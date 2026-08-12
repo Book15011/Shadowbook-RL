@@ -1,0 +1,14 @@
+# Placeholder SAC (L2) config keys only
+sac_l2:
+  policy:
+  total_timesteps:
+  learning_rate:
+  buffer_size:
+  batch_size:
+  tau:
+  gamma:
+  train_freq:
+  gradient_steps:
+  ent_coef:
+  target_update_interval:
+  tensorboard_log:

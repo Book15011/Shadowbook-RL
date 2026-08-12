@@ -1,0 +1,11 @@
+# Placeholder data config keys only
+data:
+  provider:
+  symbol:
+  venue:
+  timezone:
+  raw_dir:
+  processed_dir:
+  start_date:
+  end_date:
+  depth_levels:

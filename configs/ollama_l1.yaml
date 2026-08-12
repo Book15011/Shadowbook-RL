@@ -1,0 +1,11 @@
+# Placeholder Ollama L1 config keys only
+ollama_l1:
+  host:
+  model:
+  timeout_s:
+  temperature:
+  top_p:
+  max_tokens:
+  format:
+  retry:
+  schema:

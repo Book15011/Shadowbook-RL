@@ -1,0 +1,14 @@
+# Placeholder PPO (L3) config keys only
+ppo_l3:
+  policy:
+  total_timesteps:
+  learning_rate:
+  gamma:
+  gae_lambda:
+  n_steps:
+  batch_size:
+  clip_range:
+  ent_coef:
+  vf_coef:
+  max_grad_norm:
+  tensorboard_log:

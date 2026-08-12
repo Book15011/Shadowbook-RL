@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: lob-execution-hma
+Version: 0.1.0
+Summary: Pre-flight bootstrap for hierarchical multi-agent LOB execution
+Requires-Python: >=3.11
+Requires-Dist: gymnasium==0.29.1
+Requires-Dist: stable-baselines3==2.3.2
+Requires-Dist: sb3-contrib==2.3.0
+Requires-Dist: langgraph==0.2.34
+Requires-Dist: pydantic>=2
+Requires-Dist: pandas==2.2.2
+Requires-Dist: pyarrow==17.0.0
+Requires-Dist: requests==2.32.3
+Requires-Dist: websockets==12.0
+Requires-Dist: pytest==8.3.2
