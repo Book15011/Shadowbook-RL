@@ -227,11 +227,12 @@ def _download_one(
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             csv_name = next(n for n in zf.namelist() if n.endswith(".csv"))
             csv_bytes = zf.read(csv_name)
-
-        df = pd.read_csv(io.StringIO(csv_bytes.decode("utf-8")))
-        parquet_path = out_dir / f"{symbol}-{dataset}-{date_str}.parquet"
-        df.to_parquet(parquet_path, index=False)
-        parquet_sha = _sha256_file(parquet_path)
+            df = pd.read_csv(io.StringIO(csv_bytes.decode("utf-8")))
+            dataset_dir = out_dir / dataset
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            parquet_path = dataset_dir / f"{symbol}-{dataset}-{date_str}.parquet"
+            df.to_parquet(parquet_path, index=False)
+            parquet_sha = _sha256_file(parquet_path)
     except Exception as exc:
         log.error("FAILED %s %s extract/parquet: %s", date_str, dataset, exc)
         manifest.record(date_str, dataset, "failed")
