@@ -38,9 +38,15 @@ silently pick"):
   - LIMIT when already resting is a no-op (same as HOLD); CANCEL_AND_REPLACE
     is the only action that tears down and replaces an existing resting
     order, giving it a distinct, unambiguous meaning.
-  - MARKET orders fill fully at the current best price for the requested
-    size (no book-walk/impact modeling against depth beyond the touch --
-    a deliberate simplification for this foundation phase).
+  - MARKET orders walk the visible top-20 book level-by-level (best-to-
+    worst, matching TickView's stored order -- see matching_engine.py's
+    walk_market_fill()), producing one fill per level touched at that
+    level's own price. If the requested quantity exceeds all visible
+    retained levels, only the visible depth fills; the unconsumed
+    remainder stays in qty_remaining and is picked up on a later tick, or
+    falls through to the terminal opportunity-cost IS component (Section
+    5.1) if the episode ends first -- no synthetic price levels are
+    invented beyond what is actually observed.
   - A resting LIMIT order whose computed price falls outside the visible
     top-20 book is seeded with Q_ahead=0 (we cannot observe deeper levels;
     flagged as likely optimistic for very passive/deep prices).
@@ -58,7 +64,7 @@ import numpy as np
 import pandas as pd
 
 from src.data.features import obi
-from src.envs.matching_engine import QueueState, queue_position_ratio, update_queue
+from src.envs.matching_engine import QueueState, queue_position_ratio, update_queue, walk_market_fill
 from src.envs.reward import RewardWeights, compute_implementation_shortfall, step_reward
 
 TICK_SIZE = 0.1  # BTCUSDT perpetual tick size, matches observed real data
@@ -376,9 +382,15 @@ class LOBExecutionEnv(gym.Env):
         if order_type == ORDER_TYPE_MARKET:
             mkt_qty = min(size_frac * self.qty_remaining, self.qty_remaining)
             if mkt_qty > 0:
-                fill_price = tick_before.best_ask if self.side == 1 else tick_before.best_bid
-                step_fills.append({"price": fill_price, "qty": mkt_qty, "is_maker": False})
-                self.qty_remaining = max(0.0, self.qty_remaining - mkt_qty)
+                book_prices, book_sizes = (
+                    (tick_before.ask_prices, tick_before.ask_sizes) if self.side == 1
+                    else (tick_before.bid_prices, tick_before.bid_sizes)
+                )
+                level_fills, qty_unfilled = walk_market_fill(mkt_qty, book_prices, book_sizes)
+                for level_price, level_qty in level_fills:
+                    step_fills.append({"price": level_price, "qty": level_qty, "is_maker": False})
+                filled_qty = mkt_qty - qty_unfilled
+                self.qty_remaining = max(0.0, self.qty_remaining - filled_qty)
         elif order_type in (ORDER_TYPE_LIMIT, ORDER_TYPE_CANCEL_REPLACE):
             if self._resting is None and self.qty_remaining > 0:
                 self._place_limit(tick_before, offset, size_frac)

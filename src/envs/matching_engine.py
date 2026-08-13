@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,40 @@ def update_queue(state: QueueState, *, v_trade: float, v_cancel: float, q_p_befo
     new_filled = state.filled_qty + fill_qty
 
     return QueueState(q_ahead=new_q_ahead, own_qty_remaining=new_own_remaining, filled_qty=new_filled)
+
+
+def walk_market_fill(
+    qty: float, prices: Sequence[float], sizes: Sequence[float]
+) -> tuple[list[tuple[float, float]], float]:
+    """Level-by-level market-order fill against visible resting depth
+    (architecture_spec.md Section 2.3's top-N=20 levels, best-to-worst order --
+    matches the ordering TickView already stores, see lob_execution_env.py).
+
+    Consumes qty starting at prices[0] (the touch) and walking outward one
+    level at a time until qty is fully consumed or the visible levels run
+    out. Never fills beyond what prices/sizes actually show: if the visible
+    book doesn't have enough depth, the unconsumed remainder is returned as
+    qty_unfilled rather than invented at a synthetic price -- callers are
+    responsible for leaving that remainder in the caller's own qty_remaining
+    so it can be picked up on a later tick (or fall through to the terminal
+    opportunity-cost IS component if the episode ends first).
+
+    Returns (fills, qty_unfilled): fills is a list of (price, qty) tuples,
+    one entry per level touched (a partial fill at the last level touched
+    gets its own entry with just the partial qty, not the level's full size).
+    """
+    remaining = max(0.0, qty)
+    fills: list[tuple[float, float]] = []
+    for price, size in zip(prices, sizes):
+        if remaining <= 0.0:
+            break
+        size = max(0.0, float(size))
+        if size <= 0.0:
+            continue
+        take = min(remaining, size)
+        fills.append((float(price), take))
+        remaining -= take
+    return fills, remaining
 
 
 def expected_wait_time(q_ahead: float, avg_trade_rate: float) -> float:

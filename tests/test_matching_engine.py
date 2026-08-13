@@ -10,6 +10,7 @@ from src.envs.matching_engine import (
     expected_wait_time,
     queue_position_ratio,
     update_queue,
+    walk_market_fill,
 )
 
 
@@ -127,3 +128,51 @@ def test_queue_position_ratio_hand_computed():
 def test_queue_position_ratio_no_resting_order_is_negative_one():
     state = QueueState(q_ahead=0.0, own_qty_remaining=0.0)
     assert queue_position_ratio(state) == -1.0
+
+
+def test_walk_market_fill_multi_level_partial():
+    # Book (best-to-worst): (100.0, 5.0), (100.1, 3.0), (100.2, 10.0), (100.3, 4.0).
+    # qty=10.5 fully clears level 1 (5.0) and level 2 (3.0), leaving 2.5 which
+    # partially clears level 3 (10.0 available there); level 4 is never touched.
+    # Blended avg price = (100.0*5.0 + 100.1*3.0 + 100.2*2.5) / 10.5
+    #                    = (500.0 + 300.3 + 250.5) / 10.5 = 1050.8 / 10.5 = 100.07619047619048
+    prices = [100.0, 100.1, 100.2, 100.3]
+    sizes = [5.0, 3.0, 10.0, 4.0]
+    fills, qty_unfilled = walk_market_fill(10.5, prices, sizes)
+    assert fills == [
+        pytest.approx((100.0, 5.0)),
+        pytest.approx((100.1, 3.0)),
+        pytest.approx((100.2, 2.5)),
+    ]
+    assert qty_unfilled == pytest.approx(0.0)
+    total_qty = sum(q for _, q in fills)
+    blended_avg = sum(p * q for p, q in fills) / total_qty
+    assert total_qty == pytest.approx(10.5)
+    assert blended_avg == pytest.approx(100.07619047619048)
+
+
+def test_walk_market_fill_exceeds_all_visible_levels():
+    # Only 3.0 total visible (2.0 + 1.0) against a 5.0 request -- the visible
+    # depth fills exactly, and the un-invented remainder (2.0) comes back as
+    # qty_unfilled rather than being filled at a synthetic price.
+    prices = [100.0, 100.1]
+    sizes = [2.0, 1.0]
+    fills, qty_unfilled = walk_market_fill(5.0, prices, sizes)
+    assert fills == [pytest.approx((100.0, 2.0)), pytest.approx((100.1, 1.0))]
+    assert qty_unfilled == pytest.approx(2.0)
+
+
+def test_walk_market_fill_small_order_touches_only_touch_level():
+    # A request smaller than level 1's size should behave exactly like the
+    # old single-price fill: one fill entry, level 2 untouched.
+    prices = [100.0, 100.1]
+    sizes = [5.0, 3.0]
+    fills, qty_unfilled = walk_market_fill(2.0, prices, sizes)
+    assert fills == [pytest.approx((100.0, 2.0))]
+    assert qty_unfilled == pytest.approx(0.0)
+
+
+def test_walk_market_fill_empty_book_returns_all_unfilled():
+    fills, qty_unfilled = walk_market_fill(5.0, [], [])
+    assert fills == []
+    assert qty_unfilled == pytest.approx(5.0)
