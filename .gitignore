@@ -3,5 +3,7 @@ __pycache__/
 *.pyc
 logs/
 models/*.pkl
+models/*.zip
+models/l3_checkpoints/
 data/raw*
 .pytest_cache/

@@ -1,14 +1,72 @@
-# Placeholder PPO (L3) config keys only
+# L3 (Executioner) RecurrentPPO config -- architecture_spec.md Section 4.1.
+# Values below are Section 4.1's exact hyperparameters where specified. Anything
+# Section 4.1 does not specify is marked "JUDGMENT CALL" with the reasoning, per
+# the Phase 3 task's explicit instruction not to silently pick.
+
 ppo_l3:
-  policy:
-  total_timesteps:
-  learning_rate:
-  gamma:
-  gae_lambda:
-  n_steps:
-  batch_size:
-  clip_range:
-  ent_coef:
-  vf_coef:
-  max_grad_norm:
-  tensorboard_log:
+  policy: MlpLstmPolicy
+  total_timesteps: 20_000_000       # Section 4.1's real target for the eventual full run.
+                                     # NOT used by the Phase 3 first-pass smoke test, which
+                                     # overrides this via --total-timesteps on the CLI --
+                                     # this field documents the production value, unchanged.
+  learning_rate: 0.0003             # 3e-4, Section 4.1
+  gamma: 0.995                      # Section 4.1: ~100ms ticks -> ~5s effective discount horizon
+  gae_lambda: 0.95                  # Section 4.1
+  n_steps: 512                      # Section 4.1: ticks per env per rollout
+  batch_size: 256                   # Section 4.1
+  n_epochs: 6                       # Section 4.1
+  clip_range: 0.15                  # Section 4.1
+  ent_coef: 0.005                   # Section 4.1: small -- action space already fairly constrained
+  vf_coef: 0.5                      # JUDGMENT CALL: not specified in Section 4.1's reference
+                                     # RecurrentPPO(...) call. Using sb3-contrib's own default
+                                     # (confirmed via RecurrentPPO.__init__ signature) rather
+                                     # than inventing a different number.
+  max_grad_norm: 0.5                # JUDGMENT CALL: same as vf_coef -- not in Section 4.1,
+                                     # sb3-contrib's own default used as-is.
+  policy_kwargs:
+    lstm_hidden_size: 128           # Section 4.1
+    n_lstm_layers: 1                # Section 4.1
+    net_arch:
+      pi: [128]                     # Section 4.1
+      vf: [128]                     # Section 4.1
+  n_envs: 8                         # Section 4.1's N_ENVS (a script-level constant there,
+                                     # promoted to config here since it is a real training
+                                     # hyperparameter, not incidental script plumbing)
+  seed: 42                          # JUDGMENT CALL: Section 4.1's reference code seeds each
+                                     # env individually (LOBExecutionEnv(..., seed=rank)), which
+                                     # does not match the real env's constructor (see Step 0
+                                     # reconciliation -- LOBExecutionEnv has no seed param; the
+                                     # seed lives on reset()). The correct real mechanism is
+                                     # passing seed= to RecurrentPPO itself: SB3's
+                                     # BaseAlgorithm.set_random_seed() calls env.seed(seed) on
+                                     # the VecEnv, and SubprocVecEnv.seed() distributes seed+idx
+                                     # to each worker automatically on its next reset() --
+                                     # confirmed directly against the installed SB3 2.3.2 source,
+                                     # not assumed. 42 is an arbitrary, documented default,
+                                     # overridable via CLI.
+  device: cuda                      # Section 4.1
+  verbose: 1                        # Section 4.1
+  tensorboard_log: logs/l3_ppo/     # Section 4.1
+
+# Not in Section 4.1 at all -- these govern the held-out val evaluation and checkpointing
+# this task explicitly requires building (Section 4.1's reference code has no eval loop and
+# only a single final model.save(), no periodic checkpoints).
+eval:
+  eval_freq_timesteps: 4096         # JUDGMENT CALL: fires roughly once per rollout
+                                     # (n_envs * n_steps = 8*512 = 4096) at this default; no
+                                     # spec guidance since this callback does not exist in
+                                     # Section 4.1. Chosen to be frequent enough that the Phase
+                                     # 3 first-pass smoke test actually exercises it at least
+                                     # once within a short run.
+  n_eval_episodes: 5                # JUDGMENT CALL: small for now (fast eval during the short
+                                     # smoke test); revisit for the eventual full run.
+checkpoint:
+  save_freq_timesteps: 4096         # JUDGMENT CALL: same reasoning as eval_freq_timesteps.
+  save_vecnormalize: true           # Section 4.1's note: VecNormalize stats must be saved
+                                     # alongside the model for eval to use matching normalization.
+
+# Inherited from LOBExecutionEnv's own existing defaults (Section 3), not freshly decided
+# here -- Section 4.1's reference code does not pass these either.
+env:
+  horizon_ticks: 3000
+  lookback_ticks: 10
