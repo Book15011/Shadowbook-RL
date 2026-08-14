@@ -52,16 +52,47 @@ ppo_l3:
 # this task explicitly requires building (Section 4.1's reference code has no eval loop and
 # only a single final model.save(), no periodic checkpoints).
 eval:
-  eval_freq_timesteps: 4096         # JUDGMENT CALL: fires roughly once per rollout
-                                     # (n_envs * n_steps = 8*512 = 4096) at this default; no
-                                     # spec guidance since this callback does not exist in
-                                     # Section 4.1. Chosen to be frequent enough that the Phase
-                                     # 3 first-pass smoke test actually exercises it at least
-                                     # once within a short run.
-  n_eval_episodes: 5                # JUDGMENT CALL: small for now (fast eval during the short
-                                     # smoke test); revisit for the eventual full run.
+  eval_freq_timesteps: 250_000      # REBALANCED for the real 20M-step run (smoke test used
+                                     # 4096, which would fire ~4,883 times over the full run --
+                                     # both wasteful and, at n=5, too thin to mean anything).
+                                     # 20_000_000 / 250_000 = 80 eval points across the run,
+                                     # inside the 40-100 range that gives a real learning curve
+                                     # without excess firings.
+                                     # Overhead check, measured directly rather than guessed:
+                                     # timed 30 real eval episodes against the smoke-test
+                                     # checkpoint on the actual training GPU -- 2.27s/episode
+                                     # mean (dominated by env.reset()'s per-day data load and
+                                     # feature precompute, not by per-tick inference). Pure
+                                     # training throughput backed out from the smoke test log
+                                     # (iteration-2 wall time minus its 5-episode eval cost):
+                                     # ~17.4 steps/s, so the 20M-step run costs roughly 319
+                                     # training-only hours on its own. 80 firings * 50 episodes
+                                     # * 2.27s is about 3.0 hours of eval total -- 0.79% of that,
+                                     # negligible. n_eval_episodes below is therefore chosen for
+                                     # statistical power, not to protect this budget.
+                                     # The short smoke test does not use this value directly --
+                                     # it overrides via --eval-freq so a short run still fires
+                                     # eval multiple times and exercises the cadence and pairing
+                                     # logic before real GPU time is committed.
+  n_eval_episodes: 50                # REBALANCED (was 5). Phase 2a measured this exact metric
+                                     # at std roughly 5-9bps/episode (unpaired, n=50). At the
+                                     # old n=5, the unpaired standard error on the L3-vs-TWAP
+                                     # difference was about 3.2-5.7bps -- far larger than the
+                                     # approximately 0.1-0.15bps gap the smoke test reported, so
+                                     # that comparison carried no real statistical power.
+                                     # Now paired (see ValISEvalCallback docstring: same fixed
+                                     # seed set drives both arms at every eval point), so some
+                                     # of that per-episode noise should cancel across arms; even
+                                     # ignoring that benefit entirely, n=50 alone drops standard
+                                     # error to roughly 0.7-1.3bps -- small enough to detect a
+                                     # real several-bps learning signal once one exists, for well
+                                     # under 1% added wall-clock overhead (see eval_freq above).
 checkpoint:
-  save_freq_timesteps: 4096         # JUDGMENT CALL: same reasoning as eval_freq_timesteps.
+  save_freq_timesteps: 4096         # JUDGMENT CALL: same reasoning as the original eval_freq --
+                                     # roughly once per rollout (n_envs * n_steps = 8*512).
+                                     # Left unchanged: checkpoint cost is a cheap disk write, not
+                                     # a full eval episode, so it does not carry the same
+                                     # overhead pressure that motivated rebalancing eval_freq.
   save_vecnormalize: true           # Section 4.1's note: VecNormalize stats must be saved
                                      # alongside the model for eval to use matching normalization.
 

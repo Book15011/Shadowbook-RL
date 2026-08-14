@@ -1,5 +1,5 @@
 """L3 (Executioner) RecurrentPPO training -- architecture_spec.md Section 4.1,
-reconciled against the real LOBExecutionEnv API. Section 4.1's reference
+reconciled against the real LOBExecutionEnv API. The Section 4.1 reference
 train_l3.py illustrates LOBExecutionEnv(tier="l3", l2_override=..., seed=rank),
 which does not match the real constructor.
 
@@ -10,7 +10,7 @@ not assumed from memory):
     min_size_mult, max_size_mult, reward_weights, fee_bps_per_fill, date_range,
     funding_rate_dir, l1_risk_score, l1_confidence, l2_urgency,
     l2_target_slice_ratio_override.
-  - "L2 stub = fixed_twap" needs NO extra wiring. l2_target_slice_ratio (obs
+  - L2 stub = fixed_twap needs NO extra wiring. l2_target_slice_ratio (obs
     idx 15) computed DEFAULT (_compute_l2_target_slice_ratio(), active
     whenever l2_target_slice_ratio_override is None -- which is itself the
     default) already IS a fixed-linear-TWAP-schedule fraction
@@ -22,11 +22,11 @@ not assumed from memory):
     Confirmed against the installed SB3 2.3.2 source:
     BaseAlgorithm.set_random_seed() calls env.seed(seed) on the VecEnv, and
     SubprocVecEnv.seed() distributes seed+idx to each worker automatically on
-    its next reset() -- the real mechanism for the per-worker diversity
-    Section 4.1's illustrative seed=rank was going for.
+    its next reset() -- the real mechanism for the per-worker diversity that
+    the Section 4.1 illustrative seed=rank was going for.
 
 Run: PYTHONPATH=. .venv/bin/python -m src.train.train_l3 [--total-timesteps N]
-[--n-envs N] [--config configs/ppo_l3.yaml]
+[--n-envs N] [--eval-freq N] [--n-eval-episodes N] [--config configs/ppo_l3.yaml]
 """
 from __future__ import annotations
 
@@ -46,8 +46,8 @@ from src.envs.lob_execution_env import LOBExecutionEnv
 
 
 def make_env(date_range: tuple[str, str], horizon_ticks: int, lookback_ticks: int):
-    """L2 stub = fixed_twap is the environment's own default behavior (see
-    module docstring) -- no l2_override kwarg exists or is needed."""
+    """L2 stub = fixed_twap is the default behavior the environment already
+    has (see module docstring) -- no l2_override kwarg exists or is needed."""
     def _init():
         return LOBExecutionEnv(
             date_range=date_range,
@@ -59,25 +59,39 @@ def make_env(date_range: tuple[str, str], horizon_ticks: int, lookback_ticks: in
 
 class ValISEvalCallback(BaseCallback):
     """Periodic held-out evaluation against load_split("val") ONLY -- never
-    test. Not in Section 4.1's reference code (it has no eval loop at all);
-    built here per the Phase 3 task's explicit requirement. Uses the real
-    business metric (compute_implementation_shortfall(), via the same
-    run_episode() pattern scripts/phase2a_sanity_suite.py already
-    established for every prior sanity check this project has done), not
-    SB3's stock reward-based EvalCallback.
+    test. Not in the Section 4.1 reference code (it has no eval loop at all);
+    built here per the explicit requirement from the Phase 3 task. Uses the
+    real business metric (compute_implementation_shortfall(), via the same
+    run_episode() pattern already established in
+    scripts/phase2a_sanity_suite.py for every prior sanity check this project
+    has done), not SB3 stock reward-based EvalCallback.
 
-    Baseline: TWAPPolicy from phase2a_sanity_suite.py, confirmed to fit
-    Section 6.2's "naive same-level limit-order baseline" -- it always posts
-    passively at the touch (offset=0, never adaptive: the "same-level" part)
-    under the identical fixed-TWAP pacing schedule L2 stubs for L3 too (the
-    slicing/forced-completion logic), forcing MARKET completion only when a
-    slice would otherwise miss its target. This gives a fair, apples-to-apples
-    comparison: does L3's LEARNED tick-level policy beat the simplest possible
-    tick-level policy under the same macro pacing constraint? Computed once at
-    training start (a fixed, non-learning policy has no reason to be
-    re-evaluated every callback firing) and logged as a constant reference
-    line alongside L3's evolving IS at each eval.
+    Baseline: TWAPPolicy from phase2a_sanity_suite.py, confirmed to fit the
+    naive same-level limit-order baseline description from Section 6.2 -- it
+    always posts passively at the touch (offset=0, never adaptive: the
+    "same-level" part) under the identical fixed-TWAP pacing schedule L2
+    stubs for L3 too (the slicing/forced-completion logic), forcing MARKET
+    completion only when a slice would otherwise miss its target. This gives
+    a fair, apples-to-apples comparison: does the LEARNED tick-level policy
+    for L3 beat the simplest possible tick-level policy under the same macro
+    pacing constraint?
+
+    Paired design: both arms are evaluated against the exact SAME fixed set
+    of eval seeds (self._eval_seeds, generated once at construction from
+    EVAL_SEED_BASE and never regenerated). Since a seed deterministically
+    fixes the day/window/side/qty draw (see Phase 2a), this pins the TWAP
+    baseline and every single L3 eval firing across the whole run to the
+    identical episode set -- matched, not independently sampled, exactly the
+    pattern the Phase 2a sanity suite already used to compare policies. The
+    TWAP arm is still computed once at training start and cached as a
+    constant reference line (a fixed, non-learning policy has no reason to
+    be re-evaluated every callback firing), but it is cached FROM the same
+    seed list that every L3 firing reuses, so every reported comparison
+    stays apples-to-apples throughout training, not just at one point in
+    time.
     """
+
+    EVAL_SEED_BASE = 5_000_000
 
     def __init__(
         self,
@@ -95,6 +109,8 @@ class ValISEvalCallback(BaseCallback):
         self._eval_env = LOBExecutionEnv(
             date_range=val_date_range, horizon_ticks=horizon_ticks, lookback_ticks=lookback_ticks,
         )
+        # Fixed once, reused for every arm and every firing -- the paired-design guarantee.
+        self._eval_seeds = [self.EVAL_SEED_BASE + i for i in range(n_eval_episodes)]
         self._twap_is_bps: np.ndarray | None = None
         self._twap_fill: np.ndarray | None = None
         self._last_eval_step = 0
@@ -102,20 +118,21 @@ class ValISEvalCallback(BaseCallback):
     def _on_training_start(self) -> None:
         twap = TWAPPolicy(n_slices=10)
         results = [
-            run_episode(self._eval_env, twap, seed=1_000_000 + i, horizon_ticks=self.horizon_ticks)
-            for i in range(self.n_eval_episodes)
+            run_episode(self._eval_env, twap, seed=s, horizon_ticks=self.horizon_ticks)
+            for s in self._eval_seeds
         ]
         self._twap_is_bps = np.array([r["is_result"].is_total_bps for r in results])
         self._twap_fill = np.array([r["is_result"].fill_ratio for r in results])
         if self.verbose:
             print(
-                f"[ValISEvalCallback] TWAP baseline on val ({self.n_eval_episodes} episodes): "
+                f"[ValISEvalCallback] TWAP baseline on val ({self.n_eval_episodes} episodes, "
+                f"paired seeds {self._eval_seeds[0]}..{self._eval_seeds[-1]}): "
                 f"IS_total_bps mean={self._twap_is_bps.mean():.4f} fill_ratio mean={self._twap_fill.mean():.4f}"
             )
 
     def _run_l3_episode(self, seed: int) -> dict:
-        """Mirrors run_episode()'s pattern from phase2a_sanity_suite.py, but
-        driving actions from the RecurrentPPO policy instead of a fixed
+        """Mirrors the pattern from run_episode() in phase2a_sanity_suite.py,
+        but driving actions from the RecurrentPPO policy instead of a fixed
         policy object -- handles LSTM state carry-forward and VecNormalize
         observation normalization, neither of which a non-recurrent policy
         needs, which is why this cannot just call run_episode() directly."""
@@ -145,7 +162,7 @@ class ValISEvalCallback(BaseCallback):
             return True
         self._last_eval_step = self.num_timesteps
 
-        results = [self._run_l3_episode(seed=2_000_000 + i) for i in range(self.n_eval_episodes)]
+        results = [self._run_l3_episode(seed=s) for s in self._eval_seeds]
         l3_is_bps = np.array([r["is_result"].is_total_bps for r in results])
         l3_fill = np.array([r["is_result"].fill_ratio for r in results])
 
@@ -160,6 +177,7 @@ class ValISEvalCallback(BaseCallback):
         if self.verbose:
             print(
                 f"[ValISEvalCallback] step={self.num_timesteps} "
+                f"(paired seeds {self._eval_seeds[0]}..{self._eval_seeds[-1]}, n={self.n_eval_episodes}) "
                 f"L3 IS_total_bps mean={l3_is_bps.mean():.4f} (TWAP baseline {self._twap_is_bps.mean():.4f})"
             )
         return True
@@ -173,6 +191,14 @@ def main() -> None:
         help="Override config total_timesteps (e.g. for a short smoke test)",
     )
     parser.add_argument("--n-envs", type=int, default=None, help="Override config n_envs")
+    parser.add_argument(
+        "--eval-freq", type=int, default=None,
+        help="Override config eval.eval_freq_timesteps (e.g. for a short smoke test)",
+    )
+    parser.add_argument(
+        "--n-eval-episodes", type=int, default=None,
+        help="Override config eval.n_eval_episodes (e.g. for a short smoke test)",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -184,6 +210,8 @@ def main() -> None:
 
     n_envs = args.n_envs or ppo_cfg["n_envs"]
     total_timesteps = args.total_timesteps or ppo_cfg["total_timesteps"]
+    eval_freq = args.eval_freq or eval_cfg["eval_freq_timesteps"]
+    n_eval_episodes = args.n_eval_episodes or eval_cfg["n_eval_episodes"]
 
     cuda_available = torch.cuda.is_available()
     print(f"cuda available: {cuda_available}")
@@ -238,8 +266,8 @@ def main() -> None:
         val_date_range=val_date_range,
         horizon_ticks=env_cfg["horizon_ticks"],
         lookback_ticks=env_cfg["lookback_ticks"],
-        eval_freq=eval_cfg["eval_freq_timesteps"],
-        n_eval_episodes=eval_cfg["n_eval_episodes"],
+        eval_freq=eval_freq,
+        n_eval_episodes=n_eval_episodes,
         verbose=1,
     )
 
