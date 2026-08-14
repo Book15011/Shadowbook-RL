@@ -1,7 +1,9 @@
 # LOBExecutionEnv: Hierarchical Multi-Agent Optimal Execution System
 ### Master Implementation Plan & Architecture Specification
 
-**Target:** BTCUSDT Perpetual Futures (Binance) — tick-level Limit Order Book execution
+**Target:** BTCUSDT Perpetual Futures — tick-level Limit Order Book execution. **Cross-venue in
+practice:** L1's aggregate context comes from Binance, L2/L3's order book comes from Bybit — see
+§2.1.1 for why, added after the original single-venue plan hit a real infrastructure blocker.
 **Scope:** Portfolio-grade system for quant execution / market-making roles (Jane Street, Citadel, Optiver-tier bar)
 **Stack:** Python 3.11, Gymnasium, Stable-Baselines3 + sb3-contrib, LangGraph, Ollama (local LLM), RTX 4090
 
@@ -27,15 +29,14 @@ ablation study). Build the project so you can answer both with numbers, not intu
 ### 1.1 Architecture Diagram
 
 ```
-┌──────────────────────────────┐
-│  data.binance.vision          │
-│  futures/um/daily/{trades,    │
-│  aggTrades,bookDepth}         │      ┌───────────────────────────┐
-│  + live L2 diff capture       │      │  Live capture daemon        │
-│  (see §2.1 — data caveat)     │◄────►│  (wss://fstream.binance.com)│
-└──────────────┬────────────────┘      └───────────────────────────┘
-               │ raw .zip / .parquet
-               ▼
+┌──────────────────────────────────┐      ┌──────────────────────────────────┐
+│ data.binance.vision               │      │ Bybit historical L2               │
+│ futures/um/daily/{trades,         │      │ quote-saver.bycsi.com             │
+│ aggTrades,bookDepth}              │      │ -> primary L2 source (§2.1.1)     │
+│ -> L1 aggregates only (§2.1.1)    │      └──────────────┬─────────────────────┘
+└──────────────┬─────────────────────┘                    │
+               │ raw .zip / .parquet                       │ raw .zip
+               ▼                                           ▼
 ┌───────────────────────────────────────┐
 │  Feature Pipeline (src/data/features.py)│
 │  Rebuilds L2 book state, computes:       │
@@ -205,8 +206,56 @@ have three honest options, and your writeup/interview answer should name which o
 2. **Buy it.** Vendors (Tardis.dev, CryptoTick, Databento, Amberdata) sell historical L2 tick/diff archives for Binance futures at reasonable cost for a portfolio project — this is what most prop shops actually do rather than reconstructing from scratch, and citing it shows you know the industry-standard path.
 3. **Degrade gracefully and say so.** Approximate L2 from `bookDepth`'s percentage bands + `aggTrades` order-flow, accept that queue-position modeling becomes an *estimate of an estimate*, and explicitly document the approximation error this introduces into the reward signal. This is a legitimate portfolio-scope tradeoff **as long as you state it**, not stumble into it.
 
-The rest of this document assumes you go with (1) or (2) so that `src/data/features.py` operates on a
-true per-level order book reconstruction. `src/data/l2_capture_daemon.py` below implements option (1).
+The rest of this document originally assumed option (1) or (2) so that `src/data/features.py` operates
+on a true per-level order book reconstruction. `src/data/l2_capture_daemon.py` below implements option
+(1). **What actually happened in practice, superseding that assumption, is documented in §2.1.1 below —
+read that before treating this section as the current data source.**
+
+#### 2.1.1 UPDATE — what actually happened, and the current real data source
+
+Option (1) was attempted first and hit a real infrastructure blocker, not a code bug: the dev
+environment's network path routes through mainland China, which silently blocks Binance's *live
+trading* API domains (`fapi.binance.com`, `fstream.binance.com`) via SNI-based filtering — confirmed
+directly via `curl -v`/`nc`/IP geolocation, not assumed. `data.binance.vision` (the static archive)
+stays reachable throughout; only the live REST/WebSocket endpoints are blocked. A same-country VPN
+exit was also ruled out (Thailand independently blocks direct Binance.com access under local
+regulation) before concluding this needed an infrastructure workaround, not a retry.
+
+Rather than stand up a second always-on server just to keep pursuing live capture, a fourth option —
+not in the original three above — was investigated and adopted: **a venue's own official historical
+archive of already-captured L2**, as opposed to capturing it live yourself going forward. Bybit
+publishes exactly this, for free, no account required, at `quote-saver.bycsi.com` — genuine
+snapshot + incremental-delta + sequence-number order book data, 500 levels per side, confirmed via
+real trial download to be genuinely ~100ms cadence (verified from actual consecutive-timestamp
+diffs, not the vendor's marketing claim). This sidesteps the entire "historical L2 doesn't exist"
+problem for BTCUSDT on Bybit's linear-perpetual venue, in a way no option above achieves for Binance
+specifically.
+
+**Current real data source, adopted as the project's actual design, not a hypothetical:**
+- **L2 order book (feeds L2/L3's observation space and reward function): Bybit**, bulk-downloaded
+  from its official historical archive, truncated from the published 500 levels down to the top 20
+  (§3.1's `book_depth_norm` only needs 20), reusing this section's `L2Book`/`apply_diff` reconstruction
+  logic rather than reimplementing it. Byte-budget-targeted (not a fixed day count) — walk backward
+  from the most recent available day until a storage ceiling is hit, since 500-level 100ms data is
+  genuinely large (~1.2GB/day uncompressed at full depth).
+- **L1 aggregate context (feeds the Macro Analyst's `feature_summary`, §1.2): Binance**, via
+  `data.binance.vision`'s `klines` (1-minute), `fundingRate` (monthly), and `metrics` (daily, contains
+  open interest) archives — **not** the tick-level `trades`/`aggTrades` tables described below. L1 was
+  originally scoped around those tick tables; in practice they're unnecessary and oversized for what
+  L1 actually consumes (a handful of rolling summary statistics, not tick data) — full 5-year coverage
+  of the three aggregate archives totals under 300MB, versus an estimated 70-180GB for 5 years of tick
+  trades.
+- `trades`/`aggTrades`/`bookDepth` (this section, below) remain accurate documentation of what those
+  archives *are*, and stay useful for anyone who does want tick-level trade context — they're simply
+  not what L1 or L2/L3 actually consume in the current design.
+- `src/data/l2_capture_daemon.py` (below) is kept as a **secondary/optional** capability — e.g. live
+  augmentation on top of the Bybit archive, or a fallback if network access to Binance's live API is
+  restored later — not the primary L2 path.
+
+**This is a deliberate cross-venue design** (L1's context from Binance, L2/L3's order book from
+Bybit) and should be stated explicitly as such in any writeup — not silently blended as if both came
+from the same exchange. If a fully single-venue system is ever required, the honest path is re-pulling
+L1's aggregate context from Bybit's own equivalent endpoints instead, not pretending the venues match.
 
 ### 2.2 Data ingestion pipeline
 
@@ -259,7 +308,10 @@ def bulk_download(symbol: str, dataset: str, start: date, end: date, out_dir: Pa
 ```
 
 ```python
-# src/data/l2_capture_daemon.py — true tick-level L2 (see §2.1, option 1)
+# src/data/l2_capture_daemon.py — SECONDARY/OPTIONAL path; see §2.1.1 — the project's actual
+# primary L2 source is Bybit's historical archive, reusing L2Book/apply_diff below rather than
+# this file's REST/WebSocket orchestration, which requires live Binance API access this
+# environment doesn't currently have. Kept for potential future live augmentation.
 import asyncio, json, time, requests, websockets
 import pyarrow as pa, pyarrow.parquet as pq
 from collections import deque
@@ -936,7 +988,7 @@ lob-execution-hma/
 
 | Phase | Focus | Key deliverable | Est. duration |
 |---|---|---|---|
-| **1 — Data Engine** | `download_manager.py`, `l2_capture_daemon.py`, checksum-verified ingestion, feature pipeline (§2) | Reproducible, tested feature dataset for a fixed date range; unit tests on OBI/micro-price against hand-computed fixtures | 1-1.5 weeks (plus passive L2 capture time running in parallel, §2.1) |
+| **1 — Data Engine** | `download_manager.py` (Binance, L1 aggregates), Bybit L2 historical backfill (primary L2 source, §2.1.1), checksum-verified ingestion, feature pipeline (§2) | Reproducible, tested feature dataset for a fixed date range; unit tests on OBI/micro-price against hand-computed fixtures | 1-1.5 weeks — **in practice took longer**, most of it spent diagnosing a live-capture network blocker before pivoting to Bybit's archive; budget for infrastructure surprises, not just code time |
 | **2 — Gym Env** | `matching_engine.py`, `LOBExecutionEnv-v0`, reward function, fixed-TWAP baseline agent | Env passes a "does nothing dumb" sanity suite: a no-op policy loses exactly the opportunity-cost IS, a perfect-foresight oracle policy (cheat: peek at future prices) achieves near-zero IS | 1.5-2 weeks |
 | **3 — L3 Baseline** | `RecurrentPPO` training against fixed TWAP schedule, hyperparameter sweep, tensorboard eval curves | L3 beats naive same-level limit-order baseline on IS across held-out days, with a clean training-curve writeup | 2-3 weeks |
 | **4 — L2/L1 Integration** | `FrozenL3Wrapper`, `SAC` training for L2, LangGraph orchestrator, Ollama L1 plumbing + ablation (§4.4) | Full 3-tier system beats L3-alone; L1-on-vs-off ablation table with confidence intervals | 2-3 weeks |
