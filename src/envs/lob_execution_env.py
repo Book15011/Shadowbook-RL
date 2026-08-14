@@ -28,7 +28,20 @@ flagged interpretations (full rationale in the Phase 2b completion report,
 kept brief here to keep this docstring maintainable):
   - idx 12 / 40 (trade flow, taker ratio): derived from L2 diffs directly
     (touch-level depletion inferred as taker buy/sell pressure) -- NO new
-    trade-tape data needed. See _precompute_feature_series().
+    trade-tape data needed. CAVEAT (added on closer consistency check with
+    idx 10-11 below): _estimate_trade_volume(), the source of this signal,
+    is an ASSUMPTION (all touch-level depletion = trade), not a real
+    trade-print field -- the Bybit archive has no execution/trade-id field
+    alongside the book deltas, confirmed by direct inspection of the
+    collector script. So a real cancel on either side is silently
+    mislabeled as taker flow here, same underlying ambiguity CAR faces.
+    The reason this is buildable while CAR is not: idx 12/40 only need
+    WHICH SIDE depleted (always known), not the cancel-vs-trade split CAR
+    needs as its numerator (which is definitionally 0 under the
+    v_cancel=0 assumption below) -- so idx 12/40 produce a real, noisy
+    signal, CAR produces a trivial, exactly-zero one. Report this plainly
+    as noisier than the spec implies, not clean. See
+    _precompute_feature_series().
   - idx 10-11 (cancel_add_ratio): genuinely blocked -- CAR needs real
     cancel volume, and this snapshot archive cannot separate a cancel from
     a trade at the same price. Consistent with the existing v_cancel=0
@@ -36,8 +49,16 @@ kept brief here to keep this docstring maintainable):
   - idx 15-18 (L2/L1 stub hooks): plain overridable attributes, not real
     agent calls (architecture_spec.md Section 4.4 step 4/5). l1_risk_score
     is now the single source of truth also passed to step_reward().
-  - idx 19-38 (book_depth_norm): cross-sectional z-score across the 20
-    levels at one tick, not a time-rolling window.
+  - idx 19-38 (book_depth_norm): each of the 20 levels z-scored against
+    ITS OWN trailing rolling mean/std over TIME (Section 3.1's blanket
+    "trailing rolling window" rule, matching every other z-scored
+    feature in the vector -- corrected from an earlier cross-sectional
+    (across-levels) reading, which was a judgment call against ambiguous
+    table phrasing rather than a confirmed-correct one). Window reuses
+    ticks_60s, the same window as realized_vol_60s_z/
+    taker_buy_sell_ratio_1m -- the spec gives no explicit window length
+    for this feature, so this is a documented, consistent default rather
+    than an arbitrary new one.
   - idx 39 (funding_rate_z): joined by timestamp against data/raw_l1/
     funding_rate/ (both L2 ts and funding calc_time are epoch-ms,
     confirmed by direct inspection). Z-scored vs trailing ~30d history.
@@ -197,6 +218,28 @@ def _rolling_sum(values: np.ndarray, window_ticks: int) -> np.ndarray:
         w = min(window_ticks, i + 1)
         out[i] = csum[i + 1] - csum[i + 1 - w]
     return out
+
+
+def _rolling_mean_std(values: np.ndarray, window_ticks: int) -> tuple[np.ndarray, np.ndarray]:
+    """out[i] = (trailing mean, trailing std) of values[max(0,i-window_ticks+1):i+1] --
+    unlike _rolling_rms (which assumes a near-zero-mean series like returns), this is for
+    a raw, non-centered series (e.g. a book level's resting size) where the mean itself
+    is a meaningful, non-zero quantity to track."""
+    n = len(values)
+    v = values.astype(float)
+    csum = np.concatenate([[0.0], np.cumsum(v)])
+    csum_sq = np.concatenate([[0.0], np.cumsum(v * v)])
+    mean_out = np.empty(n, dtype=float)
+    std_out = np.empty(n, dtype=float)
+    for i in range(n):
+        w = min(window_ticks, i + 1)
+        s = csum[i + 1] - csum[i + 1 - w]
+        sq = csum_sq[i + 1] - csum_sq[i + 1 - w]
+        m = s / w
+        variance = max(0.0, sq / w - m * m)
+        mean_out[i] = m
+        std_out[i] = math.sqrt(variance)
+    return mean_out, std_out
 
 
 class LOBExecutionEnv(gym.Env):
@@ -404,6 +447,32 @@ class LOBExecutionEnv(gym.Env):
         abs_60s = _rolling_sum(absvol, ticks_60s)
         self._flow60s_series = np.clip(np.divide(signed_60s, abs_60s + 1e-9), -1.0, 1.0)
 
+        # idx 19-38 (book_depth_norm): each of the 20 levels z-scored against ITS OWN
+        # trailing rolling mean/std over TIME (Section 3.1's blanket "trailing rolling
+        # window" rule, not a cross-sectional level-axis reading -- see module docstring).
+        # Window reuses ticks_60s (no explicit window length is given in the spec for this
+        # feature; 60s matches the already-established realized_vol_60s_z/
+        # taker_buy_sell_ratio_1m window, a consistent, documented choice rather than an
+        # arbitrary new one).
+        bid_size_matrix = np.zeros((n, 10), dtype=float)
+        ask_size_matrix = np.zeros((n, 10), dtype=float)
+        for i, t in enumerate(self._ticks):
+            k = min(10, len(t.bid_sizes))
+            bid_size_matrix[i, :k] = t.bid_sizes[:k]
+            k = min(10, len(t.ask_sizes))
+            ask_size_matrix[i, :k] = t.ask_sizes[:k]
+
+        self._book_depth_mean = np.zeros((n, 20), dtype=float)
+        self._book_depth_std = np.zeros((n, 20), dtype=float)
+        for level in range(10):
+            m, s = _rolling_mean_std(bid_size_matrix[:, level], ticks_60s)
+            self._book_depth_mean[:, level] = m
+            self._book_depth_std[:, level] = s
+        for level in range(10):
+            m, s = _rolling_mean_std(ask_size_matrix[:, level], ticks_60s)
+            self._book_depth_mean[:, 10 + level] = m
+            self._book_depth_std[:, 10 + level] = s
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
 
@@ -559,17 +628,20 @@ class LOBExecutionEnv(gym.Env):
         l1_risk_score = float(np.clip(self.l1_risk_score, -1.0, 1.0))
         l1_confidence = float(np.clip(self.l1_confidence, 0.0, 1.0))
 
-        # idx 19-38: cross-sectional z-score across the 20 bid+ask level sizes at THIS
-        # tick (see module docstring -- 20-level rolling mean read as level-axis, not
-        # time-axis). Missing levels (book shallower than 10 on a side) pad with 0.0.
+        # idx 19-38: each of the 20 bid+ask levels z-scored against ITS OWN trailing
+        # rolling mean/std over time (Section 3.1's blanket "trailing rolling window"
+        # rule -- see _precompute_feature_series() and module docstring; NOT a
+        # cross-sectional level-axis reading). Missing levels (book shallower than 10 on
+        # a side) pad with 0.0.
         bid_sizes_10 = np.zeros(10, dtype=float)
         bid_sizes_10[: min(10, len(tick.bid_sizes))] = tick.bid_sizes[:10]
         ask_sizes_10 = np.zeros(10, dtype=float)
         ask_sizes_10[: min(10, len(tick.ask_sizes))] = tick.ask_sizes[:10]
         sizes_20 = np.concatenate([bid_sizes_10, ask_sizes_10])
-        level_mean = float(np.mean(sizes_20))
-        level_std = float(np.std(sizes_20))
-        book_depth_norm = [zscore(float(s), level_mean, level_std) for s in sizes_20]
+        book_depth_norm = [
+            zscore(float(sizes_20[k]), self._book_depth_mean[pos, k], self._book_depth_std[pos, k])
+            for k in range(20)
+        ]
 
         taker_buy_sell_ratio_1m = float(self._flow60s_series[pos])
 

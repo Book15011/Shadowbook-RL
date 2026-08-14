@@ -39,19 +39,22 @@ def _write_constant_day(path, n_rows, bid_price, bid_size, ask_price, ask_size, 
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
-def _write_book_depth_day(path, n_rows, bid_sizes, ask_sizes, price=100.0, ts_start=1):
-    bid_levels = [[round(price - 0.1 * (i + 1), 2), s] for i, s in enumerate(bid_sizes)]
-    ask_levels = [[round(price + 0.1 * (i + 1), 2), s] for i, s in enumerate(ask_sizes)]
-    bids = json.dumps(bid_levels)
-    asks = json.dumps(ask_levels)
-    rows = [
-        {
+def _write_varying_book_depth_day(path, n_rows, bid_level_fns, ask_level_fns, price=100.0, ts_start=1):
+    # bid_level_fns / ask_level_fns: 10 callables each, row index i -> that level's size at
+    # row i -- used to build a book whose per-level sizes vary over TIME (for the
+    # book_depth_norm rolling-mean/std-over-time fixture; contrast the old
+    # _write_book_depth_day, which repeated one constant book every row).
+    rows = []
+    for i in range(n_rows):
+        bid_sizes = [max(0.0, fn(i)) for fn in bid_level_fns]
+        ask_sizes = [max(0.0, fn(i)) for fn in ask_level_fns]
+        bid_levels = [[round(price - 0.1 * (k + 1), 2), bid_sizes[k]] for k in range(10)]
+        ask_levels = [[round(price + 0.1 * (k + 1), 2), ask_sizes[k]] for k in range(10)]
+        rows.append({
             "ts": ts_start + i, "best_bid": bid_levels[0][0], "best_ask": ask_levels[0][0],
             "mid_price": price, "spread": ask_levels[0][0] - bid_levels[0][0],
-            "bids": bids, "asks": asks,
-        }
-        for i in range(n_rows)
-    ]
+            "bids": json.dumps(bid_levels), "asks": json.dumps(ask_levels),
+        })
     pd.DataFrame(rows).to_parquet(path, index=False)
 
 
@@ -76,22 +79,34 @@ def _write_funding_history(path, calc_times, rates):
 # ---- idx 19-38: book_depth_norm ----
 
 def test_book_depth_norm_hand_computed_fixture(tmp_path):
+    # book_depth_norm z-scores each level against ITS OWN trailing rolling mean/std over
+    # TIME (Section 3.1's blanket rule, corrected from an earlier cross-sectional
+    # reading -- see module docstring). lookback_ticks=60 with tick_interval_s=1.0
+    # guarantees the 60-tick window at episode_start is fully populated regardless of the
+    # random start draw (same technique as the trade-flow fixture below).
+    #
+    # bid level 1: size(i) = 100+i (arithmetic, step=1). For any 60 CONSECUTIVE terms of a
+    # step-d arithmetic sequence, the z-score of the LAST term against the window's own
+    # mean/std is 29.5/sqrt(3599/12) regardless of d or where the window starts (mean =
+    # last - 29.5*d, std = |d|*sqrt(3599/12), the d cancels) -- 3599/12 is the population
+    # variance of 60 consecutive integers (60^2-1)/12.
+    # bid level 10: constant 50.0 -- zero variance, exercises the zscore() std<=0 fallback.
+    # ask level 1: size(i) = 7+2*i (different step) -- same derivation, same expected z,
+    # independent check that the ask-side array is computed correctly on its own data.
     data_dir = tmp_path / "BTCUSDT"
     data_dir.mkdir()
-    bid_sizes = [10.0, 8.0, 6.0, 4.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    ask_sizes = [5.0] * 10
-    _write_book_depth_day(data_dir / "l2-BTCUSDT-2024-01-01.parquet", 20, bid_sizes, ask_sizes)
+    bid_fns = [lambda i: 100.0 + i] + [lambda i: 20.0] * 8 + [lambda i: 50.0]
+    ask_fns = [lambda i: 7.0 + 2.0 * i] + [lambda i: 20.0] * 9
+    _write_varying_book_depth_day(data_dir / "l2-BTCUSDT-2024-01-01.parquet", 400, bid_fns, ask_fns)
 
-    env = LOBExecutionEnv(data_dir=data_dir, horizon_ticks=5, lookback_ticks=2)
+    env = LOBExecutionEnv(data_dir=data_dir, horizon_ticks=5, lookback_ticks=60, tick_interval_s=1.0)
     obs, info = env.reset(seed=1)
+    assert env._episode_start == 60  # confirms the deterministic-window assumption above holds
 
-    # mean = 85/20 = 4.25, sum_sq = 475, mean_sq = 23.75, variance = 5.6875 = 91/16
-    # std = sqrt(91)/4. z_bid_level1 (size=10) = 23/sqrt(91); z_bid_level10 (size=1) =
-    # -13/sqrt(91); z_ask_level1 (size=5) = 3/sqrt(91).
-    sqrt91 = math.sqrt(91)
-    assert obs[19] == pytest.approx(23.0 / sqrt91, abs=1e-4)
-    assert obs[28] == pytest.approx(-13.0 / sqrt91, abs=1e-4)
-    assert obs[29] == pytest.approx(3.0 / sqrt91, abs=1e-4)
+    expected_z = 29.5 / math.sqrt(3599.0 / 12.0)
+    assert obs[19] == pytest.approx(expected_z, abs=1e-6)   # bid level 1
+    assert obs[28] == pytest.approx(0.0, abs=1e-9)          # bid level 10 (constant)
+    assert obs[29] == pytest.approx(expected_z, abs=1e-6)   # ask level 1
 
 
 # ---- idx 15: l2_target_slice_ratio ----
