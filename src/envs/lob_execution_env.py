@@ -1,59 +1,60 @@
-"""LOBExecutionEnv-v0 (architecture_spec.md Section 3) -- Phase 2a foundation.
+"""LOBExecutionEnv-v0 (architecture_spec.md Section 3) -- Phase 2a/2b.
 
-Scope for this phase (explicitly deferred per the task, not an oversight):
-  - Reduced 9-dim observation subset only (see _build_obs docstring for the
-    exact index mapping and the flagged "mid/micro price" interpretation).
-  - L3 (Executioner) tier only. No L1/L2 orchestration, no LangGraph, no
-    frequency gating -- every tick is L3's turn. l1_risk_score is a fixed
-    0.0 placeholder (neutral) until L1 exists.
-  - Single symbol/venue (BTCUSDT, Bybit L2 archive collected in Part 2).
+Phase 2a scope: L3-only, single symbol/venue (BTCUSDT, Bybit L2 archive).
+Bybit L2 archive has book-state snapshots only, no separate trade tape --
+this env approximates v_trade as the full observed decrease in resting qty
+at a price level between ticks (v_cancel=0 in this adapter); it cannot
+distinguish trade from cancel using this data source. See
+matching_engine.py module docstring for the core-engine side of this.
 
-Flagged data-source limitation (see src/envs/matching_engine.py's docstring
-for the core-engine side of this): the Bybit L2 archive has book-state
-snapshots only, no separate trade tape. This env's per-tick queue update
-approximates v_trade as the full observed decrease in resting qty at a
-price level between ticks (v_cancel=0 in this adapter) -- it cannot
-distinguish "consumed by a trade" from "canceled" using this data source.
-The core matching_engine.py formula itself is unaffected; only this
-integration path inherits the approximation.
+Phase 2a flagged interpretations:
+  - inventory_remaining_norm = side * (qty_remaining / qty_total).
+  - spread_norm rolling p95 spread is a STATIC per-episode value computed
+    once at reset() over the whole lookback+horizon window -- not a
+    genuinely trailing/rolling window within the episode. Contrast idx 5
+    below, which is a real fixed-size (60s) trailing window.
+  - action size_frac_idx scales qty_remaining directly, not an L2 slice.
+  - LIMIT while resting is a no-op; CANCEL_AND_REPLACE tears down and
+    replaces the resting order.
+  - MARKET orders walk the visible top-20 book level-by-level (see
+    matching_engine.walk_market_fill()); unfilled remainder stays in
+    qty_remaining, picked up later or folded into terminal IS.
+  - A resting LIMIT order priced outside the visible top-20 book seeds
+    Q_ahead=0 (optimistic for deep/passive prices, flagged).
 
-Other flagged interpretations (task instructions: "flag rather than
-silently pick"):
-  - "mid/micro price" in the reduced obs subset has no exact spec index.
-    Mapped to mid_return_1s_z (full-vector idx 3) and micro_mid_dev_ticks
-    (idx 9) -- there is no raw-price feature in the full 42-dim vector by
-    design (raw price wouldn't generalize/normalize), making these the
-    closest legitimate proxies.
-  - inventory_remaining_norm = side * (qty_remaining / qty_total). The
-    spec's "1 = fully unexecuted" reads naturally for a buy order; the
-    side-signed fraction is the only internally consistent reading across
-    both sides sharing one feature index.
-  - spread_norm's "rolling p95 spread" and the z-score stats for
-    mid_return_1s_z/micro_mid_dev_ticks are computed from the EPISODE'S OWN
-    sampled window at reset() (a local/per-episode normalizer), not a
-    persistent cross-episode online estimator -- appropriately deferred
-    alongside the other explicitly-deferred features for this phase.
-  - action size_frac_idx scales qty_remaining directly (fraction of what's
-    left), not "L2's assigned slice" -- L2 doesn't exist yet in Phase 2a.
-  - LIMIT when already resting is a no-op (same as HOLD); CANCEL_AND_REPLACE
-    is the only action that tears down and replaces an existing resting
-    order, giving it a distinct, unambiguous meaning.
-  - MARKET orders walk the visible top-20 book level-by-level (best-to-
-    worst, matching TickView's stored order -- see matching_engine.py's
-    walk_market_fill()), producing one fill per level touched at that
-    level's own price. If the requested quantity exceeds all visible
-    retained levels, only the visible depth fills; the unconsumed
-    remainder stays in qty_remaining and is picked up on a later tick, or
-    falls through to the terminal opportunity-cost IS component (Section
-    5.1) if the episode ends first -- no synthetic price levels are
-    invented beyond what is actually observed.
-  - A resting LIMIT order whose computed price falls outside the visible
-    top-20 book is seeded with Q_ahead=0 (we cannot observe deeper levels;
-    flagged as likely optimistic for very passive/deep prices).
+Phase 2b scope: full 42-dim observation vector (Section 3.1), superseding
+Phase 2a reduced 9-dim subset. Every index is in _OBS_SPEC below. New
+flagged interpretations (full rationale in the Phase 2b completion report,
+kept brief here to keep this docstring maintainable):
+  - idx 12 / 40 (trade flow, taker ratio): derived from L2 diffs directly
+    (touch-level depletion inferred as taker buy/sell pressure) -- NO new
+    trade-tape data needed. See _precompute_feature_series().
+  - idx 10-11 (cancel_add_ratio): genuinely blocked -- CAR needs real
+    cancel volume, and this snapshot archive cannot separate a cancel from
+    a trade at the same price. Consistent with the existing v_cancel=0
+    adapter assumption, hardcoded 0.0 for both sides.
+  - idx 15-18 (L2/L1 stub hooks): plain overridable attributes, not real
+    agent calls (architecture_spec.md Section 4.4 step 4/5). l1_risk_score
+    is now the single source of truth also passed to step_reward().
+  - idx 19-38 (book_depth_norm): cross-sectional z-score across the 20
+    levels at one tick, not a time-rolling window.
+  - idx 39 (funding_rate_z): joined by timestamp against data/raw_l1/
+    funding_rate/ (both L2 ts and funding calc_time are epoch-ms,
+    confirmed by direct inspection). Z-scored vs trailing ~30d history.
+  - idx 9 TICK_SIZE: exchangeInfo runtime check is spec-requested but
+    fapi.binance.com is network-blocked (Section 2.1.1) -- 0.10 hardcoded,
+    flagged explicitly.
+  - idx 41 (own_open_orders_norm): own_qty_remaining / qty_total.
+  - idx 4, 14: not explicitly itemized in the Phase 2b task step list, but
+    built anyway since the full 42-dim vector requires every index.
+  - Lookback buffer increased to up to 600 ticks (60s) for idx 5/12/40,
+    WITHOUT changing the RNG draw order (buffer size decided after start
+    is already drawn) -- preserves exact Phase 2a seed reproducibility.
 """
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass, field
@@ -64,11 +65,16 @@ import gymnasium as gym
 import numpy as np
 import pandas as pd
 
-from src.data.features import obi
+from src.data.features import obi, zscore
 from src.envs.matching_engine import QueueState, queue_position_ratio, update_queue, walk_market_fill
 from src.envs.reward import RewardWeights, compute_implementation_shortfall, step_reward
 
-TICK_SIZE = 0.1  # BTCUSDT perpetual tick size, matches observed real data
+_log = logging.getLogger(__name__)
+
+TICK_SIZE = 0.1  # BTCUSDT perpetual tick size. Spec asks to confirm against exchangeInfo
+# at runtime rather than hardcode; exchangeInfo lives at fapi.binance.com, which is
+# network-blocked here (architecture_spec.md Section 2.1.1). Runtime verification is
+# genuinely not possible in this environment -- flagged deviation, not a silent shortcut.
 
 ORDER_TYPE_HOLD = 0
 ORDER_TYPE_LIMIT = 1
@@ -76,19 +82,37 @@ ORDER_TYPE_MARKET = 2
 ORDER_TYPE_CANCEL_REPLACE = 3
 SIZE_FRACTIONS = (0.2, 0.4, 0.6, 0.8, 1.0)
 
-# Reduced 9-dim observation: (full-vector idx, name, clip range)
+# Full 42-dim observation vector (architecture_spec.md Section 3.1): (index, name, clip
+# range). observation_space bounds are built directly from this; _build_obs() returns
+# values in this exact order. Full rationale for each new index is in the module
+# docstring above and the Phase 2b completion report.
 _OBS_SPEC = (
     (0, "time_remaining_norm", (0.0, 1.0)),
     (1, "inventory_remaining_norm", (-1.0, 1.0)),
     (2, "spread_norm", (0.0, 1.0)),
     (3, "mid_return_1s_z", (-5.0, 5.0)),
-    (9, "micro_mid_dev_ticks", (-5.0, 5.0)),
+    (4, "mid_return_5s_z", (-5.0, 5.0)),
+    (5, "realized_vol_60s_z", (-5.0, 5.0)),
     (6, "OBI_1", (-1.0, 1.0)),
     (7, "OBI_5", (-1.0, 1.0)),
     (8, "OBI_10", (-1.0, 1.0)),
+    (9, "micro_mid_dev_ticks", (-5.0, 5.0)),
+    (10, "cancel_add_ratio_bid", (0.0, 5.0)),
+    (11, "cancel_add_ratio_ask", (0.0, 5.0)),
+    (12, "trade_flow_imbalance_5s", (-1.0, 1.0)),
     (13, "queue_position_ratio", (-1.0, 1.0)),
+    (14, "ticks_since_own_fill_norm", (0.0, 1.0)),
+    (15, "l2_target_slice_ratio", (0.0, 1.0)),
+    (16, "l2_urgency", (0.0, 1.0)),
+    (17, "l1_risk_score", (-1.0, 1.0)),
+    (18, "l1_confidence", (0.0, 1.0)),
+    *[(19 + i, f"book_depth_norm_{i}", (-5.0, 5.0)) for i in range(20)],
+    (39, "funding_rate_z", (-5.0, 5.0)),
+    (40, "taker_buy_sell_ratio_1m", (-1.0, 1.0)),
+    (41, "own_open_orders_norm", (0.0, 1.0)),
 )
 OBS_FEATURE_NAMES = tuple(name for _, name, _ in _OBS_SPEC)
+assert len(_OBS_SPEC) == 42
 
 
 @dataclass
@@ -117,10 +141,10 @@ _DATE_RE = re.compile(r'(\d{4}-\d{2}-\d{2})')
 
 def _extract_date(path: Path) -> str:
     """Pulls the YYYY-MM-DD date out of an l2-{symbol}-{date}.parquet filename
-    (see scripts/collect_l2_bybit.py's day_str = day.isoformat()). Raises if a
-    file in data_dir doesn't follow that convention -- a silently-skipped file
-    would be a worse failure mode than a loud one when date_range filtering is
-    what's supposed to make window selection reproducible."""
+    (see scripts/collect_l2_bybit.py day_str = day.isoformat()). Raises if a
+    file in data_dir does not follow that convention -- a silently-skipped
+    file would be a worse failure mode than a loud one when date_range
+    filtering is what is supposed to make window selection reproducible."""
     m = _DATE_RE.search(path.stem)
     if m is None:
         raise ValueError(f"Could not parse a YYYY-MM-DD date out of filename: {path.name}")
@@ -135,12 +159,59 @@ def _parse_levels(raw_json: str) -> tuple[np.ndarray, np.ndarray]:
     return arr[:, 0], arr[:, 1]
 
 
+def _rolling_return(mids: np.ndarray, window_ticks: int) -> np.ndarray:
+    """out[i] = (mids[i]-mids[i-window_ticks])/mids[i-window_ticks], 0.0 where
+    there is not enough history yet (i < window_ticks) or the denominator is
+    non-positive."""
+    n = len(mids)
+    out = np.zeros(n, dtype=float)
+    if n > window_ticks and window_ticks > 0:
+        prior = mids[:-window_ticks]
+        curr = mids[window_ticks:]
+        valid = prior > 0
+        out[window_ticks:][valid] = (curr[valid] - prior[valid]) / prior[valid]
+    return out
+
+
+def _rolling_rms(values: np.ndarray, window_ticks: int) -> np.ndarray:
+    """out[i] = sqrt(mean(values[max(0,i-window_ticks+1):i+1]**2)) -- a
+    trailing-window RMS, window shrinking gracefully near the start of the
+    array rather than requiring the full window to be available."""
+    n = len(values)
+    sq = values.astype(float) ** 2
+    csum = np.concatenate([[0.0], np.cumsum(sq)])
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        w = min(window_ticks, i + 1)
+        out[i] = math.sqrt((csum[i + 1] - csum[i + 1 - w]) / w) if w > 0 else 0.0
+    return out
+
+
+def _rolling_sum(values: np.ndarray, window_ticks: int) -> np.ndarray:
+    """out[i] = sum(values[max(0,i-window_ticks+1):i+1]) -- trailing-window
+    sum, same shrinking-near-the-start behavior as _rolling_rms."""
+    n = len(values)
+    csum = np.concatenate([[0.0], np.cumsum(values.astype(float))])
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        w = min(window_ticks, i + 1)
+        out[i] = csum[i + 1] - csum[i + 1 - w]
+    return out
+
+
 class LOBExecutionEnv(gym.Env):
     """Single-agent (L3-only) limit order book execution environment,
     replaying real historical Bybit L2 archive data. See module docstring
-    for the Phase 2a scope and every flagged design assumption."""
+    for the Phase 2a/2b scope and every flagged design assumption."""
 
     metadata = {"render_modes": []}
+
+    # Trailing history needed by the widest-window feature (realized_vol_60s_z /
+    # taker_buy_sell_ratio_1m, both 60s). Buffer fetched at reset() is up to this many
+    # ticks before the episode start -- see module docstring Lookback buffer note for
+    # why this does not change the RNG draw sequence / Phase 2a reproducibility.
+    _MAX_LOOKBACK_S = 60.0
+    _FUNDING_LOOKBACK_PERIODS = 90  # roughly 30 days at the standard 8h funding cadence
 
     def __init__(
         self,
@@ -153,6 +224,11 @@ class LOBExecutionEnv(gym.Env):
         reward_weights: RewardWeights | None = None,
         fee_bps_per_fill: float = 1.0,
         date_range: tuple[str, str] | None = None,
+        funding_rate_dir: str | Path = "data/raw_l1/funding_rate",
+        l1_risk_score: float = 0.0,
+        l1_confidence: float = 0.0,
+        l2_urgency: float = 0.5,
+        l2_target_slice_ratio_override: float | None = None,
     ) -> None:
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -165,6 +241,16 @@ class LOBExecutionEnv(gym.Env):
         self.reward_weights = reward_weights or RewardWeights()
         self.fee_bps_per_fill = fee_bps_per_fill
 
+        # L1/L2 stub/override hooks (architecture_spec.md Section 4.4 step 4/5: L1 is a
+        # no-op stub until real Ollama calls exist; L2 does not exist until Phase 3/4).
+        # Plain settable attributes, not calls to real agent code -- see module docstring.
+        self.l1_risk_score = l1_risk_score
+        self.l1_confidence = l1_confidence
+        self.l2_urgency = l2_urgency
+        self.l2_target_slice_ratio_override = l2_target_slice_ratio_override
+
+        self._max_lookback_ticks = max(self.lookback_ticks, round(self._MAX_LOOKBACK_S / self.tick_interval_s))
+
         self.observation_space = gym.spaces.Box(
             low=np.array([lo for _, _, (lo, _) in _OBS_SPEC], dtype=np.float32),
             high=np.array([hi for _, _, (_, hi) in _OBS_SPEC], dtype=np.float32),
@@ -174,24 +260,30 @@ class LOBExecutionEnv(gym.Env):
 
         # Reproducibility (architecture_spec.md Section 4.4 needs identical held-out
         # windows across on/off ablation runs): globbing data_dir fresh in every
-        # instantiation means the file list -- and therefore what a fixed seed's
-        # integer index resolves to -- silently drifts as the L2 backfill job (which
-        # walks backward, prepending older days) adds files between runs. Passing an
-        # explicit date_range pins the exact file set independent of whatever else has
-        # landed on disk since; without it, behavior is unchanged (whatever is
-        # currently present), which remains fine for exploratory/dev use.
+        # instantiation means the file list -- and therefore what a fixed seed integer
+        # index resolves to -- silently drifts as the L2 backfill job (which walks
+        # backward, prepending older days) adds files between runs. Passing an explicit
+        # date_range pins the exact file set independent of whatever else has landed on
+        # disk since; without it, behavior is unchanged (whatever is currently present),
+        # which remains fine for exploratory/dev use.
         all_files = sorted(self.data_dir.glob("*.parquet"))
         if date_range is not None:
             start_date, end_date = date_range
             self._files = [p for p in all_files if start_date <= _extract_date(p) <= end_date]
         else:
             self._files = all_files
+            _log.warning(
+                "date_range not set; cross-run window reproducibility is not guaranteed "
+                "(see architecture_spec.md Section 4.4)."
+            )
         if not self._files:
             raise FileNotFoundError(
                 f"No parquet files found in {self.data_dir}"
                 + (f" for date_range={date_range}" if date_range is not None else "")
             )
         self._day_cache: dict[Path, pd.DataFrame] = {}
+
+        self._funding_df = self._load_funding_history(Path(funding_rate_dir))
 
         # episode state, set in reset()
         self._ticks: list[TickView] = []
@@ -203,13 +295,19 @@ class LOBExecutionEnv(gym.Env):
         self.arrival_price: float = 0.0
         self._resting: QueueState | None = None
         self._resting_price: float | None = None
-        self._resting_side: str | None = None  # "bid" or "ask" -- which side of the book we rest on
+        self._resting_side: str | None = None  # bid or ask -- which side of the book we rest on
         self._spread_p95: float = 1.0
         self._ret1s_mean: float = 0.0
         self._ret1s_std: float = 1.0
+        self._ret5s_mean: float = 0.0
+        self._ret5s_std: float = 1.0
+        self._rv60s_mean: float = 0.0
+        self._rv60s_std: float = 1.0
+        self._funding_rate_z: float = 0.0
+        self._last_fill_tick_idx: int | None = None
         self._episode_fills: list[dict] = []  # full history for the episode, for eval reporting
 
-    _MAX_CACHED_DAYS = 3  # ~85MB/day; a small cache trims repeat reads across 50+ episodes without holding all 115+ files resident
+    _MAX_CACHED_DAYS = 3  # roughly 85MB/day; a small cache trims repeat reads across 50+ episodes
 
     def _load_day(self, path: Path) -> pd.DataFrame:
         if path not in self._day_cache:
@@ -217,6 +315,41 @@ class LOBExecutionEnv(gym.Env):
                 self._day_cache.pop(next(iter(self._day_cache)))
             self._day_cache[path] = pd.read_parquet(path)
         return self._day_cache[path]
+
+    def _load_funding_history(self, funding_dir: Path) -> pd.DataFrame:
+        """Loaded once at construction (not per-episode -- it is a small,
+        symbol-wide archive independent of which L2 day/window an episode
+        samples). Missing directory/files degrade gracefully to an empty
+        frame (funding_rate_z then stays at its 0.0 neutral default) rather
+        than raising -- funding context is a genuinely optional enrichment,
+        not something the env core loop depends on."""
+        if not funding_dir.exists():
+            return pd.DataFrame(columns=["calc_time", "last_funding_rate"])
+        files = sorted(funding_dir.glob("*.parquet"))
+        if not files:
+            return pd.DataFrame(columns=["calc_time", "last_funding_rate"])
+        df = pd.concat(
+            [pd.read_parquet(f, columns=["calc_time", "last_funding_rate"]) for f in files],
+            ignore_index=True,
+        )
+        return df.sort_values("calc_time").reset_index(drop=True)
+
+    def _compute_funding_rate_z(self, episode_ts: int) -> float:
+        """episode_ts and calc_time are both epoch-milliseconds (confirmed
+        by direct inspection of both datasets, see module docstring) -- a
+        plain numeric searchsorted is a valid as-of backward join, no unit
+        conversion needed."""
+        df = self._funding_df
+        if len(df) == 0:
+            return 0.0
+        calc_times = df["calc_time"].to_numpy()
+        idx = int(np.searchsorted(calc_times, episode_ts, side="right")) - 1
+        if idx < 0:
+            return 0.0  # episode predates all known funding history
+        window_start = max(0, idx - self._FUNDING_LOOKBACK_PERIODS + 1)
+        window = df["last_funding_rate"].to_numpy()[window_start : idx + 1]
+        current = float(window[-1])
+        return zscore(current, float(np.mean(window)), float(np.std(window)))
 
     def _build_ticks(self, day_df: pd.DataFrame, start: int, end: int) -> list[TickView]:
         sl = day_df.iloc[start:end]
@@ -233,6 +366,44 @@ class LOBExecutionEnv(gym.Env):
             )
         return ticks
 
+    def _precompute_feature_series(self) -> None:
+        """Once per reset(), vectorized over the full self._ticks range (buffer +
+        episode): every rolling-window feature series (idx 4, 5, 12, 40), so
+        _build_obs() is an O(1) lookup per tick rather than recomputing a window
+        from scratch every step. See module docstring for the window-size
+        rationale and the touch-depletion trade-sign inference technique."""
+        n = len(self._ticks)
+        mids = np.array([t.mid_price for t in self._ticks], dtype=float)
+
+        ticks_5s = max(1, round(5.0 / self.tick_interval_s))
+        ticks_60s = max(1, round(60.0 / self.tick_interval_s))
+
+        tick_rets = _rolling_return(mids, 1)  # per-tick (1-step) returns, building block for realized vol
+        self._ret5s_series = _rolling_return(mids, ticks_5s)
+        self._rv60s_series = _rolling_rms(tick_rets, ticks_60s)
+
+        self._ret5s_mean = float(np.mean(self._ret5s_series)) if n else 0.0
+        self._ret5s_std = float(np.std(self._ret5s_series)) if n > 1 else 1.0
+        self._rv60s_mean = float(np.mean(self._rv60s_series)) if n else 0.0
+        self._rv60s_std = float(np.std(self._rv60s_series)) if n > 1 else 1.0
+
+        signed = np.zeros(n, dtype=float)
+        absvol = np.zeros(n, dtype=float)
+        for i in range(1, n):
+            prev, curr = self._ticks[i - 1], self._ticks[i]
+            bid_dep = max(0.0, prev.qty_at_price(prev.best_bid, "bid") - curr.qty_at_price(prev.best_bid, "bid"))
+            ask_dep = max(0.0, prev.qty_at_price(prev.best_ask, "ask") - curr.qty_at_price(prev.best_ask, "ask"))
+            signed[i] = ask_dep - bid_dep  # ask depletion -> taker BUY pressure; bid depletion -> taker SELL
+            absvol[i] = ask_dep + bid_dep
+
+        signed_5s = _rolling_sum(signed, ticks_5s)
+        abs_5s = _rolling_sum(absvol, ticks_5s)
+        self._flow5s_series = np.clip(np.divide(signed_5s, abs_5s + 1e-9), -1.0, 1.0)
+
+        signed_60s = _rolling_sum(signed, ticks_60s)
+        abs_60s = _rolling_sum(absvol, ticks_60s)
+        self._flow60s_series = np.clip(np.divide(signed_60s, abs_60s + 1e-9), -1.0, 1.0)
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
 
@@ -241,6 +412,9 @@ class LOBExecutionEnv(gym.Env):
         day_df = self._load_day(day_path)
         n_rows = len(day_df)
 
+        # needed/start/end use self.lookback_ticks (NOT self._max_lookback_ticks) --
+        # deliberately unchanged from Phase 2a so the RNG draw sequence, and therefore
+        # which file/window/side/size a given seed resolves to, stays byte-identical.
         needed = self.lookback_ticks + self.horizon_ticks
         if n_rows <= needed:
             # degenerate case: day shorter than one full episode window (shouldn't
@@ -253,13 +427,31 @@ class LOBExecutionEnv(gym.Env):
             start = int(self.np_random.integers(self.lookback_ticks, n_rows - self.horizon_ticks))
             end = start + self.horizon_ticks
 
-        self._ticks = self._build_ticks(day_df, start - self.lookback_ticks, end)
-        self._episode_start = self.lookback_ticks  # index into self._ticks where the real episode begins
+        # Buffer for feature lookback (idx 4/5/12/40's 5s/60s windows): as much of
+        # _max_lookback_ticks as is actually available before `start`. This is a pure
+        # post-hoc slicing decision made AFTER start is drawn above -- it does not
+        # perturb the RNG state, so it cannot change which window a given seed selects.
+        buffer_ticks = min(self._max_lookback_ticks, start)
+        self._ticks = self._build_ticks(day_df, start - buffer_ticks, end)
+        self._episode_start = buffer_ticks  # index into self._ticks where the real episode begins
         self._tick_idx = self._episode_start
 
+        # legacy_ticks is EXACTLY the Phase 2a window (lookback_ticks + horizon_ticks
+        # ticks, i.e. day_df.iloc[start-lookback_ticks:end]) -- a strict sub-range of the
+        # now-larger self._ticks (which additionally carries up to _max_lookback_ticks of
+        # buffer for idx 4/5/12/40's rolling windows below). Every Phase 2a-era statistic
+        # (spread_p95, ret1s stats, ref_depth/qty_total sizing) stays scoped to
+        # legacy_ticks so it is byte-identical to before. Getting this wrong is exactly
+        # how ref_depth silently drifted during development: it is used to size
+        # qty_total, which DOES feed reward/IS (unlike idx 2/3's z-score stats, which
+        # only feed obs) -- caught via a controlled before/after comparison at identical
+        # seed+date_range (qty_total: 23.9086 vs 22.7718 for one test seed, before this
+        # fix scoped ref_depth back down).
+        legacy_ticks = self._ticks[buffer_ticks - self.lookback_ticks :]
+
         # Local (per-episode-window) normalization stats -- see module docstring.
-        mids = np.array([t.mid_price for t in self._ticks], dtype=float)
-        spreads = np.array([t.spread for t in self._ticks], dtype=float)
+        mids = np.array([t.mid_price for t in legacy_ticks], dtype=float)
+        spreads = np.array([t.spread for t in legacy_ticks], dtype=float)
         self._spread_p95 = float(np.percentile(spreads, 95)) if len(spreads) else 1.0
         if self._spread_p95 <= 0:
             self._spread_p95 = TICK_SIZE
@@ -269,10 +461,14 @@ class LOBExecutionEnv(gym.Env):
         if self._ret1s_std <= 0:
             self._ret1s_std = 1e-9
 
+        self._precompute_feature_series()
+        episode_ts = self._ticks[self._episode_start].ts
+        self._funding_rate_z = self._compute_funding_rate_z(episode_ts)
+
         # Order-size bound relative to typical top-of-book depth in this window
         # (task instruction: bound so episodes aren't degenerate by construction).
         top_depths = np.array(
-            [t.bid_sizes[0] + t.ask_sizes[0] for t in self._ticks if len(t.bid_sizes) and len(t.ask_sizes)],
+            [t.bid_sizes[0] + t.ask_sizes[0] for t in legacy_ticks if len(t.bid_sizes) and len(t.ask_sizes)],
             dtype=float,
         )
         ref_depth = float(np.median(top_depths)) if len(top_depths) else 1.0
@@ -290,6 +486,7 @@ class LOBExecutionEnv(gym.Env):
         self._resting_price = None
         self._resting_side = None
         self._episode_fills = []
+        self._last_fill_tick_idx = None
         self._terminated_early = False
 
         obs = self._build_obs()
@@ -299,8 +496,22 @@ class LOBExecutionEnv(gym.Env):
     def _current_tick(self) -> TickView:
         return self._ticks[self._tick_idx]
 
+    def _compute_l2_target_slice_ratio(self) -> float:
+        """Default: what a fixed-TWAP schedule would have executed by now, as a
+        fraction of the full parent order (linear in elapsed time -- only the
+        minimal scheduling arithmetic, not scripts/phase2a_sanity_suite.py full
+        N-slice TWAPPolicy). Overridable via l2_target_slice_ratio_override for
+        when a real L2 agent exists to supply its own target."""
+        if self.l2_target_slice_ratio_override is not None:
+            return float(np.clip(self.l2_target_slice_ratio_override, 0.0, 1.0))
+        if self.horizon_ticks <= 0:
+            return 0.0
+        ticks_elapsed = self._tick_idx - self._episode_start
+        return float(np.clip(ticks_elapsed / self.horizon_ticks, 0.0, 1.0))
+
     def _build_obs(self) -> np.ndarray:
         tick = self._current_tick()
+        pos = self._tick_idx  # index into self._ticks / the precomputed feature series
         ticks_elapsed = self._tick_idx - self._episode_start
         time_remaining_norm = max(0.0, min(1.0, 1.0 - ticks_elapsed / self.horizon_ticks))
 
@@ -312,6 +523,9 @@ class LOBExecutionEnv(gym.Env):
         prior = self._ticks[self._tick_idx - self.lookback_ticks]
         ret_1s = (tick.mid_price - prior.mid_price) / prior.mid_price if prior.mid_price > 0 else 0.0
         mid_return_1s_z = float(np.clip((ret_1s - self._ret1s_mean) / self._ret1s_std, -5.0, 5.0))
+
+        mid_return_5s_z = zscore(self._ret5s_series[pos], self._ret5s_mean, self._ret5s_std)
+        realized_vol_60s_z = zscore(self._rv60s_series[pos], self._rv60s_mean, self._rv60s_std)
 
         if len(tick.bid_sizes) and len(tick.ask_sizes) and (tick.bid_sizes[0] + tick.ask_sizes[0]) > 0:
             micro = (
@@ -325,13 +539,53 @@ class LOBExecutionEnv(gym.Env):
         obi_5 = obi(tick.bid_prices, tick.ask_prices, tick.bid_sizes, tick.ask_sizes, k=5) if len(tick.bid_prices) >= 5 else obi_1
         obi_10 = obi(tick.bid_prices, tick.ask_prices, tick.bid_sizes, tick.ask_sizes, k=10) if len(tick.bid_prices) >= 10 else obi_5
 
+        # idx 10-11: genuinely blocked, not a fresh stub -- see module docstring.
+        cancel_add_ratio_bid = 0.0
+        cancel_add_ratio_ask = 0.0
+
+        trade_flow_imbalance_5s = float(self._flow5s_series[pos])
+
         qpr = queue_position_ratio(self._resting) if self._resting is not None else -1.0
 
-        return np.array(
-            [time_remaining_norm, inventory_remaining_norm, spread_norm, mid_return_1s_z,
-             micro_mid_dev_ticks, obi_1, obi_5, obi_10, qpr],
-            dtype=np.float32,
-        )
+        if self._last_fill_tick_idx is None:
+            ticks_since_own_fill_norm = 1.0
+        else:
+            ticks_since_own_fill_norm = float(
+                np.clip((self._tick_idx - self._last_fill_tick_idx) / self.horizon_ticks, 0.0, 1.0)
+            )
+
+        l2_target_slice_ratio = self._compute_l2_target_slice_ratio()
+        l2_urgency = float(np.clip(self.l2_urgency, 0.0, 1.0))
+        l1_risk_score = float(np.clip(self.l1_risk_score, -1.0, 1.0))
+        l1_confidence = float(np.clip(self.l1_confidence, 0.0, 1.0))
+
+        # idx 19-38: cross-sectional z-score across the 20 bid+ask level sizes at THIS
+        # tick (see module docstring -- 20-level rolling mean read as level-axis, not
+        # time-axis). Missing levels (book shallower than 10 on a side) pad with 0.0.
+        bid_sizes_10 = np.zeros(10, dtype=float)
+        bid_sizes_10[: min(10, len(tick.bid_sizes))] = tick.bid_sizes[:10]
+        ask_sizes_10 = np.zeros(10, dtype=float)
+        ask_sizes_10[: min(10, len(tick.ask_sizes))] = tick.ask_sizes[:10]
+        sizes_20 = np.concatenate([bid_sizes_10, ask_sizes_10])
+        level_mean = float(np.mean(sizes_20))
+        level_std = float(np.std(sizes_20))
+        book_depth_norm = [zscore(float(s), level_mean, level_std) for s in sizes_20]
+
+        taker_buy_sell_ratio_1m = float(self._flow60s_series[pos])
+
+        own_open_orders_norm = 0.0
+        if self._resting is not None and self.qty_total > 0:
+            own_open_orders_norm = float(np.clip(self._resting.own_qty_remaining / self.qty_total, 0.0, 1.0))
+
+        values = [
+            time_remaining_norm, inventory_remaining_norm, spread_norm, mid_return_1s_z,
+            mid_return_5s_z, realized_vol_60s_z, obi_1, obi_5, obi_10, micro_mid_dev_ticks,
+            cancel_add_ratio_bid, cancel_add_ratio_ask, trade_flow_imbalance_5s, qpr,
+            ticks_since_own_fill_norm, l2_target_slice_ratio, l2_urgency, l1_risk_score,
+            l1_confidence, *book_depth_norm, self._funding_rate_z, taker_buy_sell_ratio_1m,
+            own_open_orders_norm,
+        ]
+        return np.array(values, dtype=np.float32)
 
     def _build_info(self, *, step_fills: list[dict], canceled_unfilled: bool) -> dict[str, Any]:
         tick = self._current_tick()
@@ -353,7 +607,7 @@ class LOBExecutionEnv(gym.Env):
     def _estimate_trade_volume(self, prev_idx: int, curr_idx: int, price: float, side: str) -> tuple[float, float]:
         """Approximates v_trade as the full observed decrease in resting qty
         at `price` between two ticks (v_cancel=0 in this adapter) -- see
-        module docstring for why this data source can't separate the two."""
+        module docstring for why this data source cannot separate the two."""
         prev_qty = self._ticks[prev_idx].qty_at_price(price, side)
         curr_qty = self._ticks[curr_idx].qty_at_price(price, side)
         v_trade = max(0.0, prev_qty - curr_qty)
@@ -430,11 +684,14 @@ class LOBExecutionEnv(gym.Env):
                 self._place_limit(tick_before, offset, size_frac)
         # HOLD (order_type == 0): nothing further.
 
+        if step_fills:
+            self._last_fill_tick_idx = self._tick_idx
+
         r = step_reward(
             self.reward_weights, side=self.side, fills=step_fills,
             arrival_price=self.arrival_price, mid_price=tick_before.mid_price,
             qty_remaining=self.qty_remaining, qty_total=self.qty_total,
-            dt=self.tick_interval_s, l1_risk_score=0.0,
+            dt=self.tick_interval_s, l1_risk_score=self.l1_risk_score,
             canceled_unfilled=canceled_unfilled,
             queue_ahead_at_cancel=queue_ahead_at_cancel, queue_at_level=queue_at_level,
         )

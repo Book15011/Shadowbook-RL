@@ -70,3 +70,15 @@ class CancelAddTracker:
 
     def window_ratio(self, side: str) -> float:
         return self.ratio(side)
+
+
+def zscore(x: float, mean: float, std: float, clip: float = 5.0) -> float:
+    """Z-score x against (mean, std), clipped to +/-clip.
+
+    std <= 0 (a degenerate or single-sample population) returns 0.0 (neutral)
+    rather than dividing by zero or by a near-zero denominator that would
+    blow the result out to the clip bound for a meaningless reason.
+    """
+    if std <= 0:
+        return 0.0
+    return float(np.clip((x - mean) / std, -clip, clip))
