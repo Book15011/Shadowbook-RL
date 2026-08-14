@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -111,6 +112,21 @@ class TickView:
         return float(sizes[matches][0])
 
 
+_DATE_RE = re.compile(r'(\d{4}-\d{2}-\d{2})')
+
+
+def _extract_date(path: Path) -> str:
+    """Pulls the YYYY-MM-DD date out of an l2-{symbol}-{date}.parquet filename
+    (see scripts/collect_l2_bybit.py's day_str = day.isoformat()). Raises if a
+    file in data_dir doesn't follow that convention -- a silently-skipped file
+    would be a worse failure mode than a loud one when date_range filtering is
+    what's supposed to make window selection reproducible."""
+    m = _DATE_RE.search(path.stem)
+    if m is None:
+        raise ValueError(f"Could not parse a YYYY-MM-DD date out of filename: {path.name}")
+    return m.group(1)
+
+
 def _parse_levels(raw_json: str) -> tuple[np.ndarray, np.ndarray]:
     levels = json.loads(raw_json)
     if not levels:
@@ -136,9 +152,11 @@ class LOBExecutionEnv(gym.Env):
         max_size_mult: float = 8.0,
         reward_weights: RewardWeights | None = None,
         fee_bps_per_fill: float = 1.0,
+        date_range: tuple[str, str] | None = None,
     ) -> None:
         super().__init__()
         self.data_dir = Path(data_dir)
+        self.date_range = date_range
         self.horizon_ticks = horizon_ticks
         self.lookback_ticks = lookback_ticks
         self.tick_interval_s = tick_interval_s
@@ -154,9 +172,25 @@ class LOBExecutionEnv(gym.Env):
         )
         self.action_space = gym.spaces.MultiDiscrete([4, 11, 5])
 
-        self._files = sorted(self.data_dir.glob("*.parquet"))
+        # Reproducibility (architecture_spec.md Section 4.4 needs identical held-out
+        # windows across on/off ablation runs): globbing data_dir fresh in every
+        # instantiation means the file list -- and therefore what a fixed seed's
+        # integer index resolves to -- silently drifts as the L2 backfill job (which
+        # walks backward, prepending older days) adds files between runs. Passing an
+        # explicit date_range pins the exact file set independent of whatever else has
+        # landed on disk since; without it, behavior is unchanged (whatever is
+        # currently present), which remains fine for exploratory/dev use.
+        all_files = sorted(self.data_dir.glob("*.parquet"))
+        if date_range is not None:
+            start_date, end_date = date_range
+            self._files = [p for p in all_files if start_date <= _extract_date(p) <= end_date]
+        else:
+            self._files = all_files
         if not self._files:
-            raise FileNotFoundError(f"No parquet files found in {self.data_dir}")
+            raise FileNotFoundError(
+                f"No parquet files found in {self.data_dir}"
+                + (f" for date_range={date_range}" if date_range is not None else "")
+            )
         self._day_cache: dict[Path, pd.DataFrame] = {}
 
         # episode state, set in reset()
