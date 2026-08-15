@@ -166,9 +166,20 @@ class ValISEvalCallback(BaseCallback):
         results = [self._run_l3_episode(seed=s) for s in self._eval_seeds]
         l3_is_bps = np.array([r["is_result"].is_total_bps for r in results])
         l3_fill = np.array([r["is_result"].fill_ratio for r in results])
+        # is_exec_bps is None (not NaN) when fill_ratio == 0 -- reward.py's documented
+        # convention for "undefined, no fills to average", not "zero cost". dtype=float
+        # converts None -> nan on construction; nanmean/nanstd then correctly average only
+        # over episodes where it was actually defined. is_opp_bps has no such case (always
+        # computed regardless of fill_ratio), so it uses plain mean/std like is_total_bps.
+        l3_is_exec_bps = np.array([r["is_result"].is_exec_bps for r in results], dtype=float)
+        l3_is_opp_bps = np.array([r["is_result"].is_opp_bps for r in results])
 
         self.logger.record("eval/val_l3_is_total_bps_mean", float(l3_is_bps.mean()))
         self.logger.record("eval/val_l3_is_total_bps_std", float(l3_is_bps.std()))
+        self.logger.record("eval/val_l3_is_exec_bps_mean", float(np.nanmean(l3_is_exec_bps)))
+        self.logger.record("eval/val_l3_is_exec_bps_std", float(np.nanstd(l3_is_exec_bps)))
+        self.logger.record("eval/val_l3_is_opp_bps_mean", float(l3_is_opp_bps.mean()))
+        self.logger.record("eval/val_l3_is_opp_bps_std", float(l3_is_opp_bps.std()))
         self.logger.record("eval/val_l3_fill_ratio_mean", float(l3_fill.mean()))
         self.logger.record("eval/val_twap_baseline_is_total_bps_mean", float(self._twap_is_bps.mean()))
         self.logger.record("eval/val_twap_baseline_fill_ratio_mean", float(self._twap_fill.mean()))
