@@ -272,6 +272,19 @@ def main() -> None:
     if args.resume_from:
         model = RecurrentPPO.load(args.resume_from, device=ppo_cfg["device"])
         model.set_env(vec_env)
+        # RecurrentPPO.load() reconstructs the model with env=None (no env= kwarg was
+        # passed to .load() above), so set_random_seed()'s internal `if self.env is not
+        # None: self.env.seed(seed)` was skipped during load -- and set_env() on its own
+        # never seeds anything (confirmed directly against the installed SB3 source: it
+        # only wraps/validates the env and assigns self.env, no seeding call at all). A
+        # fresh run seeds correctly only because __init__ sets self.env BEFORE
+        # _setup_model() calls set_random_seed(); here that ordering is inverted, so the
+        # equivalent call has to happen explicitly, now that self.env is finally real.
+        # Calling the same method a fresh run relies on (not just vec_env.seed()
+        # directly) also reseeds the global python/numpy/torch RNGs and the action
+        # space, matching a fresh run's _setup_model() effect exactly, not just the
+        # env-specific piece of it.
+        model.set_random_seed(model.seed)
         print(f"resumed from {args.resume_from}: loaded num_timesteps={model.num_timesteps}")
     else:
         model = RecurrentPPO(
