@@ -27,6 +27,7 @@ not assumed from memory):
 
 Run: PYTHONPATH=. .venv/bin/python -m src.train.train_l3 [--total-timesteps N]
 [--n-envs N] [--eval-freq N] [--n-eval-episodes N] [--config configs/ppo_l3.yaml]
+[--no-progress-bar]
 """
 from __future__ import annotations
 
@@ -199,6 +200,13 @@ def main() -> None:
         "--n-eval-episodes", type=int, default=None,
         help="Override config eval.n_eval_episodes (e.g. for a short smoke test)",
     )
+    parser.add_argument(
+        "--progress-bar", action=argparse.BooleanOptionalAction, default=True,
+        help="tqdm progress bar (default on). Use --no-progress-bar when stdout is "
+        "redirected to a log file (e.g. a long unattended nohup run) -- tqdm's "
+        "carriage-return redraws do not collapse in a plain file the way they do "
+        "on a real terminal, and repeat every refresh for the run's full duration.",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -272,7 +280,8 @@ def main() -> None:
     )
 
     model.learn(
-        total_timesteps=total_timesteps, callback=CallbackList([checkpoint_cb, eval_cb]), progress_bar=True,
+        total_timesteps=total_timesteps, callback=CallbackList([checkpoint_cb, eval_cb]),
+        progress_bar=args.progress_bar,
     )
 
     Path("models").mkdir(exist_ok=True)

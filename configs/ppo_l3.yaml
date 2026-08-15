@@ -88,11 +88,20 @@ eval:
                                      # real several-bps learning signal once one exists, for well
                                      # under 1% added wall-clock overhead (see eval_freq above).
 checkpoint:
-  save_freq_timesteps: 4096         # JUDGMENT CALL: same reasoning as the original eval_freq --
-                                     # roughly once per rollout (n_envs * n_steps = 8*512).
-                                     # Left unchanged: checkpoint cost is a cheap disk write, not
-                                     # a full eval episode, so it does not carry the same
-                                     # overhead pressure that motivated rebalancing eval_freq.
+  save_freq_timesteps: 250_000      # REBALANCED (was 4096). Originally left matching the old
+                                     # eval_freq on the reasoning that a checkpoint write is
+                                     # cheap so overhead was not a concern -- true for wall-clock,
+                                     # but CheckpointCallback has no pruning (confirmed by reading
+                                     # its source: every save gets a unique step-suffixed
+                                     # filename, nothing is ever deleted), so at 4096 the real
+                                     # 20M-step run would silently accumulate ~4,883 checkpoint
+                                     # pairs (~12.7GB, measured from one real pair: 2.61MB zip +
+                                     # 4.5KB pkl). Matched to eval_freq_timesteps instead: exactly
+                                     # 80 checkpoint pairs (~209MB total), one per eval point.
+                                     # Tradeoff: up to ~4 hours of progress lost on an unattended
+                                     # crash (250_000 steps at the measured ~17.4 steps/s), about
+                                     # 1% of the full run -- acceptable for a 61x smaller,
+                                     # actually-navigable checkpoint directory.
   save_vecnormalize: true           # Section 4.1's note: VecNormalize stats must be saved
                                      # alongside the model for eval to use matching normalization.
 
