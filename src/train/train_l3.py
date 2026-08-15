@@ -218,7 +218,22 @@ def main() -> None:
         "carriage-return redraws do not collapse in a plain file the way they do "
         "on a real terminal, and repeat every refresh for the run's full duration.",
     )
+    parser.add_argument(
+        "--resume-from", type=str, default=None,
+        help="Path to a model checkpoint .zip to resume from (e.g. "
+        "models/l3_checkpoints/l3_ppo_1750000_steps.zip). Requires "
+        "--resume-vecnormalize. --total-timesteps is interpreted as REMAINING "
+        "steps, not an absolute target -- SB3 adds the checkpoint's own "
+        "num_timesteps back in automatically when reset_num_timesteps=False.",
+    )
+    parser.add_argument(
+        "--resume-vecnormalize", type=str, default=None,
+        help="Path to the matching VecNormalize .pkl for --resume-from (e.g. "
+        "models/l3_checkpoints/l3_ppo_vecnormalize_1750000_steps.pkl).",
+    )
     args = parser.parse_args()
+    if bool(args.resume_from) != bool(args.resume_vecnormalize):
+        raise ValueError("--resume-from and --resume-vecnormalize must be given together")
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -249,30 +264,38 @@ def main() -> None:
         for _ in range(n_envs)
     ])
     vec_env = VecMonitor(vec_env)
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=ppo_cfg["gamma"])
+    if args.resume_from:
+        vec_env = VecNormalize.load(args.resume_vecnormalize, vec_env)
+    else:
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=ppo_cfg["gamma"])
 
-    model = RecurrentPPO(
-        ppo_cfg["policy"], vec_env,
-        n_steps=ppo_cfg["n_steps"],
-        batch_size=ppo_cfg["batch_size"],
-        n_epochs=ppo_cfg["n_epochs"],
-        gamma=ppo_cfg["gamma"],
-        gae_lambda=ppo_cfg["gae_lambda"],
-        clip_range=ppo_cfg["clip_range"],
-        ent_coef=ppo_cfg["ent_coef"],
-        vf_coef=ppo_cfg["vf_coef"],
-        max_grad_norm=ppo_cfg["max_grad_norm"],
-        learning_rate=ppo_cfg["learning_rate"],
-        policy_kwargs=dict(
-            lstm_hidden_size=ppo_cfg["policy_kwargs"]["lstm_hidden_size"],
-            n_lstm_layers=ppo_cfg["policy_kwargs"]["n_lstm_layers"],
-            net_arch=ppo_cfg["policy_kwargs"]["net_arch"],
-        ),
-        tensorboard_log=ppo_cfg["tensorboard_log"],
-        device=ppo_cfg["device"],
-        verbose=ppo_cfg["verbose"],
-        seed=ppo_cfg["seed"],
-    )
+    if args.resume_from:
+        model = RecurrentPPO.load(args.resume_from, device=ppo_cfg["device"])
+        model.set_env(vec_env)
+        print(f"resumed from {args.resume_from}: loaded num_timesteps={model.num_timesteps}")
+    else:
+        model = RecurrentPPO(
+            ppo_cfg["policy"], vec_env,
+            n_steps=ppo_cfg["n_steps"],
+            batch_size=ppo_cfg["batch_size"],
+            n_epochs=ppo_cfg["n_epochs"],
+            gamma=ppo_cfg["gamma"],
+            gae_lambda=ppo_cfg["gae_lambda"],
+            clip_range=ppo_cfg["clip_range"],
+            ent_coef=ppo_cfg["ent_coef"],
+            vf_coef=ppo_cfg["vf_coef"],
+            max_grad_norm=ppo_cfg["max_grad_norm"],
+            learning_rate=ppo_cfg["learning_rate"],
+            policy_kwargs=dict(
+                lstm_hidden_size=ppo_cfg["policy_kwargs"]["lstm_hidden_size"],
+                n_lstm_layers=ppo_cfg["policy_kwargs"]["n_lstm_layers"],
+                net_arch=ppo_cfg["policy_kwargs"]["net_arch"],
+            ),
+            tensorboard_log=ppo_cfg["tensorboard_log"],
+            device=ppo_cfg["device"],
+            verbose=ppo_cfg["verbose"],
+            seed=ppo_cfg["seed"],
+        )
     print(f"model device actually in use: {model.device}")
 
     checkpoint_cb = CheckpointCallback(
@@ -292,7 +315,7 @@ def main() -> None:
 
     model.learn(
         total_timesteps=total_timesteps, callback=CallbackList([checkpoint_cb, eval_cb]),
-        progress_bar=args.progress_bar,
+        progress_bar=args.progress_bar, reset_num_timesteps=not args.resume_from,
     )
 
     Path("models").mkdir(exist_ok=True)
