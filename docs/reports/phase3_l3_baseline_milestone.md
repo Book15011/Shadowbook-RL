@@ -272,3 +272,152 @@ checksum against models/baseline_20M_backup/) and this probe own
 checkpoint (models/l3_executioner_v1_staleness_probe.zip and
 models/l3_executioner_v1_staleness_probe_vecnormalize.pkl) are preserved on
 disk for comparison.
+
+
+## Coefficient sweep (zeta=0.06 vs 0.006 vs 0.002)
+
+Following the zeta=0.06 probe (fill_ratio 0.582 to 0.969, IS-vs-TWAP margin
+0.63 to 0.16 bps), two questions needed answering before treating 0.06 as
+the answer: what mechanism actually drove the fill_ratio recovery, and
+would a gentler coefficient recover more of the IS edge while still fixing
+the problem.
+
+### Mechanism diagnosis (on the zeta=0.06 checkpoint)
+
+A 15-episode rollout (same protocol as the original investigation) on the
+finished zeta=0.06 checkpoint found:
+
+- Placements per episode: 4.47, versus about 1.7 in the original baseline
+  -- the dominant factor.
+- price_offset_ticks at true placements: 65.67% passive, 25.37%
+  aggressive, 8.96% at-touch -- a real but partial shift toward
+  aggression (the baseline was 75-86% passive across its low/high-fill
+  buckets), not a full reversal.
+- MARKET usage: 0.26% of ticks (up from exactly 0%), and for the first
+  time this actually cancels a still-resting unfilled order before
+  acting (14 of 67 placement streaks in this sample ended this way,
+  something structurally impossible at 0% MARKET usage). CANCEL_AND_REPLACE
+  stayed at exactly 0%.
+- Time-to-fill for streaks that did fill: median 195.5 ticks, versus
+  2,690 in the original low-fill bucket -- about a 14x collapse.
+
+Direct check on the ticks_since_own_fill_norm signal itself (obs idx 14,
+also the new reward term input) while resting: only 2.77% of resting-ticks
+sit at the fully saturated value of 1.0. Most sit near 0, because orders
+are cycling and refilling far more often now.
+
+Conclusion: the fill_ratio recovery is not explained by the small
+MARKET-usage increase alone, nor primarily by a full reversal to
+aggressive pricing. It is driven mainly by dramatically more frequent
+re-engagement (2.6x more placement attempts per episode), combined with a
+modest aggressiveness shift, with the new (if still small) MARKET-cancel
+pathway playing a real but secondary supporting role.
+
+### The saturation behavior changes the coefficient arithmetic
+
+Direct source inspection (src/envs/lob_execution_env.py,
+_ticks_since_own_fill_norm()) confirms: this value returns exactly 1.0
+immediately whenever an episode has had zero fills so far -- it is a hard
+floor, not a ramp building up from 0 to 1 over the episode. The original
+break-even derivation in this document Part B assumed a linear 0-to-1 ramp
+(giving a quadratic cumulative cost, sum_{k=1..K} zeta*(k/3000)). For the
+dominant case (an order resting, never yet filled this episode), the real
+cumulative cost is instead linear: -(0.002 + zeta) * K per K ticks held.
+
+Recomputing the real break-even (ticks before a single correction, costing
+up to 0.8, becomes cheaper than continuing to hold):
+
+- zeta=0.06 (probed): real break-even is about 12.9 ticks, not the
+  originally intended ~400 -- this is the actual reason 0.06 overcorrected
+  as hard as it did.
+- Naive "roughly 1/3 and 2/3 of 0.06" (0.02, 0.04): break-even about 36.4
+  and 19.1 ticks respectively -- still far too aggressive, confirming the
+  naive linear-fraction guess would not have meaningfully fixed the
+  overcorrection.
+- zeta=0.006 (chosen): break-even about 100 ticks.
+- zeta=0.002 (chosen): break-even about 200 ticks, matching this
+  document original intended target.
+
+### Sweep results
+
+Both candidates were warm-started from the ORIGINAL 20M-step baseline
+(not from the zeta=0.06 checkpoint), 2,000,000 steps each, same n_envs=8.
+A --reward-zeta CLI override was added to src/train/train_l3.py (threaded
+through make_env() and ValISEvalCallback, both accepting an optional
+RewardWeights) so each candidate could run without editing the shared
+src/envs/reward.py default per run -- necessary infrastructure for the
+sweep itself, not a change to matching_engine.py or the observation/action
+space.
+
+Paired eval (n=50, seeds 5000000-5000049, the reliable comparison basis),
+fill_ratio then IS_total_bps, first firing to last:
+
+- Baseline (no staleness term): flat around 0.59-0.65; IS_total_bps
+  around 0.63 bps margin over TWAP (1.2652) at a comparable step count.
+- zeta=0.06: fill_ratio 0.582 to 0.969 (strong recovery); IS_total_bps
+  0.509 to 1.101 (margin over TWAP shrinks from about 0.63 to 0.16 bps).
+- zeta=0.006: fill_ratio 0.582 to 0.527 (flat, no recovery across the
+  9 firings, actual sequence 0.582, 0.563, 0.568, 0.53, 0.615, 0.587,
+  0.618, 0.606, 0.527); IS_total_bps 0.509 to 0.637 (margin over TWAP
+  preserved at about 0.63 bps, matching the baseline).
+- zeta=0.002: fill_ratio 0.582 to 0.625 (flat, no recovery; sequence
+  0.582, 0.642, 0.629, 0.645, 0.624, 0.61, 0.625 -- two mid-sequence
+  firings were lost to log corruption during the earlier parallel-run
+  incident, see methodology note below); IS_total_bps 0.509 to 0.652
+  (margin over TWAP about 0.61 bps, also close to baseline).
+
+Independent 8-episode direct rollout check (own seed convention, order-type
+usage rates the eval log does not report):
+
+- zeta=0.06: MARKET 0.16-0.26% (measured twice, 15-episode and 8-episode
+  samples), CANCEL_AND_REPLACE 0%.
+- zeta=0.006: MARKET 0.004% (1 of 23,996 ticks -- noise, not a real
+  signal), CANCEL_AND_REPLACE 0%. mean_fill_ratio on this 8-episode sample
+  was 0.2356, notably lower than the paired-eval trend -- consistent with
+  this system own known high per-episode variance on a small, differently
+  seeded sample, not treated as more reliable than the n=50 paired result.
+- zeta=0.002: MARKET 0%, CANCEL_AND_REPLACE 0%. mean_fill_ratio on this
+  sample was 0.2641, same caveat as above.
+
+### Finding
+
+Neither gentler candidate shows the fix working within this 2,000,000-step
+window -- both remain statistically indistinguishable from the baseline
+own 0% MARKET/CANCEL_AND_REPLACE usage pattern and its ~0.59-0.65
+fill_ratio band. Only zeta=0.06 own much stronger, near-immediate penalty
+(about 13-tick break-even versus 100-200 for the gentler candidates) was
+enough to break the place-once-and-never-touch-it-again pattern within a
+short probe. This does not prove the gentler candidates cannot work --
+they may simply need substantially more than 2,000,000 steps for a weaker
+per-tick signal to accumulate enough gradient pressure -- but that is
+untested, not confirmed, by this sweep.
+
+Of the three tested, zeta=0.06 is the only one that demonstrably fixes the
+under-execution problem, at a real, not-yet-shown-to-recover cost to the
+IS-vs-TWAP edge. The gentler candidates preserve the edge but do not yet
+fix the problem within the tested window. No candidate has been picked as
+a winner; this is deliberately left for review rather than decided here.
+Both src/envs/reward.py (zeta=0.06 default, already committed in the prior
+revision) and the new src/train/train_l3.py --reward-zeta override
+(uncommitted) remain in their current state pending that decision.
+
+### Methodology note: a resource-contention incident during the sweep
+
+The two lower-zeta probes were originally launched in parallel (the GPU
+was fully idle at the time, unlike earlier in this session when it was
+shared with an unrelated project). A duplicate zeta=0.006 process appears
+to have been launched alongside the intended one, most likely when a
+launch command that timed out at the tool level and was moved to
+background caused its underlying nohup invocation to fire twice. With
+three n_envs=8 jobs competing for RAM instead of two, the kernel OOM
+killer fired twice (confirmed via dmesg), killing the tracked zeta=0.006
+process and, 23 minutes later, the unexplained duplicate. zeta=0.002
+survived only because the kernel OOM heuristic picked the other two
+processes both times, not by any protection. zeta=0.006 was relaunched
+solo afterward (verified via a fresh connection that exactly one process
+was running before proceeding) and completed cleanly. All further probes
+in this sweep ran strictly sequentially, not in parallel, given this
+confirmed real (not just theoretical) resource-contention risk. The
+zeta=0.002 log shows minor corruption (two mid-sequence eval firings
+missing) likely from the same period of concurrent writes; the remaining
+7 of 9 firings are intact and used above.
