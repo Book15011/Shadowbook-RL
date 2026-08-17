@@ -205,9 +205,70 @@ touches it again" low-fill characterization are both correct descriptions
 of the same underlying mechanism (fresh placements only follow full
 resolution, never a correction), not a contradiction between them.
 
-## Part B and Part C
+## Part B: the staleness reward term
 
-A minimal reward change (a staleness term keyed on the existing
-ticks_since_own_fill_norm signal, obs idx 14) and a 2,000,000-step
-validation fine-tune from this checkpoint are tracked as a follow-up to
-this report, not included in this revision.
+Implemented in src/envs/reward.py: a new RewardWeights.zeta = 0.06 weight
+and an r_stale = -zeta * ticks_since_own_fill_norm term (zero unless an
+order is resting and unfilled), added to step_reward()'s return value
+alongside the existing four components. Coefficient derivation is in the
+further-review section above. src/envs/lob_execution_env.py required a
+small, necessary wiring change: the existing ticks_since_own_fill_norm
+computation (already feeding obs idx 14) was factored into a reusable
+_ticks_since_own_fill_norm() helper, called from both _build_obs() (value
+unchanged) and step()'s step_reward() call (new). No changes to
+matching_engine.py or the observation/action space definitions. Two new
+isolated tests were added to tests/test_reward.py, matching the file
+existing one-test-per-component style; the full test suite was re-run
+afterward -- all 38 previously-passing tests plus the 2 new ones pass (4
+pre-existing failures in test_bulk_backfill.py and test_l2_capture.py are
+unrelated: network-mock URL drift and an L2 gap-resync edge case, neither
+file importing reward.py or lob_execution_env.py).
+
+## Part C: validation probe results
+
+Warm-started from the 20M-step baseline, resumed 2,000,000 steps under the
+new reward (total_timesteps 20,001,776 to 22,004,720), same n_envs=8,
+logged to logs/l3_train_staleness_probe.log.
+
+Real, measured effect across the probe 8 held-out eval firings (paired
+seeds 5000000-5000049, same set the baseline itself used, n=50 episodes
+each):
+
+fill_ratio: 0.582, 0.641, 0.595, 0.632, 0.625, 0.648, 0.647, 0.803, then
+0.969 at the final firing -- a clear, substantial recovery from the
+baseline own ~0.59-0.65 band (its last eval before this probe, at step
+20,000,008, was 0.590). Corroborated independently: a fresh 8-episode
+deterministic rollout on the finished probe checkpoint (different seeds
+than the paired eval set, same seed pattern as the original rollout
+investigation) found 6 of 8 episodes reaching fill_ratio=1.0 exactly, and
+MARKET orders used 24 times out of 15,069 recorded ticks (0.16%) -- up
+from exactly 0% in the baseline across 40,367 ticks. CANCEL_AND_REPLACE
+remained at exactly 0% in this spot check.
+
+IS_total_bps over the same 8 firings: 0.509, 0.331, 0.298, 0.541, 0.831,
+0.849, 1.343, 1.448, then 1.101 at the final firing -- trending worse, not
+better, and briefly underperforming the TWAP baseline of 1.2652 at two
+firings (1.343 and 1.448). By the final firing the L3-vs-TWAP margin had
+shrunk to about 0.16 bps, down from the baseline own roughly 0.63 bps at a
+comparable step count. This is the real, measured cost of the fix: pushing
+the policy to actually complete orders trades away some of the
+price-improvement edge that came from its previous willingness to sit
+passively and only fill on favorable terms.
+
+Verdict: the reward-structure hypothesis in the further-review section
+above is validated, not just argued -- changing one reward term measurably
+changed the exact policy behavior it was designed to change, within
+2,000,000 steps (10% of the original run length). This is a genuine
+result, not a free one: zeta=0.06 clearly overcorrects within this short
+probe, trading most of the IS edge for fill-ratio recovery rather than
+preserving both. Whether a smaller zeta, or the same zeta given more
+training time to re-balance, recovers more of that edge is an open
+question this probe was not designed to answer, and is left for a
+deliberate follow-up rather than decided here.
+
+Both the original 20M-step baseline (restored to its canonical path,
+models/l3_executioner_v1.zip and models/l3_vecnormalize.pkl, verified via
+checksum against models/baseline_20M_backup/) and this probe own
+checkpoint (models/l3_executioner_v1_staleness_probe.zip and
+models/l3_executioner_v1_staleness_probe_vecnormalize.pkl) are preserved on
+disk for comparison.

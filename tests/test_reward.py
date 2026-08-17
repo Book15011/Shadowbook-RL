@@ -56,6 +56,33 @@ def test_step_reward_cancel_with_zero_queue_at_level_skips_gamma_term():
     assert r == pytest.approx(-0.5)
 
 
+def test_step_reward_staleness_isolated():
+    # resting=True, ticks_since_own_fill_norm=0.5, default zeta=0.06
+    # r_stale = -0.06*0.5 = -0.03; no fills/cancel/dt -> everything else is 0
+    w = RewardWeights()
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_unfilled=False, queue_ahead_at_cancel=None, queue_at_level=None,
+        resting=True, ticks_since_own_fill_norm=0.5,
+    )
+    assert r == pytest.approx(-0.03)
+
+
+def test_step_reward_staleness_zero_when_not_resting():
+    # resting=False -> r_stale must be exactly 0 regardless of
+    # ticks_since_own_fill_norm (it is only meaningful while an order is
+    # actually resting and unfilled).
+    w = RewardWeights()
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_unfilled=False, queue_ahead_at_cancel=None, queue_at_level=None,
+        resting=False, ticks_since_own_fill_norm=1.0,
+    )
+    assert r == pytest.approx(0.0)
+
+
 def test_implementation_shortfall_with_fills_hand_computed():
     # side=1, fills=[(101,3),(102,2)], qty_total=10, arrival=100, terminal_mid=103, fee=2bps
     # p_avg = (101*3+102*2)/5 = 101.4, fill_ratio=0.5

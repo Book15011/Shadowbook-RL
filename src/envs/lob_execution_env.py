@@ -565,6 +565,15 @@ class LOBExecutionEnv(gym.Env):
     def _current_tick(self) -> TickView:
         return self._ticks[self._tick_idx]
 
+    def _ticks_since_own_fill_norm(self) -> float:
+        """Obs idx 14. Factored out (Part B, docs/reports/
+        phase3_l3_baseline_milestone.md) so step()'s new staleness reward
+        term and _build_obs() share one formula rather than risk drifting
+        apart -- value and meaning are unchanged from before."""
+        if self._last_fill_tick_idx is None:
+            return 1.0
+        return float(np.clip((self._tick_idx - self._last_fill_tick_idx) / self.horizon_ticks, 0.0, 1.0))
+
     def _compute_l2_target_slice_ratio(self) -> float:
         """Default: what a fixed-TWAP schedule would have executed by now, as a
         fraction of the full parent order (linear in elapsed time -- only the
@@ -616,12 +625,7 @@ class LOBExecutionEnv(gym.Env):
 
         qpr = queue_position_ratio(self._resting) if self._resting is not None else -1.0
 
-        if self._last_fill_tick_idx is None:
-            ticks_since_own_fill_norm = 1.0
-        else:
-            ticks_since_own_fill_norm = float(
-                np.clip((self._tick_idx - self._last_fill_tick_idx) / self.horizon_ticks, 0.0, 1.0)
-            )
+        ticks_since_own_fill_norm = self._ticks_since_own_fill_norm()
 
         l2_target_slice_ratio = self._compute_l2_target_slice_ratio()
         l2_urgency = float(np.clip(self.l2_urgency, 0.0, 1.0))
@@ -766,6 +770,8 @@ class LOBExecutionEnv(gym.Env):
             dt=self.tick_interval_s, l1_risk_score=self.l1_risk_score,
             canceled_unfilled=canceled_unfilled,
             queue_ahead_at_cancel=queue_ahead_at_cancel, queue_at_level=queue_at_level,
+            resting=self._resting is not None,
+            ticks_since_own_fill_norm=self._ticks_since_own_fill_norm(),
         )
         self._episode_fills.extend(step_fills)
 
