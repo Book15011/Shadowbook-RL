@@ -95,19 +95,30 @@ has apparently learned to never use two of its four available order types.
 The above is itself not the end of the story. Three points, stated plainly
 rather than smoothed over:
 
-1. The "places once and never touches it again" summary does not hold for
-   the high-fill bucket, and this was an open question as of this writing.
-   The 7 placement streaks across only 2 high-fill episodes average 3.5
-   placements per episode, not once -- an apparent contradiction with the
-   low-fill bucket average of about 1.3 per episode that this document did
-   not yet resolve. Two readings are possible without further work: either
-   the high-fill episodes see more genuine corrective re-placements (which
-   would undercut the "zero correction usage" framing above), or they see
-   more full-fill-then-fresh-tranche cycles (which would be consistent with
-   it). Pending disambiguation -- see Part A below, tracked to resolve this
-   specific question against the existing raw data rather than leaving it
-   as an unresolved tension in a document meant to be read as a coherent
-   record.
+1. RESOLVED (see Part A below for the analysis). The "places once and never
+   touches it again" summary does not actually contradict the high-fill
+   bucket. Classifying all 26 real placements against the raw per-step data:
+   every single one is either the first placement in its episode (15 of 26)
+   or a fresh tranche placed only after the prior order in that same episode
+   fully resolved via a complete fill (11 of 26) -- zero were placed while a
+   prior order was still outstanding. This is not a coincidence: it is
+   mechanically guaranteed by the already-measured 0% CANCEL_AND_REPLACE
+   usage rate, since nothing else can free up the resting-order slot
+   mid-episode. The high-fill bucket average of 3.5 placements per episode
+   (5 of its 7 events are fresh-tranche-after-full-fill) reflects orders
+   resolving quickly and completely, cycling through several tranches in a
+   row -- not corrective behavior. The low-fill bucket averages 1.3 per
+   episode (only 3 of 12 events are fresh-tranche-after-full-fill, and 2 of
+   those 3 occur in the final 10% of the horizon, at l2_target_slice_ratio
+   0.90 and 0.96, leaving almost no runway to matter). Six of the 9 low-fill
+   episodes place exactly once and never place again for the rest of the
+   horizon. Separately: l2_target_slice_ratio (obs idx 15) is a continuous
+   per-tick ramp (ticks_elapsed divided by horizon_ticks), not a discretized
+   N-slice schedule, so it changes by construction on every single tick --
+   "how many times did it change" is not a meaningful question in this
+   environment. The meaningful question, fresh opportunity versus stuck-
+   order correction, is answered structurally above without needing that
+   quantity.
 
 2. The "avg_trade_rate collapsed to near zero" explanation is an inference,
    not a measurement. The expected_wait_time formula from Section 2.4 was
@@ -161,3 +172,42 @@ Verdict on this checkpoint: it should not be treated as final, and should
 not be wired into Phase 3.5 as-is, until the staleness gap above is
 addressed and the fix is validated against real training data, not just
 argued from the reward-function arithmetic.
+
+## Part A: high-fill placement-frequency disambiguation (resolved)
+
+Classified all 26 real placements from the rollout investigation against
+the raw per-step data (/tmp/rollout_analysis_raw.json), using the already-
+confirmed fact that CANCEL_AND_REPLACE/MARKET are never used, so the only
+way a new placement can occur after the first is if the prior order in that
+same episode fully resolved via a complete fill.
+
+Totals: 15 of 26 are the first placement in their episode; 11 of 26 are a
+fresh tranche placed after the prior order fully filled; 0 of 26 occurred
+while a prior order was still outstanding (structurally impossible given
+0% CANCEL_AND_REPLACE usage, and confirmed directly rather than assumed).
+
+HIGH-FILL bucket (7 events, 2 episodes): 2 first-in-episode, 5 fresh-
+tranche-after-full-fill, 0 corrections. This is what produces the 3.5
+placements/episode average -- orders resolving quickly and completely,
+repeatedly, not corrective re-pricing.
+
+LOW-FILL bucket (12 events, 9 episodes): 9 first-in-episode, 3 fresh-
+tranche-after-full-fill, 0 corrections. Two of those three fresh tranches
+land at l2_target_slice_ratio 0.90 and 0.96 -- in the final 10% of the
+horizon, essentially out of runway. Six of the 9 low-fill episodes place
+exactly once and take no further action of any kind for the remainder of
+the episode, regardless of how far l2_target_slice_ratio (the L2 stub
+pacing schedule) climbs above their actual, stalled progress.
+
+This closes the open question from further-review point 1 above: the
+high-fill bucket placement frequency and the "places once and never
+touches it again" low-fill characterization are both correct descriptions
+of the same underlying mechanism (fresh placements only follow full
+resolution, never a correction), not a contradiction between them.
+
+## Part B and Part C
+
+A minimal reward change (a staleness term keyed on the existing
+ticks_since_own_fill_norm signal, obs idx 14) and a 2,000,000-step
+validation fine-tune from this checkpoint are tracked as a follow-up to
+this report, not included in this revision.
