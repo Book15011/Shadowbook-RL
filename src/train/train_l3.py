@@ -44,16 +44,24 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecNorma
 from scripts.phase2a_sanity_suite import TWAPPolicy, run_episode
 from src.data.split import load_split
 from src.envs.lob_execution_env import LOBExecutionEnv
+from src.envs.reward import RewardWeights
 
 
-def make_env(date_range: tuple[str, str], horizon_ticks: int, lookback_ticks: int):
+def make_env(
+    date_range: tuple[str, str], horizon_ticks: int, lookback_ticks: int,
+    reward_weights: RewardWeights | None = None,
+):
     """L2 stub = fixed_twap is the default behavior the environment already
-    has (see module docstring) -- no l2_override kwarg exists or is needed."""
+    has (see module docstring) -- no l2_override kwarg exists or is needed.
+    reward_weights: None keeps LOBExecutionEnv's own default (RewardWeights());
+    passed explicitly only when --reward-zeta overrides it (see main()), for
+    the Part B/C coefficient sweep in docs/reports/phase3_l3_baseline_milestone.md."""
     def _init():
         return LOBExecutionEnv(
             date_range=date_range,
             horizon_ticks=horizon_ticks,
             lookback_ticks=lookback_ticks,
+            reward_weights=reward_weights,
         )
     return _init
 
@@ -102,6 +110,7 @@ class ValISEvalCallback(BaseCallback):
         eval_freq: int,
         n_eval_episodes: int,
         verbose: int = 0,
+        reward_weights: RewardWeights | None = None,
     ) -> None:
         super().__init__(verbose)
         self.eval_freq = eval_freq
@@ -109,6 +118,7 @@ class ValISEvalCallback(BaseCallback):
         self.horizon_ticks = horizon_ticks
         self._eval_env = LOBExecutionEnv(
             date_range=val_date_range, horizon_ticks=horizon_ticks, lookback_ticks=lookback_ticks,
+            reward_weights=reward_weights,
         )
         # Fixed once, reused for every arm and every firing -- the paired-design guarantee.
         self._eval_seeds = [self.EVAL_SEED_BASE + i for i in range(n_eval_episodes)]
@@ -231,6 +241,15 @@ def main() -> None:
         help="Path to the matching VecNormalize .pkl for --resume-from (e.g. "
         "models/l3_checkpoints/l3_ppo_vecnormalize_1750000_steps.pkl).",
     )
+    parser.add_argument(
+        "--reward-zeta", type=float, default=None,
+        help="Override RewardWeights.zeta (the experimental staleness-penalty "
+        "coefficient -- see docs/reports/phase3_l3_baseline_milestone.md Part B) "
+        "for this run only, without editing src/envs/reward.py's shared default. "
+        "Needed for the coefficient sweep so multiple candidate values can run "
+        "(including in parallel) off one checkout. Unset keeps RewardWeights()'s "
+        "own default.",
+    )
     args = parser.parse_args()
     if bool(args.resume_from) != bool(args.resume_vecnormalize):
         raise ValueError("--resume-from and --resume-vecnormalize must be given together")
@@ -259,8 +278,12 @@ def main() -> None:
     print(f"train date_range: {train_date_range} ({len(train_dates)} real days)")
     print(f"val   date_range: {val_date_range} ({len(val_dates)} real days)")
 
+    reward_weights = RewardWeights(zeta=args.reward_zeta) if args.reward_zeta is not None else None
+    if args.reward_zeta is not None:
+        print(f"reward_weights override: zeta={args.reward_zeta} (all other weights at RewardWeights() defaults)")
+
     vec_env = SubprocVecEnv([
-        make_env(train_date_range, env_cfg["horizon_ticks"], env_cfg["lookback_ticks"])
+        make_env(train_date_range, env_cfg["horizon_ticks"], env_cfg["lookback_ticks"], reward_weights)
         for _ in range(n_envs)
     ])
     vec_env = VecMonitor(vec_env)
@@ -324,6 +347,7 @@ def main() -> None:
         eval_freq=eval_freq,
         n_eval_episodes=n_eval_episodes,
         verbose=1,
+        reward_weights=reward_weights,
     )
 
     model.learn(

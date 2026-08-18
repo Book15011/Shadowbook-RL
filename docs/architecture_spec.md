@@ -465,6 +465,72 @@ your matching engine (Section 3) and report the estimator's calibration error in
 calibration check is itself a good thing to show off: it demonstrates you understand your own model's
 limitations rather than treating a heuristic as ground truth.
 
+### 2.5 Train / Validation / Test Split (chronological — mandatory)
+
+Splits must be **chronological, never randomly shuffled across dates** — train on the oldest
+days, validate on the next-oldest block, test on the most recent block. Random shuffling
+across dates leaks lookahead information (a policy trained partly on days *after* its
+validation window is not being validated honestly) and silently invalidates every IS/mark-out
+number reported downstream, including §4.4's ablation.
+
+**Why held-out windows go on the recent end, not the old end:** the L2 backfill (§2.1.1) walks
+*backward* from the most recent available day toward the past. The newest portion of the
+dataset is therefore already final and will never be touched by future backfill runs — only
+the older boundary keeps moving. Pinning val/test to the recent, stable end and letting train
+absorb everything older means the split never needs to be recomputed as backfill continues;
+train simply grows for free.
+
+**Boundary heuristic** (exact day counts must be chosen against the real date coverage on
+disk, not hardcoded blindly from this doc — check gap density in the proposed windows before
+finalizing):
+
+| Split | Window | Notes |
+|---|---|---|
+| test | most recent ~15-20 calendar days actually present | held out entirely; never touched until final Phase 5 backtest |
+| val | next ~15-20 days back from test's boundary | used for Phase 3/4 model selection / early stopping |
+| train | everything older | grows automatically as backfill adds older days |
+
+If known coverage gaps (§2.1.1) fall inside the proposed val/test windows, either shift the
+boundary to avoid concentrating gaps in the held-out set, or explicitly document the resulting
+gap count in val/test as a known limitation — don't silently absorb it.
+
+**Persisted artifact** — a list of dates per split, not just min/max boundaries, since gaps
+mean a date range alone doesn't fully specify membership:
+
+```json
+{
+  "generated_at": "2026-08-15T00:00:00Z",
+  "source_day_count": 296,
+  "train_dates": ["2024-01-01", "2024-01-02", "..."],
+  "val_dates": ["2025-07-15", "..."],
+  "test_dates": ["2025-08-01", "..."],
+  "known_gap_dates": ["2024-08-12", "..."]
+}
+```
+
+**Consumption pattern** — all training/val/test/ablation code reads from this single artifact,
+never recomputes its own boundary:
+
+```python
+# src/data/split.py
+def load_split(name: str) -> list[date]:
+    """name in {'train', 'val', 'test'}. Reads the persisted split artifact;
+    raises if the artifact doesn't exist yet (must be generated once, explicitly,
+    not implicitly on first use)."""
+```
+
+`LOBExecutionEnv`'s existing `date_range` constructor param (added for cross-run seed
+reproducibility, see the fix landed on master) may need widening from a `(start, end)` tuple to
+accept an explicit date list, since a contiguous range can't represent a gapped split. This
+artifact is also the mechanism that makes §4.4's requirement — "identical held-out backtest
+windows" for the L1 on/off ablation — actually satisfiable: both runs load the same `test`
+split from disk rather than each independently sampling and risking drift.
+
+This artifact should not need regenerating as backfill continues, since backfill only appends
+days *older* than train's boundary. If val or test's underlying files ever change after
+generation, that's a signal something unexpected happened — flag it, don't silently
+regenerate and move on.
+
 ---
 
 ## Section 3: Custom Gymnasium Environment — `LOBExecutionEnv-v0`
@@ -627,7 +693,7 @@ def step_reward(w: RewardWeights, *, side: int, fills: list[dict], arrival_price
 ### 3.4 Episode structure
 
 One episode = one **parent order** (e.g., liquidate 50 BTC over a 30-minute horizon). `reset()` samples
-a random historical window from the held-out training days, a random parent order size (log-uniform over
+a random historical window from the held-out training days (§2.5), a random parent order size (log-uniform over
 a configured range to force the policy to generalize across order sizes relative to typical book depth —
 report this ratio, e.g. "parent order = 3x median 30min traded volume," as a scenario-difficulty metric
 in your eval suite), and a random side. `step()` advances one LOB tick, applies the current tier's action
@@ -834,6 +900,167 @@ move this toward anything resembling live paper trading, since a real venue won'
    whole project: a hiring manager at any of these firms will ask "did the LLM help, or is it decoration,"
    and "here's the ablation table" is a categorically stronger answer than "it seemed to help."
 
+### 4.5 Post-L3 realism layer: stealth execution + calibrated market impact
+
+Two additions sit strictly downstream of the core pipeline above — neither touches L3's action/observation
+space, neither is required for Phases 3-5 to produce a complete, defensible result on their own. They exist
+to answer a sharper version of a question any interviewer at these firms will ask: *if all of this trains
+against a static historical tape, how do you know the agent actually achieves the objective — executing
+without revealing the plan — rather than just looking good against a market that can't react to it?*
+
+The honest answer has two parts, and this section is deliberately built to keep them separate rather than
+conflate them:
+
+- **Timing quality** — did the policy avoid trading into moments the market was about to move against it —
+  is fully answerable from historical replay alone, no simulated reaction required. §5.3's mark-out formula
+  already measures this against the real subsequent tape, independent of whether the agent's own trade
+  caused anything.
+- **Footprint avoidance** — would a live, adaptive counterparty learn to detect and exploit *this specific
+  policy's* behavioral signature — cannot be validated from replay, full stop, at any level of fill-pricing
+  realism. It requires an opponent that reacts to the agent over repeated interaction, which is what
+  agent-based market simulation (ABIDES, JAX-LOB) exists to provide, and which this project has an explicit,
+  documented reason to not adopt: ABIDES is CPU-bound (a separate line of GPU-accelerated research exists
+  specifically because of this bottleneck, reporting up to 240x speedups over it) and ships no crypto
+  calibration — its default agent populations are fit to equities, and calibrating a synthetic population to
+  genuinely resemble BTC-USDT is its own multi-week research project (one benchmark reported ~155 CPU-core-
+  hours to calibrate a single asset for a single day), disproportionate to this project's scope. This
+  limitation is real and is explicitly out of scope here, not silently assumed away — the mark-out metric is
+  the honest, achievable proxy for stealth at this project's scope, and §5.3 should be read with that caveat.
+
+**A. Deterministic stealth wrapper (`src/agents/stealth_wrapper.py`)**
+
+Sits between `executioner` and `env_step` in the LangGraph orchestrator (§4.3), intercepting L3's already-
+decoded action and expanding a large clip into an iceberg-style schedule of smaller re-quoted peaks before
+it reaches `matching_engine.py`. Stateless with respect to L3's weights — no retraining, no action-space
+change, applies to any already-trained L3 checkpoint.
+
+Randomization is anchored to real local context on three axes, not pure noise — a refresh pattern that looks
+too random relative to actual market conditions is itself a kind of signature. All three anchors reuse
+features the project already computes; no new data pipeline:
+
+1. **Size** — jittered around the level's own trailing average trade size (§2.4's `v̄_trade,p(w)`, already
+   computed for expected-wait-time).
+2. **Depth cap** — additionally hard-capped as a fraction of *currently* visible resting size at the level
+   (`book_depth_norm`, §3.1). Catches the case where a peak is reasonable on average but anomalously large
+   on one particular thin tick.
+3. **Pace** — inter-clip refresh timing jitters around the interval implied by L2's assigned pace (idx 15,
+   `l2_target_slice_ratio`), rather than locking to a literal fixed interval. A mechanically regular refresh
+   cadence is itself one of the standard iceberg-detection heuristics in the microstructure literature —
+   syncing tightly to a TWAP clock would reintroduce the exact signature this layer exists to avoid.
+
+```python
+# src/agents/stealth_wrapper.py
+from dataclasses import dataclass
+import numpy as np
+
+@dataclass
+class StealthConfig:
+    peak_frac_range: tuple[float, float] = (0.5, 1.5)     # jitter around the size anchor
+    max_visible_depth_frac: float = 0.5                    # hard cap: never reveal >50% of what's resting
+    pace_jitter_frac: float = 0.3                           # +/- jitter around the L2-implied refresh interval
+
+class StealthWrapper:
+    """Deterministic, stateless w.r.t. L3's weights. Expands a decoded L3 action into an
+    iceberg clip schedule. Reference scaffolding -- fill in and unit test, same convention
+    as matching_engine.py and reward.py."""
+
+    def __init__(self, cfg: StealthConfig = StealthConfig()):
+        self.cfg = cfg
+
+    def expand(self, l3_action: dict, avg_trade_size_at_level: float,
+               visible_depth_at_level: float, l2_pace_hint: float) -> list[dict]:
+        if not l3_action.get("stealth_mode", False):
+            return [l3_action]  # pass-through, identical to today's behavior
+
+        target_qty = l3_action["size_frac"] * l3_action["l2_slice_qty"]
+        clips, remaining = [], target_qty
+        while remaining > 1e-9:
+            size_anchor = np.random.uniform(*self.cfg.peak_frac_range) * avg_trade_size_at_level
+            depth_cap = self.cfg.max_visible_depth_frac * visible_depth_at_level
+            peak = min(remaining, size_anchor, depth_cap)
+            clips.append({**l3_action, "size_frac": None, "qty": peak})
+            remaining -= peak
+            # each refreshed peak is a fresh placement event through §2.4's Q_ahead(0) reset --
+            # correctly modeling that a refreshed iceberg peak loses time priority, at zero new
+            # matching-engine code.
+        return clips
+```
+
+`stealth_mode` is a boolean set externally (by the orchestrator, e.g. above a configurable notional
+threshold) — not a dimension of L3's `MultiDiscrete([4,11,5])`. A learned version was considered and
+explicitly rejected: extending L3's action space would change the policy network's output shape, which
+`RecurrentPPO.load()` cannot warm-start through directly (it requires the saved model's action space to
+match the environment's) — making this real model-surgery work, not a cheap continuation, for a benefit not
+worth that cost at this project's scope.
+
+**B. Calibrated market impact (Tier 1 realism, layered onto historical replay)**
+
+Historical replay already prices real, *within-tick* cost via level-walking (§3.2/§3.4) — a large market
+order pays real, increasing slippage as it consumes visible depth. What replay cannot capture is
+*intertemporal* cost: the next tick's book is whatever actually happened historically, fully recovered,
+regardless of how aggressively the agent traded the tick before. Two consequences, at two different
+timescales, both worth naming explicitly since they affect different training phases:
+
+- **Permanent impact** persists across the rest of the episode and is the primary signal L2's participation-
+  rate decision needs — without it, there is limited reward-driven reason to prefer spreading a parent order
+  over time rather than front-loading it.
+- **Temporary impact** decays over a short half-life but still outlives a single tick — meaning it also bears
+  on L3's own tick-level decisions (e.g. firing consecutive MARKET orders with no compounding cost), not only
+  on L2's pacing.
+
+$$\Delta_{perm} = \eta \cdot \text{side} \cdot \frac{\text{child\_qty}}{\text{typical\_volume}} \quad
+  \text{(persistent shift to the replayed mid-price path for the rest of the episode)}$$
+
+$$\Delta_{temp} = \lambda \cdot \text{side} \cdot \sqrt{\text{participation\_rate}} \quad
+  \text{(decays back toward the historical path with a short half-life)}$$
+
+**Calibration is mandatory before this is trusted, not optional:** $\eta$ and $\lambda$ must be fit via a
+short historical regression (realized short-horizon return vs. signed order flow/volume) against the
+project's own trade/order-flow data, not hand-picked illustrative constants. Uncalibrated constants would
+make this cosmetic rather than genuinely load-bearing — inconsistent with how every other quantitative
+choice in this document is expected to be justified.
+
+**Depth replenishment** — when the agent consumes book depth, replenish it stochastically at a rate
+calibrated from §2.3's `CancelAddTracker` cancel/add features, already computed. This reuses existing
+feature-pipeline code and is the piece that makes counterparty behavior look reactive rather than static,
+without needing any agent population.
+
+**Sequencing: between Phase 3 and Phase 4, not folded into either.** Phase 3 (§6.2) trains L3 alone against
+a *frozen* TWAP schedule — L2 isn't learning pacing yet, so Tier 1's primary payoff isn't accessible during
+Phase 3, and Phase 3 should run first, unmodified, exactly as scoped: a clean, isolated read on whether
+`RecurrentPPO` learns a sensible tick-level policy at all, before a second, never-yet-validated piece of new
+logic (impact model + fresh calibration) enters the same environment. This project's own history argues for
+that staging discipline directly — the free-market-order-fill bug, the `ref_depth` buffer-widening bug, and
+the seed/window drift bug were each caught *because* something was isolated and tested before the next layer
+went on top; introducing RL training and a new, uncalibrated environment change simultaneously would make a
+bad Phase 3 result ambiguous between "policy problem" and "environment problem." The real cost of this
+staging is a second, warm-started fine-tune run (`RecurrentPPO.load(...)` → `.learn()`) after Tier 1 lands —
+genuine extra GPU time, though bounded, since it continues from a working checkpoint rather than a fresh
+init. Tier 1 must be in place, calibrated, and validated *before* Phase 4's L2 training begins, since L2's
+entire objective is the pacing decision Tier 1 makes meaningful.
+
+**Considered and explicitly out of scope, with reasons on record:**
+
+- **Reactive rule-based counterparty agents (closed-form Avellaneda-Stoikov/Cartea-Jaimungal quoting bots,
+  e.g. via `mbt_gym`).** Would give real, if limited, counterparty reaction — closed-form agents avoid the
+  expensive calibration-search cost that makes full ABIDES-style populations impractical here. Rejected
+  anyway: proving robustness against a known, simple, closed-form adversary is not a meaningfully stronger
+  claim than proving it against static replay, and isn't worth the setup cost at this project's scope.
+- **A self-trained RL counterparty**, as a higher-fidelity substitute for the above. Investigated directly —
+  no viable pretrained, drop-in open-source option exists for crypto LOB market-making specifically
+  (available projects either ship no portable weights, requiring training from scratch anyway, or solve a
+  different problem entirely, such as directional price prediction rather than LOB quoting). Training one
+  from scratch is a real option but a **larger** lift than the rule-based agents above, not a lighter
+  substitute for them, and would require the same freeze-and-alternate pattern already used for L2/L3
+  (`FrozenL3Wrapper`) — train the counterparty against static data first, freeze it, then train the execution
+  agent against the frozen counterparty — since co-training both simultaneously reintroduces the exact
+  non-stationarity problem the hierarchical L1/L2/L3 decomposition (§4.2) was specifically designed to avoid.
+  Noted here as a real future stretch option, structured correctly if ever pursued, not planned for this
+  project's scope.
+- **Full agent-based simulation (ABIDES, JAX-LOB).** See the opening of this section — CPU-bound, no crypto
+  calibration, and calibrating one is its own multi-week research project. The footprint-avoidance question
+  this would answer is left as a documented, disclosed limitation (see above), not silently assumed solved.
+
 ---
 
 ## Section 5: Quant Metrics & Evaluation Suite
@@ -991,7 +1218,8 @@ lob-execution-hma/
 | **1 — Data Engine** | `download_manager.py` (Binance, L1 aggregates), Bybit L2 historical backfill (primary L2 source, §2.1.1), checksum-verified ingestion, feature pipeline (§2) | Reproducible, tested feature dataset for a fixed date range; unit tests on OBI/micro-price against hand-computed fixtures | 1-1.5 weeks — **in practice took longer**, most of it spent diagnosing a live-capture network blocker before pivoting to Bybit's archive; budget for infrastructure surprises, not just code time |
 | **2 — Gym Env** | `matching_engine.py`, `LOBExecutionEnv-v0`, reward function, fixed-TWAP baseline agent | Env passes a "does nothing dumb" sanity suite: a no-op policy loses exactly the opportunity-cost IS, a perfect-foresight oracle policy (cheat: peek at future prices) achieves near-zero IS | 1.5-2 weeks |
 | **3 — L3 Baseline** | `RecurrentPPO` training against fixed TWAP schedule, hyperparameter sweep, tensorboard eval curves | L3 beats naive same-level limit-order baseline on IS across held-out days, with a clean training-curve writeup | 2-3 weeks |
-| **4 — L2/L1 Integration** | `FrozenL3Wrapper`, `SAC` training for L2, LangGraph orchestrator, Ollama L1 plumbing + ablation (§4.4) | Full 3-tier system beats L3-alone; L1-on-vs-off ablation table with confidence intervals | 2-3 weeks |
+| **3.5 — Market Realism Layer** | Calibrated Tier 1 impact model (η/λ via historical regression, §4.5) + deterministic stealth wrapper, built and unit-tested; warm-started fine-tune of Phase 3's L3 checkpoint in the impact-aware environment | Impact model calibrated against real order-flow data (not illustrative constants); stealth wrapper passes fixture tests; fine-tuned L3 checkpoint ready for Phase 4 | 3-5 days — reuses existing feature pipeline (§2.3, §2.4), no new data collection |
+| **4 — L2/L1 Integration** | `FrozenL3Wrapper`, `SAC` training for L2 (now in the Phase 3.5 impact-aware environment), LangGraph orchestrator, Ollama L1 plumbing + ablation (§4.4) | Full 3-tier system beats L3-alone; L1-on-vs-off ablation table with confidence intervals | 2-3 weeks |
 | **5 — Backtest & Benchmarking** | Held-out multi-day backtest, VWAP/TWAP/IS/mark-out report, comparison table vs. industry-standard baselines (TWAP, VWAP-tracking, POV) | Final report/notebook + reproducible eval script; this is the artifact you actually walk an interviewer through | 1-2 weeks |
 
 Total: roughly 8-12 weeks at a portfolio-project pace, front-loaded by however long you run the L2 capture
