@@ -421,3 +421,58 @@ confirmed real (not just theoretical) resource-contention risk. The
 zeta=0.002 log shows minor corruption (two mid-sequence eval firings
 missing) likely from the same period of concurrent writes; the remaining
 7 of 9 firings are intact and used above.
+
+
+## Extended coefficient sweep: filling the middle zone
+
+The first sweep tested only two break-even points: 12.9 ticks (zeta=0.06,
+full fix, high cost) and 100/200 ticks (zeta=0.006/0.002, zero measurable
+effect) -- skipping the zone where the actual transition most likely
+lives. Four new probes filled that gap, each warm-started from the
+ORIGINAL 20M-step baseline (not any zeta probe checkpoint), 2,000,000
+steps, same n_envs=8: zeta=0.0 (a genuine same-window control with the
+untouched reward), zeta=0.008 (break-even about 80 ticks), zeta=0.015
+(about 47 ticks), zeta=0.03 (about 25 ticks).
+
+### The zeta=0.0 control validates the historical comparison
+
+fill_ratio across its 9 paired-eval firings: 0.582, 0.595, 0.608, 0.604,
+0.615, 0.636, 0.672, 0.642, 0.599 -- a 0.58-0.67 band, matching the
+historical baseline range (about 0.59-0.65) this document has been citing
+throughout. This confirms that band is a real, reproducible property of
+the un-modified reward on a matched 2,000,000-step window, not an
+artifact of a different time period or a stale comparison.
+
+### None of the three new non-zero candidates show any effect
+
+fill_ratio, paired eval (n=50, seeds 5000000-5000049), first firing to
+last:
+
+- zeta=0.008 (break-even 80 ticks): 0.582, 0.61, 0.653, 0.651, 0.63,
+  0.615, 0.631, 0.616, 0.672 -- flat, same band as the control.
+- zeta=0.015 (break-even 47 ticks): 0.582, 0.633, 0.58, 0.627, 0.595,
+  0.611, 0.607, 0.643, 0.638 -- flat, same band.
+- zeta=0.03 (break-even 25 ticks): 0.582, 0.628, 0.581, 0.589, 0.622,
+  0.615, 0.583, 0.582, 0.569 -- flat, if anything slightly below the
+  control by the final firing.
+
+An independent 8-episode direct rollout check on each finished checkpoint
+confirms this at the order-type level: MARKET and CANCEL_AND_REPLACE both
+sit at exactly 0.0% for all three (0.0, 0.008, 0.015, 0.03), identical to
+the control -- no measurable behavioral change of any kind, not just a
+fill_ratio coincidence.
+
+### The transition is a threshold, not a gradient
+
+Six break-even points have now been tested, spanning 400 ticks down to
+12.9 ticks: 400 (zeta=0.0), 100 (zeta=0.006), 80 (zeta=0.008), 47
+(zeta=0.015), 25 (zeta=0.03), and 12.9 (zeta=0.06). Every single one is
+flat -- statistically indistinguishable from the untouched control --
+except 12.9. This rules out a smooth dose-response relationship across
+the tested range: the real transition sits somewhere between a 25-tick
+and a 12.9-tick break-even (zeta between 0.03 and 0.06), not spread
+gradually across the wider range that was the working assumption when
+this extended sweep was designed. Narrowing that specific window (e.g.
+zeta around 0.04-0.05) would be the natural next probe if a precise
+threshold is wanted, but has not been run -- no candidate is picked as a
+winner here, per instruction to stop for review.
