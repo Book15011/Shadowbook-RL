@@ -476,3 +476,148 @@ this extended sweep was designed. Narrowing that specific window (e.g.
 zeta around 0.04-0.05) would be the natural next probe if a precise
 threshold is wanted, but has not been run -- no candidate is picked as a
 winner here, per instruction to stop for review.
+
+
+## Part A/B/C follow-up: a placement-anchored signal, tested
+
+The coefficient sweep confirmed r_stale is structurally incapable of ever
+rewarding CANCEL_AND_REPLACE at any zeta: _ticks_since_own_fill_norm()
+depends solely on self._last_fill_tick_idx, set ONLY inside
+`if step_fills:` in step() -- a CANCEL_AND_REPLACE never touches it, so
+r_stale cannot tell "sitting on one stale order for 1000 ticks" apart from
+"replaced 5 times in the last 10 ticks, still unfilled." This section
+covers a direct fix for that gap, a reward-component decomposition to
+check an existing assumption, and three probes of the fix in isolation.
+
+### Part A: a placement-anchored staleness signal
+
+Added self._resting_placed_tick_idx (mirrors self._last_fill_tick_idx's
+init-only pattern exactly, in __init__ and reset()), stamped to the
+current tick on every new placement in _place_limit() -- including the
+fresh order from a CANCEL_AND_REPLACE, which is the whole point: replacing
+a stale order now genuinely resets this specific clock. A new getter,
+_ticks_since_placement_norm(), mirrors the existing getter structure but
+normalizes against a new _PLACEMENT_STALENESS_WINDOW_TICKS constant (300
+ticks, 30s) rather than horizon_ticks -- chosen because horizon_ticks is
+already covered by the existing signal; 300 ticks comes from this project
+own measured fast-fill timescale (successful fills clustered at a 125-195
+tick median across every checkpoint tested in the coefficient sweep
+above), not Section 2.4's expected_wait_time directly (that formula needs
+a live per-price trade-rate estimate this environment does not compute --
+the same gap flagged in the original rollout investigation). This value is
+reward-internal only -- not added to the 42-dim observation vector, so the
+existing baseline checkpoint stays warm-start compatible, and
+matching_engine.py was not touched.
+
+Wired into step_reward() as a new r_placement_stale term with its own
+independent weight, RewardWeights.eta_replace, defaulting to 0.0 (inert)
+so nothing changes unless explicitly overridden. Loophole check, worked
+out explicitly rather than assumed: spamming CANCEL_AND_REPLACE every tick
+keeps ticks_since_placement_norm pinned near 0, saving at most
+eta_replace*1.0 per tick -- but every such cancel also sets
+canceled_unfilled=True, costing r_queue at least -beta = -0.5 per tick
+unconditionally. Net effect of spamming: at most +eta_replace - 0.5 per
+tick, strictly negative for any eta_replace below 0.5 -- every coefficient
+tested below has more than 3x margin under that ceiling.
+
+44 tests pass (3 new isolated reward.py tests, 1 new env-level test
+directly proving the CANCEL_AND_REPLACE-resets-the-clock behavior r_stale
+could never have). A --reward-eta-replace CLI override was added to
+train_l3.py, mirroring --reward-zeta, so it can be combined with
+--reward-zeta 0.0 to isolate this term cleanly.
+
+### Part B: does zeta=0.06 actually trade slippage for spread capture?
+
+A 15-episode rollout on both the original baseline and the zeta=0.06
+checkpoint, with src.envs.lob_execution_env's own step_reward reference
+monkey-patched (observation only, no source files modified, the real
+step_reward() still computes the actual returned value) to capture and
+sum each reward component separately:
+
+  component     baseline (40,367 ticks)   zeta=0.06 (24,603 ticks)
+  r_slip        0.82                      11.39
+  r_inv         -39.48                    -13.68
+  r_queue       0.00                      -15.68
+  r_spread      1.65                      1.62
+  r_stale       -876.96 (retroactive)     -141.98
+
+(both scored at the same RewardWeights(zeta=0.06) for an apples-to-apples
+comparison, since the baseline checkpoint never actually experienced
+r_stale during its own training.)
+
+The raw sums are confounded by fill_ratio itself (0.52 baseline vs 0.98
+under zeta=0.06 on this sample -- nearly double the filled quantity
+contributing to every per-fill term). Normalizing r_slip by fill_ratio as
+a volume proxy: baseline about 1.56, zeta=0.06 about 11.6 -- per-unit
+slippage looks MORE favorable under zeta=0.06, not worse, opposite of the
+naive prediction. r_spread's raw sum stayed nearly flat (1.65 to 1.62)
+despite close to double the filled volume -- that flatness itself implies
+per-unit spread capture did erode, just masked by higher volume in the raw
+total. Conclusion: partially confirmed, partially refuted, not a clean
+result either way -- r_spread-per-unit looks to have dropped as
+hypothesized, but r_slip-per-unit improved, likely because a much larger
+and more representative set of successful fills dilutes the cost of any
+individual aggressive fill, rather than execution quality degrading
+uniformly. r_queue's new nonzero cost (-15.68) directly confirms
+MARKET-triggered cancellations are real and paid for under zeta=0.06.
+
+### Part C: three isolated probes of eta_replace
+
+Break-even ticks under the correct model for this new signal: unlike
+r_stale (a hard floor at exactly 1.0 until the first fill, so the earlier
+sweep linear cost model applied), ticks_since_placement_norm is a genuine
+ramp from 0 (every placement, including a replace, resets it), so the
+ORIGINAL quadratic accumulation model applies here correctly:
+sum_{k=1..K} eta_replace*(k/300) for K under 300. Solving for K at the
+0.8 correction-cost threshold: eta_replace=0.02 gives K about 128 ticks,
+0.06 gives about 80, 0.15 gives about 53 -- all comfortably under the
+0.5 loophole ceiling with real margin.
+
+All three probes were warm-started from the ORIGINAL 20M baseline (not
+any zeta checkpoint), 2,000,000 steps each, zeta=0.0 explicitly to isolate
+this term own effect, run strictly sequentially (a user request to
+parallelize all three was declined -- a single job alone was confirmed
+using about 25GB of the system 50GB RAM, so three at once was not
+physically possible without a near-certain repeat of the earlier
+OOM-kill incident).
+
+Paired eval (n=50) fill_ratio, first firing to last:
+  eta_replace=0.02: 0.582, 0.598, 0.614, 0.955, 1.0, 1.0, 1.0, 1.0, 1.0
+  eta_replace=0.06: 0.582, 0.644, 0.828, 1.0, 1.0, 0.985, 0.962, 0.972, 0.79
+  eta_replace=0.15: 0.582, 0.633, 0.963, 1.0, 1.0, 1.0, 1.0, 0.999, 0.992
+
+All three reach essentially complete fill_ratio recovery, and much faster
+than zeta=0.06 ever did (by the 3rd-4th firing, versus a gradual climb
+across the full 2,000,000 steps). Final IS_total_bps margin over TWAP
+(1.2652): eta_replace=0.02 about 0.34 bps, eta_replace=0.06 about -0.69
+bps (the only candidate anywhere in this sweep to finish WORSE than TWAP),
+eta_replace=0.15 about 0.44 bps -- the best margin of every candidate
+tested in this document, original baseline included.
+
+An independent 8-episode rollout check on each finished checkpoint,
+specifically for CANCEL_AND_REPLACE usage (the direct test of whether this
+new signal does what r_stale structurally could not): CANCEL_AND_REPLACE
+stayed at EXACTLY 0.0% for all three candidates. MARKET usage rose
+substantially instead (2.91% for eta_replace=0.02, 1.06% for 0.15, 0.36%
+for 0.06 -- all higher than zeta=0.06's own 0.16-0.26%). The fill_ratio
+recovery is real, but it is not happening through the mechanism Part A was
+built to unlock: the policy is escaping staleness by forcing immediate
+market execution (which, if a resting order was present, cancels it as a
+side effect of MARKET's own cancel-then-execute path -- see step()), not
+by replacing a stale limit order with a fresh, better-priced one.
+
+### Verdict
+
+Part A's structural fix is real and correctly implemented -- confirmed
+directly by the new env-level test, not just argued. It measurably changes
+policy behavior (fill_ratio recovery, higher MARKET usage) at coefficients
+an order of magnitude smaller and faster-acting than zeta ever needed. But
+the specific hypothesis -- that removing the structural block on rewarding
+CANCEL_AND_REPLACE would cause the policy to actually use it -- is not
+confirmed by this data. The policy found a different, MARKET-based escape
+route instead. eta_replace=0.15 is the strongest candidate across every
+row in this document by both fill_ratio and IS-margin, but it achieves
+that without engaging the mechanism this whole investigation set out to
+unlock, and this is reported plainly rather than reframed as a win on the
+original hypothesis. No zeta/eta_replace combination is picked here; left
+for review.
