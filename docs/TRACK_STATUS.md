@@ -67,3 +67,76 @@ with the L3 track which checkpoint is the intended "frozen" one before wiring it
 FrozenL3Wrapper.
 Next planned step: build src/envs/wrappers.py (FrozenL3Wrapper) and src/train/train_l2.py per
 the plan in docs/reports/phase4_l2_reconciliation_and_plan.md, pending approval.
+
+## L3 / Env-Physics
+Last updated: 2026-08-19 20:47 HKT
+State: Two real bugs found and fixed in src/envs/lob_execution_env.py, validated (49
+lob_execution_env/reward/matching_engine tests pass, plus 2 new regression tests), but
+NOT YET COMMITTED -- currently stacked, uncommitted, in the same 5 files alongside two
+earlier, separately-uncertain rounds of work (the Part A/B/C staleness signal --
+RewardWeights.eta_replace -- and the r_queue MARKET/REPLACE pricing split). (1)
+qty_at_price()'s np.isclose call never overrode rtol, so at BTCUSDT's ~$120k price
+scale the effective match tolerance was ~$1.2 (rtol*price) instead of the intended
+$0.05 half-tick (atol) -- verified directly: it matched 100% of 4,400 synthetic
+placements at every tested offset (-5..+5 ticks) regardless of stated distance from
+the market, and the matched index was ALWAYS index 0 (the touch), never anything
+offset-dependent. Fixed: rtol=0.0 added. (2) _place_limit() had no crossing-order
+handling -- a price that crosses the opposing side (common: offset>=+1 ticks crossed
+~100% of the time in the same sweep) fell through to the q_ahead lookup and became an
+ordinary resting ghost order instead of trading immediately. Fixed: crossing prices
+now route through walk_market_fill() against the opposing side's book, same as
+ORDER_TYPE_MARKET, returning real fills instead of a resting QueueState. Full
+mechanism writeup, the honest re-measurement of the ORIGINAL checkpoint under fixed
+physics (fill_ratio 0.590 -> 0.2015, IS_total_bps 0.632 -> -0.1999, the
+31/50-beats-TWAP result is NOT statistically significant at z~1.70/p~0.09), and the
+init-strategy probe below are all in docs/reports/phase3_l3_baseline_milestone.md.
+
+Init-strategy probe (does the existing 20M checkpoint's weights help warm-start a
+fine-tune under the now-fixed physics, vs training from scratch): from-scratch is
+ruled out as impractical -- a near-random initial policy exploits the (correct)
+crossing fix constantly, terminating episodes in ~11-21 ticks instead of the
+3,000-tick horizon, which turns every reset() into the dominant cost. Confirmed NOT a
+day-cache sizing issue (_MAX_CACHED_DAYS raised 3->5 with real RAM-budget arithmetic
+shown, RAM-safe, verified correct via direct cache-eviction/identity checks -- but
+produced no throughput change: fps stayed at 8-10 and ep_len_mean stayed at 11-21
+ticks both before and after). Root cause is the reset RATE itself (near-random
+exploration x the crossing fix), not I/O; an untested, not-yet-investigated
+alternative hypothesis worth checking later (not urgent) is per-reset cost in the
+funding-rate lookup path. Warm-start (--warm-start-weights, loading ONLY the original
+checkpoint's policy weights, fresh VecNormalize, step counter reset to 0) looks
+healthy by contrast: fps ramped to a stable ~350-359 (above the pre-fix reference
+run's own steady-state 247), ep_len_mean held at ~3,000 (full horizon) throughout a
+~25-minute/499,712-step sample -- no reset-storm at all. Stopped there per
+instruction; NOT yet committed to the full 2,000,000-step run pending a go/no-go
+decision.
+
+For the L2 track's blocking question above: models/l3_executioner_v1.zip right now IS
+the checksum-verified ORIGINAL 20M-step baseline (sha256 94b3ad38...), restored after
+every probe this session -- but it was trained entirely under the OLD, buggy
+qty_at_price/crossing physics described above, and the init-strategy probe above
+exists specifically to decide whether it gets superseded by a fixed-physics run. Do
+not treat it as the final "frozen" checkpoint for FrozenL3Wrapper yet -- recommend
+waiting for that decision before wiring integration against a specific checkpoint file.
+
+Also for the L1 track: no training process is currently running on this box (verified
+just now), so the GPU is free if that unblocks anything on your end -- but note a
+go/no-go decision on this track's own full 2,000,000-step warm-start run is pending
+and could start at any time once approved.
+
+Files owned/in-progress (all UNCOMMITTED, three stacked rounds mixed in the same 5
+files): src/envs/lob_execution_env.py, src/envs/reward.py, src/train/train_l3.py,
+tests/test_lob_execution_env_features.py, tests/test_reward.py. IMPORTANT for
+accuracy over what any docstring in these files claims: reward.py's
+canceled_via_replace branch is CURRENTLY, TEMPORARILY reverted to charging the same
+as canceled_via_market (the r_queue MARKET/REPLACE split from an earlier round is
+neutralized in the working tree right now, for a clean init-strategy comparison) --
+the split's code comments still describe it as active, but it is not, in the current
+working tree, until explicitly restored.
+Blocking/open questions: (a) commit the qty_at_price/crossing fix on its own,
+separated from the still-on-hold staleness/r_queue-split code? It's validated and has
+no known downside, but has not been committed pending this check-in. (b) go/no-go on
+committing warm-start to the full 2,000,000-step run. (c) after that run (or
+independently), restore reward.py's r_queue split back to its real (non-neutralized)
+form.
+Next planned step: awaiting explicit direction on (a)/(b)/(c) above before proceeding
+further.
