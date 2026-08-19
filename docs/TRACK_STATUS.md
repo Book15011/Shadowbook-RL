@@ -78,75 +78,85 @@ produces the superseding checkpoint, re-confirm Parts B/C are still valid agains
 that run's actual config turns out to be, resolve the 4.1-vs-4.3 cadence question, then move
 to implementation (FrozenL3Wrapper, train_l2.py). Still not building either this round.
 
+Note from L3 (2026-08-20 00:07 HKT): saw your 74ae11a commit and item (1) above. Part C
+below is the go/no-go signal you're waiting on -- it came back healthy, but per this
+session's explicit instructions the full 2,000,000-step run is NOT launched yet; it's
+gated on an explicit user go-ahead that hasn't been given as of this update. Will update
+this file again the moment that changes.
+
 ## L3 / Env-Physics
-Last updated: 2026-08-19 20:47 HKT
-State: Two real bugs found and fixed in src/envs/lob_execution_env.py, validated (49
-lob_execution_env/reward/matching_engine tests pass, plus 2 new regression tests), but
-NOT YET COMMITTED -- currently stacked, uncommitted, in the same 5 files alongside two
-earlier, separately-uncertain rounds of work (the Part A/B/C staleness signal --
-RewardWeights.eta_replace -- and the r_queue MARKET/REPLACE pricing split). (1)
-qty_at_price()'s np.isclose call never overrode rtol, so at BTCUSDT's ~$120k price
-scale the effective match tolerance was ~$1.2 (rtol*price) instead of the intended
-$0.05 half-tick (atol) -- verified directly: it matched 100% of 4,400 synthetic
-placements at every tested offset (-5..+5 ticks) regardless of stated distance from
-the market, and the matched index was ALWAYS index 0 (the touch), never anything
-offset-dependent. Fixed: rtol=0.0 added. (2) _place_limit() had no crossing-order
-handling -- a price that crosses the opposing side (common: offset>=+1 ticks crossed
-~100% of the time in the same sweep) fell through to the q_ahead lookup and became an
-ordinary resting ghost order instead of trading immediately. Fixed: crossing prices
-now route through walk_market_fill() against the opposing side's book, same as
-ORDER_TYPE_MARKET, returning real fills instead of a resting QueueState. Full
-mechanism writeup, the honest re-measurement of the ORIGINAL checkpoint under fixed
-physics (fill_ratio 0.590 -> 0.2015, IS_total_bps 0.632 -> -0.1999, the
-31/50-beats-TWAP result is NOT statistically significant at z~1.70/p~0.09), and the
-init-strategy probe below are all in docs/reports/phase3_l3_baseline_milestone.md.
+Last updated: 2026-08-20 00:07 HKT
+State: Completed a three-part sequenced task: (A) restored reward.py's r_queue
+MARKET/REPLACE split from its temporary neutralized state back to real pricing --
+canceled_via_replace no longer charges the -beta market-cancel penalty, only the
+-gamma*ratio queue-position cost; confirmed via tests (the 3 previously-failing split
+tests -- market-cancel-penalty-isolated, replace-cancel-skips-beta,
+replace-strictly-cheaper-than-market -- pass again) and via a direct quick check that
+the two cancel paths are now priced differently again. (B) Split the prior
+uncommitted, entangled working tree into 3 clean, independently-buildable, test-
+verified commits (via snapshot/strip/verify/commit/restore, checksums confirmed
+byte-identical on full restoration -- no work lost):
+  - a1d0390 "Fix qty_at_price rtol bug and add crossing-order handling"
+  - c3f4704 "Raise per-worker parquet day-cache from 3 to 5 days"
+  - 7bbf709 "Price MARKET and CANCEL_AND_REPLACE cancels differently in r_queue"
+  (this last one bundles reward.py + tests/test_reward.py + the lob_execution_env.py
+  info-dict flag split, since the two files must stay mutually consistent -- verified
+  HEAD had neither the split nor eta_replace before this round, so they could not be
+  committed separately without an intermediate broken state). Confirmed via git log
+  that the day-cache change (c3f4704) was NOT already committed before this round, so
+  it got its own commit rather than being assumed pre-existing. src/train/train_l3.py
+  deliberately left UNCOMMITTED: its --reward-eta-replace CLI path calls
+  RewardWeights(eta_replace=...), and eta_replace is not part of any of the 3 commits
+  above (it's still experimental, uncommitted, placement-staleness work) -- committing
+  train_l3.py now would ship a flag that raises TypeError against the committed
+  reward.py. git status is clean except the expected 5 files carrying the still-
+  uncommitted, still-experimental placement-staleness/eta_replace round (restored
+  byte-identical on top of the 3 commits): src/envs/lob_execution_env.py,
+  src/envs/reward.py, src/train/train_l3.py, tests/test_lob_execution_env_features.py,
+  tests/test_reward.py.
+  (C) Re-ran the warm-start validation, this time under the REAL reward config --
+  RewardWeights() defaults (zeta=0.06, eta_replace=0.0), r_queue split restored and
+  active, same baseline checkpoint (sha256 94b3ad38..., unchanged), same n_envs=8, NO
+  --reward-zeta/--reward-eta-replace overrides. ~25 min / ~500k steps: fps ramped
+  352->365 (stable, holding slightly ABOVE even the earlier neutralized-probe warm-
+  start's 350-359), ep_len_mean held at 3e+03 (full 3,000-tick horizon) throughout --
+  no reset-storm under the real reward config either. Memory stayed bounded (34GB
+  used / 16GB available of 50GB). Stopped the process after the reading (pkill,
+  verified dead via fresh ps aux) per this session's bounded-validation instruction --
+  did NOT let it continue toward the full run. Baseline checkpoint checksum re-
+  verified unchanged afterward.
+  This is the actual green light the init-strategy probe was designed to produce:
+  warm-start avoids the reset-storm under BOTH the neutralized probe config and the
+  real reward config. Per explicit instruction, the full 2,000,000+ step run is NOT
+  launched -- these numbers are being reported and the session is waiting for an
+  explicit user go-ahead before proceeding.
 
-Init-strategy probe (does the existing 20M checkpoint's weights help warm-start a
-fine-tune under the now-fixed physics, vs training from scratch): from-scratch is
-ruled out as impractical -- a near-random initial policy exploits the (correct)
-crossing fix constantly, terminating episodes in ~11-21 ticks instead of the
-3,000-tick horizon, which turns every reset() into the dominant cost. Confirmed NOT a
-day-cache sizing issue (_MAX_CACHED_DAYS raised 3->5 with real RAM-budget arithmetic
-shown, RAM-safe, verified correct via direct cache-eviction/identity checks -- but
-produced no throughput change: fps stayed at 8-10 and ep_len_mean stayed at 11-21
-ticks both before and after). Root cause is the reset RATE itself (near-random
-exploration x the crossing fix), not I/O; an untested, not-yet-investigated
-alternative hypothesis worth checking later (not urgent) is per-reset cost in the
-funding-rate lookup path. Warm-start (--warm-start-weights, loading ONLY the original
-checkpoint's policy weights, fresh VecNormalize, step counter reset to 0) looks
-healthy by contrast: fps ramped to a stable ~350-359 (above the pre-fix reference
-run's own steady-state 247), ep_len_mean held at ~3,000 (full horizon) throughout a
-~25-minute/499,712-step sample -- no reset-storm at all. Stopped there per
-instruction; NOT yet committed to the full 2,000,000-step run pending a go/no-go
-decision.
+For the L2 track's blocking question: models/l3_executioner_v1.zip is still the
+checksum-verified ORIGINAL 20M-step baseline (94b3ad38...) -- unchanged by any of the
+above, since every probe/validation this round was stopped well short of a save
+checkpoint. It was trained under the OLD, buggy qty_at_price/crossing physics; the
+warm-start run that would supersede it (under the now-fixed physics + real reward
+config) is validated and ready to launch, but is explicitly NOT started pending user
+go-ahead. Continue treating it as provisional for FrozenL3Wrapper integration purposes
+until that run lands.
 
-For the L2 track's blocking question above: models/l3_executioner_v1.zip right now IS
-the checksum-verified ORIGINAL 20M-step baseline (sha256 94b3ad38...), restored after
-every probe this session -- but it was trained entirely under the OLD, buggy
-qty_at_price/crossing physics described above, and the init-strategy probe above
-exists specifically to decide whether it gets superseded by a fixed-physics run. Do
-not treat it as the final "frozen" checkpoint for FrozenL3Wrapper yet -- recommend
-waiting for that decision before wiring integration against a specific checkpoint file.
-
-Also for the L1 track: no training process is currently running on this box (verified
-just now), so the GPU is free if that unblocks anything on your end -- but note a
-go/no-go decision on this track's own full 2,000,000-step warm-start run is pending
-and could start at any time once approved.
-
-Files owned/in-progress (all UNCOMMITTED, three stacked rounds mixed in the same 5
-files): src/envs/lob_execution_env.py, src/envs/reward.py, src/train/train_l3.py,
-tests/test_lob_execution_env_features.py, tests/test_reward.py. IMPORTANT for
-accuracy over what any docstring in these files claims: reward.py's
-canceled_via_replace branch is CURRENTLY, TEMPORARILY reverted to charging the same
-as canceled_via_market (the r_queue MARKET/REPLACE split from an earlier round is
-neutralized in the working tree right now, for a clean init-strategy comparison) --
-the split's code comments still describe it as active, but it is not, in the current
-working tree, until explicitly restored.
-Blocking/open questions: (a) commit the qty_at_price/crossing fix on its own,
-separated from the still-on-hold staleness/r_queue-split code? It's validated and has
-no known downside, but has not been committed pending this check-in. (b) go/no-go on
-committing warm-start to the full 2,000,000-step run. (c) after that run (or
-independently), restore reward.py's r_queue split back to its real (non-neutralized)
-form.
-Next planned step: awaiting explicit direction on (a)/(b)/(c) above before proceeding
-further.
+Files owned/in-progress: src/envs/lob_execution_env.py, src/envs/reward.py,
+tests/test_lob_execution_env_features.py, tests/test_reward.py -- all carrying the
+same still-uncommitted, still-experimental placement-staleness/eta_replace round
+(unchanged in substance from the last check-in, just carried forward across the 3 new
+commits underneath it). src/train/train_l3.py -- uncommitted, contains
+--warm-start-weights/--reward-zeta/--reward-eta-replace CLI additions; kept
+uncommitted for the TypeError reason above, not because it's unvalidated (warm-start-
+weights itself has now been validated twice).
+Blocking/open questions: (a) [RESOLVED] qty_at_price/crossing fix is committed
+(a1d0390). (b) go/no-go on launching the full 2,000,000-step warm-start run under the
+real reward config -- validated healthy, waiting on explicit user approval. (c)
+[RESOLVED] reward.py's r_queue split is restored to its real, non-neutralized form
+and committed. (d) NEW: once (b) is approved and the full run is committed to,
+train_l3.py's eta_replace path either needs the (still-experimental,
+still-uncommitted) staleness reward term committed alongside it, or the
+--reward-eta-replace flag needs to be stripped/deferred -- not yet decided, low
+urgency until (b) lands.
+Next planned step: awaiting explicit user go-ahead on (b). Once given, launch the full
+run from the same baseline checkpoint under the same validated config, then revisit
+(d) before or shortly after that launch.
