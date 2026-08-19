@@ -307,3 +307,221 @@ completes and produces the checkpoint that supersedes `l3_executioner_v1.zip`. I
 is rejected in favor of some other resolution, the frozen-checkpoint choice needs to be
 re-confirmed against whatever that resolution produces -- this doc should not assume warm-start
 is the outcome.
+
+---
+
+## Part A status check (2026-08-19, this session) -- still unresolved, everything below is PROVISIONAL -- PENDING PART A
+
+Read `docs/TRACK_STATUS.md`'s L3/Env-Physics section fresh at the start of this session
+(fresh read, not reused from a prior turn). It is byte-identical to the version read in the
+previous follow-up ("Last updated: 2026-08-19 20:47 HKT", same content) -- the go/no-go on
+committing warm-start to the full 2,000,000-step run is still pending, and the section still
+says explicitly not to treat `models/l3_executioner_v1.zip` as final for `FrozenL3Wrapper`
+yet. Per this session's own instructions: this is the "still unresolved" case, so Parts B/C
+below proceed but are marked **PROVISIONAL -- PENDING PART A** throughout. No checkpoint path
+is picked or assumed anywhere below. None of `lob_execution_env.py` / `reward.py` /
+`train_l3.py` / the two test files were read or touched this session (per this session's own
+hard boundary) -- all facts below are sourced from `architecture_spec.md`,
+`configs/ppo_l3.yaml`, `data/splits/l2_bybit_btcusdt_split.json`, and this doc's own prior,
+already-committed findings (which were themselves sourced from the live env file in an earlier
+session, before it became live/uncommitted work).
+
+## Part B (PROVISIONAL -- PENDING PART A): deriving L2's real SAC hyperparameters
+
+### B.1 Ground truth inputs, sourced directly (not assumed)
+
+- `horizon_ticks = 3000` -- confirmed from `configs/ppo_l3.yaml`'s `env:` block (the real
+  production value used by L3 training), not the illustrative "30-minute horizon" example in
+  architecture_spec.md Section 3.4 (which, at the real `tick_interval_s`, would actually be
+  18,000 ticks -- the spec's own example number doesn't match the real configured horizon;
+  flagged, not resolved here, out of scope for this track).
+- `tick_interval_s = 0.1` (100ms/tick) -- this session did not re-read the live env file to
+  re-verify this (out of bounds this round), but it was already established and committed in
+  this doc's original Part A (grepped `configs/` and `src/` for any override; found none) and
+  is independently corroborated by architecture_spec.md Section 4.3's own
+  `L1_EVERY_N_TICKS = 600 # ~60s at 100ms ticks` / `L2_EVERY_N_TICKS = 10 # ~1s at 100ms ticks`
+  comments, which assume the same 100ms tick rate.
+- `ticks_per_l2_decision = 50` -- Section 4.1's literal reference value.
+- => L2 decisions per episode = 3000 / 50 = **60** (matches this task's stated figure).
+- => L2 decision cadence = 50 x 0.1s = **5.0s/decision**, inside Section 3.2's own "L2 decides
+  every 1-10s" framing.
+- => episode wall-clock length = 3000 x 0.1s = **300s (5 minutes)**.
+- `train_dates = 405` -- **verified against the real, persisted split artifact**,
+  `data/splits/l2_bybit_btcusdt_split.json` (not the spec's own illustrative
+  `"source_day_count": 296` example in Section 2.5, which is placeholder text, not real data).
+  Real artifact: `source_day_count: 441` total, **`train_dates: 405`**, `val_dates: 18`,
+  `test_dates: 18`, `known_gap_dates: 49`, train window 2024-04-18 to 2025-07-15. The task's
+  stated "405 train days" figure checks out exactly against the real artifact.
+
+**Flagging one real spec-internal inconsistency surfaced while sourcing the above:** Section
+4.1's training-time cadence (`ticks_per_l2_decision=50` -> 5s/decision) and Section 4.3's
+live-inference-loop cadence (`L2_EVERY_N_TICKS=10` -> 1s/decision) are different numbers for
+what is presented as the same tier's decision frequency. This may be intentional (a coarser
+cadence during training to save frozen-L3-rollout compute per SAC gradient step, vs. a finer
+one at deployment), but it is not stated as intentional anywhere in the spec, and if L2 is
+*trained* at a 5s cadence but *deployed* at a 1s cadence, that is a genuine train/inference
+distribution mismatch (the policy would be executed on a decision cadence 5x finer than
+anything it was trained against). This doc uses the Section 4.1 training-time value
+(`ticks_per_l2_decision=50`) throughout, per this task's explicit instruction -- flagging the
+4.3 discrepancy as a separate open question, not resolving it here (it needs a judgment call,
+not arithmetic, and isn't blocking the derivations below).
+
+### B.2 `buffer_size=500_000` -- confirmed as reasonable, with arithmetic
+
+Each L2 episode (one parent order = one env episode) yields at most 60 L2-cadence transitions
+(fewer only if the full parent order fills and the episode terminates before the 3000-tick
+horizon).
+
+- `buffer_size / transitions_per_episode = 500,000 / 60 ≈ 8,333` episodes' worth of L2
+  transitions the buffer can hold at capacity.
+- `total_timesteps / transitions_per_episode = 2,000,000 / 60 ≈ 33,333` total episodes over
+  the entire training run (Section 4.1's stated `total_timesteps=2_000_000` for L2's SAC).
+- So the buffer holds roughly `8,333 / 33,333 ≈ 25%` of the run's total transition volume at
+  any point once full -- i.e., a sliding window over the most recent quarter of training.
+  This is a normal, unremarkable fraction for an off-policy replay buffer (SAC buffers
+  commonly span a meaningful fraction, not a tiny sliver, of `total_timesteps` in runs of this
+  size) -- not oversized relative to available RAM-scale concerns, not so small it forces
+  near-fully-online behavior.
+- Diversity check against the 405 real train days: with `reset()` drawing a random file +
+  random start tick + random side + random size per episode (existing, already-documented env
+  behavior), and each train day holding roughly 864,000 ticks against a ~3,010-tick episode
+  window, there is enormous room for many non-overlapping windows per day -- day count is not
+  the binding constraint on episode diversity, transition budget is. Across the full run,
+  405 days get sampled roughly `33,333 / 405 ≈ 82` times each on average; within any one
+  8,333-episode buffer snapshot, that is still on the order of 20 samples/day of coverage --
+  plenty of within-buffer diversity, not degenerate.
+
+**Confirmed as-is: `buffer_size=500_000` holds up under L2's real cadence.** No adjustment
+proposed.
+
+### B.3 `gamma=0.995` -- re-derived on L2's own terms, confirmed as-is with an explicit caveat
+
+Standard geometric-series "effective/characteristic horizon" for a discount factor:
+`1 / (1 - gamma)` steps, in whatever the step unit is.
+
+- At L2's own decision cadence: `1 / (1 - 0.995) = 200` **decisions**.
+- `200 decisions x 5.0s/decision = 1000s ≈ 16.7 minutes`.
+- Episode length is `300s (5 minutes) = 60 decisions`.
+- So `gamma=0.995`'s effective horizon (200 decisions) is **~3.3x longer than the entire
+  episode** (60 decisions) -- concretely, the discount weight on the very LAST decision of an
+  episode, relative to the first, is `0.995^59 ≈ 0.744`: barely discounted at all across the
+  whole parent-order execution.
+
+This is a materially different regime than how Section 4.1 justifies the *same* number for
+L3 ("~100ms ticks -> ~5s effective discount horizon" -- note this comment does not itself
+match `1/(1-0.995)=200 ticks x 0.1s = 20s`, not 5s, under the standard formula; L3's own
+gamma justification comment appears to already be a loose approximation, not exact arithmetic
+-- out of scope to fix here, but worth naming so the L2 number isn't held to a standard the L3
+number doesn't actually meet either). Copy-pasting `0.995` into L2's config is not, on its own,
+a derivation.
+
+**Is near-flat discounting across the whole episode actually wrong for L2, though?**
+Re-derived on L2's own terms: no, not obviously. This task's reward structure (Section 3.3) is
+dominated by one large terminal implementation-shortfall term (`r_terminal = -kappa * IS_bps`,
+paid once at episode end) plus smaller per-step shaping terms. For a bounded, single-parent-
+order episode where the thing that actually matters is the *whole order's* execution quality,
+near-flat discounting is arguably the *correct* choice, not an artifact to fix -- it stops SAC
+from myopically overweighting early-episode participation-rate decisions relative to the
+terminal outcome that reflects the entire order. This is also less costly for SAC specifically
+than it would be for an on-policy, rollout-based method (PPO/GAE), since SAC learns Q-values
+via off-policy TD bootstrapping through the replay buffer rather than needing long on-policy
+rollouts to estimate returns -- a generous effective horizon doesn't inflate rollout variance
+the way it would for L3's own PPO.
+
+**Recommendation: confirm `gamma=0.995` as the starting value, with the above as its real
+justification (not L3's copy-pasted rationale) -- but flag it as an explicit ablation
+candidate, not a fully closed question.** A lower alternative worth testing once real L2
+training is unblocked: `gamma ≈ 0.983` (`1/(1-gamma) ≈ 60` decisions, matching effective
+horizon to episode length exactly) would give more meaningful within-episode credit
+assignment (last-decision weight `0.983^59 ≈ 0.37` instead of `0.74`) at the cost of weighting
+the terminal IS term less heavily relative to early per-step shaping terms. This is ultimately
+an empirical question this session cannot settle -- no training may run under this task's own
+hard boundaries, and it's downstream of the Part A checkpoint block regardless. Recorded here
+as the concrete alternative to try, not left as a bare "flagged, unresolved."
+
+## Part C (PROVISIONAL -- PENDING PART A): L2's real observation space
+
+### C.1 What's actually in the existing 42-dim vector vs. what Section 3.1 claims L2 gets
+
+Section 3.1 states L2 "consumes a temporally downsampled view of the same 42-dim vector
+(1s/10s aggregates ...) ... and additionally receives a TWAP-schedule deviation scalar." Per
+this doc's original Part A, **no such downsampled/aggregated pipeline exists anywhere in the
+real code** -- there is exactly one `_build_obs()`, producing one 42-dim snapshot per 100ms
+tick, with no L2-cadence aggregation step. Building genuine temporal downsampling (e.g.
+mean/std of each of the 42 dims over the trailing 50-tick window) is real, non-trivial
+feature-engineering work -- a new rolling-buffer mechanism, ~50x more computation per L2
+decision than a single snapshot -- and is out of scope for this task (no implementation code
+this round, and this task's own hard boundary prohibits touching the live env file that would
+need to change).
+
+Re-examining the 42-dim vector's *existing* contents, though, several dims are already
+rolling-window features whose window length happens to land near L2's own cadence, purely by
+coincidence of the numbers involved, not by design for L2:
+- idx 4 `mid_return_5s_z` -- a trailing 5s return z-score. At `ticks_per_l2_decision=50`
+  (5.0s/decision), this is *almost exactly* "price drift since the last L2 decision" already.
+- idx 12 `trade_flow_imbalance_5s` -- trailing 5s taker buy/sell imbalance. Same coincidence:
+  already close to "net order flow since the last L2 decision" at the current cadence.
+- idx 5 `realized_vol_60s_z`, idx 40 `taker_buy_sell_ratio_1m` -- wider windows (60s), genuinely
+  different from and complementary to the per-decision window, not a substitute for it.
+
+This coincidence is fragile, not a real design guarantee: if `ticks_per_l2_decision` is ever
+changed (e.g. reconciled toward Section 4.3's `L2_EVERY_N_TICKS=10` / 1s cadence, per the B.1
+flag above), idx 4/12's fixed 5s windows would stop lining up with the decision cadence at all.
+Noting this explicitly rather than silently relying on a coincidence that could silently break
+under a config change nobody thinks to re-check.
+
+### C.2 What is genuinely missing from the 42-dim vector for L2's purposes
+
+- **TWAP-schedule deviation** -- Section 3.1 explicitly calls for this, and it does not exist
+  in any of the 42 dims. It is cheaply derivable from state the env already exposes, though,
+  without new rolling-window infrastructure: `(qty_total - qty_remaining) / qty_total` (actual
+  executed-so-far fraction) minus the existing TWAP baseline formula (already implemented as
+  `_compute_l2_target_slice_ratio()`'s default path: `ticks_elapsed / horizon_ticks`) gives
+  signed deviation of real execution from the fixed-TWAP schedule -- positive = ahead of
+  schedule, negative = behind.
+- **Fill progress since L2's own last decision** -- feedback on whether L3 actually executed
+  close to what L2 last asked for. Nothing in the 42-dim vector isolates "since my last
+  decision" specifically (idx 1 `inventory_remaining_norm` and idx 41 `own_open_orders_norm`
+  are current-state snapshots, not deltas over the just-elapsed window). This is computable by
+  the wrapper itself (it already straddles the L2-decision boundary and can diff
+  `qty_remaining` before/after its own inner tick loop) without any env change.
+- Time-remaining-in-episode is **not** missing -- idx 0 `time_remaining_norm` already covers
+  it identically for both tiers; not duplicating it.
+
+### C.3 Concrete proposed observation space
+
+**`Box(shape=(44,), dtype=np.float32)`** -- the existing 42-dim vector, snapshotted at the
+tick where each L2 decision is made, plus 2 new L2-specific scalars appended at the end:
+
+| Index | Feature | Range | Source |
+|---|---|---|---|
+| 0-41 | identical to `_OBS_SPEC` (Section 3.1 table) | as existing | reused as-is, no new computation |
+| 42 | `schedule_deviation` | `[-1, 1]` | `clip((qty_total - qty_remaining)/qty_total - twap_baseline, -1, 1)`; `twap_baseline` from the env's existing default-path formula |
+| 43 | `fill_progress_since_last_decision` | `[0, 2]` | `clip(qty_filled_last_window / max(assigned_slice_last_window, eps), 0, 2)`, tracked by the wrapper itself across its own inner-loop boundary; capped at 2 to represent "over-filled relative to what was asked" (e.g. a MARKET order fired more aggressively than the assigned slice implied) rather than clipping that signal away at 1 |
+
+Note on idx 15/16 within the reused block (`l2_target_slice_ratio`, `l2_urgency`): at L2
+decision time these reflect the *result of L2's own previous decision* (the wrapper set them
+before the just-finished inner tick loop), not something new being computed for L2 -- this is
+the standard "observe your own last action" RL pattern, not a bug, but worth stating
+explicitly rather than leaving ambiguous which tier "owns" those two values in this vector.
+
+**Why this shape over a genuine downsampled/aggregated pipeline:** it is the cheapest option
+that still closes Section 3.1's specific, named gap (the TWAP-deviation scalar) and adds the
+one other signal (fill-progress feedback) that a wrapper sitting at the L2/L3 boundary can
+supply for free from state it already has to touch. A true temporally-downsampled feature set
+(rolling mean/std of all 42 dims over each 50-tick window) is left as a documented future
+enhancement, to be built only if this simpler version proves empirically insufficient once L2
+training can actually run -- not built preemptively against an unvalidated need.
+
+## Summary of this round
+
+Part A: still blocked, unchanged since the last check-in -- reported, not resolved, no
+checkpoint picked. Parts B/C: buffer_size=500,000 confirmed as-is with real arithmetic;
+gamma=0.995 confirmed as a starting value with real (not copy-pasted) justification, plus a
+named empirical alternative (~0.983) to test once training is unblocked; L2 observation space
+concretely proposed as `Box(shape=(44,))` (42 existing dims + 2 new L2-specific scalars). All
+of Parts B/C marked **PROVISIONAL -- PENDING PART A** -- ready for review, but not to be
+treated as final until the L3 checkpoint question resolves, since the checkpoint choice could
+still, in principle, come with its own guidance that affects these numbers (e.g. if a fixed-
+physics retrain changes `horizon_ticks` or reward scaling). No `FrozenL3Wrapper`/`train_l2.py`
+code written.
