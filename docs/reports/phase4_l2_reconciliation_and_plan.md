@@ -267,3 +267,43 @@ since several same-day probe variants exist alongside it; (2) build `src/envs/wr
 (`FrozenL3Wrapper`, per B.2, including the VecNormalize fix in B.3) and `src/train/train_l2.py`
 next, once this plan is reviewed; (3) `lob_execution_env.py` itself needs no changes for any of
 this.
+
+---
+
+## Follow-up (2026-08-19 22:07 HKT): checkpoint question is BLOCKED, not resolved
+
+Checked against `docs/TRACK_STATUS.md`'s L3/Env-Physics section before proceeding further,
+per instruction. Resolution of the "which checkpoint is frozen L3" open question from Part D
+above:
+
+**Not resolved -- genuinely blocked, not just ambiguous.** Two real bugs were found and fixed
+in `lob_execution_env.py` since this doc's original Part D table was written
+(`qty_at_price()`'s missing `rtol=0.0`, and `_place_limit()`'s missing crossing-order
+handling -- both confirmed and fixed, per the L3 track's own writeup). `models/
+l3_executioner_v1.zip` is confirmed (sha256-verified) to be the original 20M-step baseline --
+but it was trained entirely under the OLD, buggy physics. An init-strategy probe (does that
+checkpoint's weights warm-start a fine-tune under the now-fixed physics, vs. training from
+scratch) is in progress: from-scratch is already ruled out as impractical (near-random policy
+exploits the correct crossing fix, episodes terminate in 11-21 ticks instead of 3,000), and
+warm-start looks healthy (fps ~350-359, full 3,000-tick episodes, ~25min/499,712-step sample)
+-- but the L3 track explicitly stopped short of committing to the full 2,000,000-step run,
+pending a go/no-go decision, and says outright: **"Do not treat \[l3_executioner_v1.zip\] as
+the final 'frozen' checkpoint for FrozenL3Wrapper yet -- recommend waiting for that decision
+before wiring integration against a specific checkpoint file."**
+
+Per this session's own task instructions: when this probe is not yet resolved, do not pick a
+checkpoint and do not proceed to hyperparameter derivation (Part B) or observation-space design
+(Part C) -- stop and report the block instead. Both of those would still need redoing (SAC's
+effective horizon depends on which policy generates L2's training transitions; L2's
+observation-space proposal is independent of the checkpoint choice, but sequencing all of this
+behind one clean go/no-go avoids building against a moving target twice, the exact repeated
+pattern this project has already paid for). No further plan content added this round --
+Parts B/C remain open until the L3 go/no-go lands.
+
+**Concrete unblock condition:** L2 wrapper work (this doc's Parts B/C, and eventually
+`FrozenL3Wrapper`/`train_l2.py` themselves) can resume once the L3 track's go/no-go on the
+full 2,000,000-step warm-start run is decided AND (if warm-start is approved) that run
+completes and produces the checkpoint that supersedes `l3_executioner_v1.zip`. If warm-start
+is rejected in favor of some other resolution, the frozen-checkpoint choice needs to be
+re-confirmed against whatever that resolution produces -- this doc should not assume warm-start
+is the outcome.

@@ -39,34 +39,34 @@ validation of L1MacroAnalyst stays paused until that decision + headroom
 are both confirmed.
 
 ## L2 -- Strategist
-Last updated: 2026-08-19 19:26 HKT
-State: reconciliation complete, integration plan proposed, awaiting review -- no code yet.
-Confirmed (read-only, against the real src/envs/lob_execution_env.py and reward.py) that
-architecture_spec.md Section 4.1's FrozenL3Wrapper/train_l2.py reference code does not match
-the real env at all: tier=, l2_override=, seed= (constructor), l2_action_space,
-l2_observation_space, apply_l2_action, step_l3, get_l3_obs, get_l2_obs, l2_info() -- all ten
-confirmed absent by direct reading. The real env is single-tier (one step() call = one
-100ms L3-shaped tick) and has exactly one obs space (42-dim, matches Section 3.1 index-for-
-index) and one action space (MultiDiscrete([4,11,5]), matches Section 3.2's L3 spec). The one
-piece of real L2-facing infra that DOES already work: l2_target_slice_ratio_override and
-l2_urgency are plain public attributes, read fresh every tick -- mid-episode L2 target changes
-without reconstructing the env already work today via direct attribute assignment, no new
-method needed. Full writeup + proposed wrapper-only integration plan (recommends zero changes
-to lob_execution_env.py) in docs/reports/phase4_l2_reconciliation_and_plan.md, including a
-flagged correctness gap the Section 4.1 reference code misses entirely: the frozen L3
-checkpoint was trained under VecNormalize(norm_obs=True, clip_obs=5.0) (confirmed from
-train_l3.py + models/l3_vecnormalize.pkl on disk), so FrozenL3Wrapper must apply those saved
-normalization stats before calling l3_model.predict(), or the frozen policy sees
-out-of-distribution inputs.
-Files owned/in-progress: none yet (read-only). New file added:
-docs/reports/phase4_l2_reconciliation_and_plan.md (design doc only, no env/train code).
-Blocking/open questions: awaiting sign-off on the integration plan. Separately: several
-same-day models/l3_executioner_v1*.zip probe variants exist alongside
-models/l3_executioner_v1.zip (the one Section 4.1's train_l2.py would load) -- need to confirm
-with the L3 track which checkpoint is the intended "frozen" one before wiring it into
-FrozenL3Wrapper.
-Next planned step: build src/envs/wrappers.py (FrozenL3Wrapper) and src/train/train_l2.py per
-the plan in docs/reports/phase4_l2_reconciliation_and_plan.md, pending approval.
+Last updated: 2026-08-19 22:07 HKT
+State: BLOCKED on the L3/Env-Physics track's own open go/no-go decision -- checked
+docs/TRACK_STATUS.md's L3 section per instruction before proceeding to hyperparameter
+derivation or observation-space design, and it resolves the prior "which checkpoint is
+frozen L3" open question as genuinely unresolved, not just ambiguous. Summary: two real
+physics bugs were found/fixed in lob_execution_env.py since this track's last update
+(qty_at_price rtol, _place_limit crossing handling); models/l3_executioner_v1.zip is
+confirmed (sha256-verified) to be the original 20M-step baseline, but trained under the OLD
+buggy physics. An init-strategy probe (warm-start vs. from-scratch fine-tune under the fixed
+physics) found from-scratch impractical and warm-start healthy, but the L3 track explicitly
+stopped short of committing to the full 2,000,000-step run pending a go/no-go decision, and
+says outright not to treat l3_executioner_v1.zip as final for FrozenL3Wrapper yet. Per this
+session's task instructions, when this is unresolved: do not pick a checkpoint, do not
+proceed to SAC hyperparameter derivation or L2 observation-space design -- stop and report
+the block instead. Did so; no new plan content added this round beyond recording the block.
+Full detail in docs/reports/phase4_l2_reconciliation_and_plan.md's new "Follow-up" section
+(appended, original Parts A/B content unchanged).
+Files owned/in-progress: none (still read-only/planning). Same file as before,
+docs/reports/phase4_l2_reconciliation_and_plan.md, now with an appended follow-up section.
+Blocking/open questions: entirely downstream of the L3 track's own open items (a)/(b)/(c) --
+specifically (b), the go/no-go on the full 2,000,000-step warm-start run. L2's SAC
+hyperparameter derivation and observation-space proposal (this session's Parts B/C) remain
+undone, deliberately, until that lands -- see the design doc's Follow-up section for why
+sequencing behind one clean decision was chosen over building ahead of it.
+Next planned step: resume Part B (derive buffer_size/gamma for L2's real 60-decisions/episode
+cadence) and Part C (propose L2's actual observation space) once the L3 go/no-go is decided
+and (if warm-start is approved) that run has produced the checkpoint that supersedes
+l3_executioner_v1.zip. Still not building FrozenL3Wrapper/train_l2.py.
 
 ## L3 / Env-Physics
 Last updated: 2026-08-19 20:47 HKT
