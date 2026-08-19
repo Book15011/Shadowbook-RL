@@ -17,11 +17,14 @@ import pandas as pd
 import pytest
 
 from src.envs.lob_execution_env import (
+    ORDER_TYPE_CANCEL_REPLACE,
     ORDER_TYPE_HOLD,
     ORDER_TYPE_LIMIT,
     ORDER_TYPE_MARKET,
+    TICK_SIZE,
     _OBS_SPEC,
     LOBExecutionEnv,
+    TickView,
 )
 
 
@@ -324,3 +327,71 @@ def test_ref_depth_scoped_to_legacy_window_not_full_buffer(tmp_path):
         f"ref_depth={ref_depth} looks like it leaked the wide buffer low-depth rows "
         f"(expected ~{2 * high_depth}, the buffer-only region has depth {2 * low_depth})"
     )
+
+
+def _make_tick_view(bid_price, bid_size, ask_price, ask_size):
+    return TickView(
+        ts=1, best_bid=bid_price, best_ask=ask_price,
+        mid_price=(bid_price + ask_price) / 2.0, spread=ask_price - bid_price,
+        bid_prices=np.array([bid_price]), bid_sizes=np.array([bid_size]),
+        ask_prices=np.array([ask_price]), ask_sizes=np.array([ask_size]),
+    )
+
+
+def test_qty_at_price_no_false_match_beyond_half_tick():
+    # Regression test for the rtol bug fixed in qty_at_price() (see
+    # docs/reports/phase3_l3_baseline_milestone.md): np.isclose's default rtol=1e-05
+    # was never overridden, so at BTC price scale (~$100k+) a price MORE than a tick
+    # or two away from the only real level would still false-match, because
+    # rtol*price alone dwarfed the intended atol=TICK_SIZE/2 half-tick window. Uses a
+    # deliberately large price (100_000.0) so the old rtol=1e-05 bug (effective
+    # tolerance ~$1) would have produced a false match at a gap this test's price is
+    # comfortably outside of atol=$0.05 but well inside what rtol used to permit.
+    tick = _make_tick_view(bid_price=100_000.0, bid_size=5.0, ask_price=100_000.1, ask_size=8.0)
+    # Deliberately not testing exactly AT the atol=0.05 boundary: float64 addition at
+    # this magnitude (100_000.0 + 0.05) lands a few ULPs past 0.05 away from the base
+    # price (0.050000000002...), which is a float-precision artifact of this test's
+    # own arithmetic, not a behavior the fix needs to guarantee -- use a comfortable
+    # margin on each side of the boundary instead.
+    comfortably_within_half_tick = round(100_000.0 + TICK_SIZE / 2 - 0.01, 2)
+    just_beyond_half_tick = round(100_000.0 + TICK_SIZE / 2 + 0.01, 2)
+
+    assert tick.qty_at_price(100_000.0, "bid") == pytest.approx(5.0)
+    assert tick.qty_at_price(comfortably_within_half_tick, "bid") == pytest.approx(5.0)
+    assert tick.qty_at_price(just_beyond_half_tick, "bid") == 0.0
+    # The old bug's signature: a price ~$1 away (well beyond any real tick-spacing
+    # gap) used to still match via rtol. Confirms it no longer does.
+    assert tick.qty_at_price(100_001.0, "bid") == 0.0
+
+
+def test_crossing_limit_placement_fills_immediately_not_a_resting_order(tmp_path):
+    # Regression test for the crossing-order fix in _place_limit() (see
+    # docs/reports/phase3_l3_baseline_milestone.md): before the fix, a price that
+    # crosses the opposing side fell through to the q_ahead lookup and became an
+    # ordinary resting ghost order -- no real exchange lets a bid rest above the
+    # current ask. Book has a 1-tick spread (100.0 / 100.1), so a buy at offset=+1
+    # prices at exactly 100.1 == best_ask, crossing it. ask_size=1000.0 is large
+    # enough that any qty_total the env draws fills in a single level, so the
+    # expected fill is fully deterministic without needing to fix the qty_total RNG.
+    data_dir = tmp_path / "BTCUSDT"
+    data_dir.mkdir()
+    _write_constant_day(
+        data_dir / "l2-BTCUSDT-2024-01-01.parquet", n_rows=20,
+        bid_price=100.0, bid_size=5.0, ask_price=100.1, ask_size=1000.0,
+    )
+    env = LOBExecutionEnv(data_dir=data_dir, horizon_ticks=5, lookback_ticks=2)
+    obs, info = env.reset(seed=0)
+    env.side = 1  # buy
+    qty_before = env.qty_remaining
+
+    action = np.array([ORDER_TYPE_LIMIT, 5 + 1, 0])  # offset=+1, SIZE_FRACTIONS[0]=0.2
+    obs, r, term, trunc, info = env.step(action)
+
+    expected_fill_qty = 0.2 * qty_before
+    assert env._resting is None, "crossing price must not become a resting order"
+    fills = info["fills_this_step"]
+    assert len(fills) == 1
+    assert fills[0]["price"] == pytest.approx(100.1)
+    assert fills[0]["qty"] == pytest.approx(expected_fill_qty)
+    assert fills[0]["is_maker"] is False
+    assert env.qty_remaining == pytest.approx(qty_before - expected_fill_qty)

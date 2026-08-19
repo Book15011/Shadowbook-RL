@@ -151,7 +151,16 @@ class TickView:
     def qty_at_price(self, price: float, side: str) -> float:
         prices = self.bid_prices if side == "bid" else self.ask_prices
         sizes = self.bid_sizes if side == "bid" else self.ask_sizes
-        matches = np.isclose(prices, price, atol=TICK_SIZE / 2)
+        # rtol=0.0: np.isclose's default rtol=1e-05 was never overridden here, and at
+        # BTCUSDT's price scale (~$100k+) rtol*price alone is ~$1-1.5 -- 20-30x wider
+        # than the intended/documented atol=TICK_SIZE/2=$0.05 half-tick match window.
+        # Verified directly (see docs/reports/phase3_l3_baseline_milestone.md): this
+        # made the match rate 100% at every offset tested, including offsets that cross
+        # the opposing side entirely, and ~89% of all matches were ambiguous (multiple
+        # array entries satisfied the loose tolerance, with the first in array order --
+        # not the nearest -- silently selected). Pinning rtol=0.0 makes the match
+        # governed purely by atol, as documented.
+        matches = np.isclose(prices, price, atol=TICK_SIZE / 2, rtol=0.0)
         if not matches.any():
             return 0.0
         return float(sizes[matches][0])
@@ -689,23 +698,51 @@ class LOBExecutionEnv(gym.Env):
         v_trade = max(0.0, prev_qty - curr_qty)
         return v_trade, prev_qty
 
-    def _place_limit(self, tick: TickView, offset: int, size_frac: float) -> None:
+    def _place_limit(self, tick: TickView, offset: int, size_frac: float) -> list[dict]:
         if self.side == 1:
             price = round(tick.best_bid + offset * TICK_SIZE, 1)
             side = "bid"
+            crossed = price >= tick.best_ask
         else:
             price = round(tick.best_ask - offset * TICK_SIZE, 1)
             side = "ask"
-        # Q_ahead(0): visible resting volume at this price at placement (Section 2.4
-        # point 1); 0.0 if the price falls outside the visible top-20 book -- flagged
-        # in the module docstring as likely optimistic for deep/passive prices.
-        q_ahead = tick.qty_at_price(price, side)
+            crossed = price <= tick.best_bid
+
         size = min(size_frac * self.qty_remaining, self.qty_remaining)
         if size <= 0:
-            return
+            return []
+
+        if crossed:
+            # A price that crosses the opposing side is marketable, not restable: no
+            # real exchange lets a bid rest above the current ask (or a sell rest below
+            # the current bid) -- it trades immediately against the opposing side
+            # instead. Route through walk_market_fill() against the OPPOSING side's
+            # visible depth, exactly like ORDER_TYPE_MARKET does in step() -- same
+            # mechanism, just reached via a crossing LIMIT/CANCEL_REPLACE price rather
+            # than an explicit MARKET action. Before this fix, a crossing price fell
+            # through to the q_ahead lookup below and became an ordinary resting ghost
+            # order -- see docs/reports/phase3_l3_baseline_milestone.md for how that,
+            # combined with the qty_at_price tolerance bug above, produced fictitious
+            # fills for ~45% of placements in the offset sweep.
+            book_prices, book_sizes = (
+                (tick.ask_prices, tick.ask_sizes) if self.side == 1
+                else (tick.bid_prices, tick.bid_sizes)
+            )
+            level_fills, qty_unfilled = walk_market_fill(size, book_prices, book_sizes)
+            fills = [{"price": p, "qty": q, "is_maker": False} for p, q in level_fills]
+            filled_qty = size - qty_unfilled
+            self.qty_remaining = max(0.0, self.qty_remaining - filled_qty)
+            return fills
+
+        # Q_ahead(0): visible resting volume at this price at placement (Section 2.4
+        # point 1); 0.0 if the price falls outside the visible top-20 book -- flagged
+        # in the module docstring as likely optimistic for deep/passive prices. (Prices
+        # that cross the opposing side never reach here -- handled above instead.)
+        q_ahead = tick.qty_at_price(price, side)
         self._resting = QueueState(q_ahead=q_ahead, own_qty_remaining=size)
         self._resting_price = price
         self._resting_side = side
+        return []
 
     def step(self, action):
         tick_before = self._current_tick()
@@ -757,7 +794,10 @@ class LOBExecutionEnv(gym.Env):
                 self.qty_remaining = max(0.0, self.qty_remaining - filled_qty)
         elif order_type in (ORDER_TYPE_LIMIT, ORDER_TYPE_CANCEL_REPLACE):
             if self._resting is None and self.qty_remaining > 0:
-                self._place_limit(tick_before, offset, size_frac)
+                # Normally [] (a resting order was created); non-empty only when the
+                # requested price crossed the opposing side and _place_limit() routed
+                # it through walk_market_fill() instead -- see _place_limit().
+                step_fills.extend(self._place_limit(tick_before, offset, size_frac))
         # HOLD (order_type == 0): nothing further.
 
         if step_fills:
