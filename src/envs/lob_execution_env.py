@@ -359,7 +359,15 @@ class LOBExecutionEnv(gym.Env):
         self._last_fill_tick_idx: int | None = None
         self._episode_fills: list[dict] = []  # full history for the episode, for eval reporting
 
-    _MAX_CACHED_DAYS = 3  # roughly 85MB/day; a small cache trims repeat reads across 50+ episodes
+    # ~828MB/day measured in memory (pd.read_parquet + memory_usage(deep=True) on
+    # real train/val days -- NOT the ~85MB the old comment here claimed, an order-
+    # of-magnitude error). At n_envs=8 parallel workers, each with its own cache:
+    # 8 * 5 * 0.86GB =~ 34.4GB cache + ~4.4GB non-cache overhead =~ 38.8GB total,
+    # leaving ~11GB headroom out of this box's 50GB (measured baseline: a single
+    # n_envs=8 job at the old default of 3 used ~25GB). See
+    # docs/reports/phase3_l3_baseline_milestone.md, "Physics fix + init-strategy
+    # probe" for the full arithmetic and why this was raised from 3.
+    _MAX_CACHED_DAYS = 5
 
     def _load_day(self, path: Path) -> pd.DataFrame:
         if path not in self._day_cache:
