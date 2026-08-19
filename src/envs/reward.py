@@ -14,7 +14,7 @@ EXPERIMENTAL ADDITION (not in Section 3.3): r_stale, added after the
 finished 20M-step baseline (models/l3_executioner_v1.zip) was found to use
 CANCEL_AND_REPLACE/MARKET 0% of the time -- see
 docs/reports/phase3_l3_baseline_milestone.md. The original four components
-only penalize an ACTIVE cancel (r_queue, via canceled_unfilled); leaving a
+only penalize an ACTIVE cancel (r_queue, via the cancel flags); leaving a
 stale, unfilled order in place costs almost nothing per tick beyond r_inv,
 so a single correction attempt is always a worse certain cost than doing
 nothing (break-even was about 400 idle ticks under r_inv alone -- see the
@@ -23,6 +23,37 @@ already computed by the env, not a new feature) while an order is resting
 and unfilled, so accumulated staleness outpaces a correction one-time cost
 well before that break-even point. See RewardWeights.zeta for the
 coefficient derivation.
+
+EXPERIMENTAL ADDITION 3 (modifies Section 3.3): r_queue is no longer
+charged identically for MARKET and CANCEL_AND_REPLACE. Motivation,
+verified from source rather than hypothesized: LOBExecutionEnv.step()
+previously set a single canceled_unfilled flag for both actions, so both
+paid -beta - gamma*queue_ratio. Since only MARKET guarantees a fill,
+MARKET strictly economically dominated CANCEL_AND_REPLACE at every
+coefficient -- the structural reason CANCEL_AND_REPLACE stayed at exactly
+0% usage across every zeta AND every eta_replace probed (see
+docs/reports/phase3_l3_baseline_milestone.md). No coefficient search can
+rescue a dominated action; the price itself had to change. The split:
+MARKET keeps both components (walking the spread on top of discarding
+queue position is full abandonment), CANCEL_AND_REPLACE keeps only the
+queue-weighted -gamma*queue_ratio (it stays in the limit-order system with
+a fresh order, so the flat abandonment charge does not apply, but
+discarded queue position is a real cost).
+
+IMPORTANT, and contrary to the intuition this split was designed around:
+queue_ratio = q_ahead / (q_ahead + own_qty_remaining) is LARGEST for a
+freshly placed order sitting behind a deep level, and tends to 0 for an
+order that has already waited its way to the front. _place_limit()
+initializes q_ahead to the full visible resting volume at the price, and
+update_queue() only ever decreases it. So this term does NOT "still sting
+for an order that has already accumulated priority" -- it stings for the
+opposite case, and it is exactly 0.0 for a price outside the visible
+top-20 book (where _place_limit() sets q_ahead = 0.0). Any future
+placement-staleness reward term (rewarding CANCEL_AND_REPLACE for
+correcting a stale order) needs to account for this: a zero-cost regime
+at prices outside the visible book means such a term could be gamed by
+spam-replacing there for free -- this is not benign, work it out
+explicitly before adding one.
 """
 from __future__ import annotations
 
@@ -65,7 +96,8 @@ def step_reward(
     qty_total: float,
     dt: float,
     l1_risk_score: float,
-    canceled_unfilled: bool,
+    canceled_via_market: bool,
+    canceled_via_replace: bool,
     queue_ahead_at_cancel: float | None,
     queue_at_level: float | None,
     resting: bool = False,
@@ -74,9 +106,13 @@ def step_reward(
     """Section 3.3, components 1-4 (per-step; the terminal IS component is
     computed separately via compute_implementation_shortfall() and added
     once at episode end -- see LOBExecutionEnv.step()). Component 5
-    (r_stale) is an experimental addition, not in Section 3.3 -- see module
-    docstring. resting/ticks_since_own_fill_norm default to False/0.0
-    (r_stale == 0) so existing callers/tests are unaffected."""
+    (r_stale) is an experimental addition, not in Section 3.3 -- see
+    module docstring.
+
+    r_queue is priced differently for the two cancel paths (EXPERIMENTAL 3,
+    module docstring). canceled_via_market and canceled_via_replace are
+    mutually exclusive by construction in LOBExecutionEnv.step(); the flat
+    -beta abandonment charge applies only to the MARKET path."""
     r_slip = 0.0
     r_spread = 0.0
     for f in fills:
@@ -86,9 +122,31 @@ def step_reward(
 
     r_inv = -w.lam * (1 + max(0.0, l1_risk_score)) * (qty_remaining / qty_total) ** 2 * dt
 
+    # EXPERIMENTAL 3 (module docstring): the two cancel paths are priced
+    # differently, because charging them identically made MARKET strictly
+    # dominate CANCEL_AND_REPLACE (only MARKET guarantees a fill) and drove
+    # CANCEL_AND_REPLACE usage to exactly 0% at every coefficient tested.
     r_queue = 0.0
-    if canceled_unfilled:
+    if canceled_via_market:
+        # Full abandonment: walks the spread AND discards queue position.
+        # Charged both components, exactly as in Section 3.3.
         r_queue -= w.beta
+        if queue_ahead_at_cancel is not None and queue_at_level:
+            r_queue -= w.gamma * (queue_ahead_at_cancel / queue_at_level)
+    elif canceled_via_replace:
+        # Not abandonment -- a fresh limit order replaces the old one, so the
+        # flat -beta is dropped and REPLACE stops being dominated by MARKET.
+        # The queue-weighted charge stays: discarded queue position is real.
+        #
+        # NOTE this charge does NOT behave the way the split was originally
+        # motivated. queue_ahead_at_cancel / queue_at_level is LARGEST for a
+        # fresh order behind a deep level and tends to 0 for an order that
+        # has already waited its way to the front -- so it does not "still
+        # sting for an already-waited order", it stings for the opposite
+        # case, and it is exactly 0.0 when the price sits outside the visible
+        # top-20 book (_place_limit() initializes q_ahead = 0.0 there) -- a
+        # future placement-staleness reward term would need to account for
+        # this zero-cost regime explicitly (see the module docstring).
         if queue_ahead_at_cancel is not None and queue_at_level:
             r_queue -= w.gamma * (queue_ahead_at_cancel / queue_at_level)
 

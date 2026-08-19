@@ -576,7 +576,7 @@ class LOBExecutionEnv(gym.Env):
         self._terminated_early = False
 
         obs = self._build_obs()
-        info = self._build_info(step_fills=[], canceled_unfilled=False)
+        info = self._build_info(step_fills=[])
         return obs, info
 
     def _current_tick(self) -> TickView:
@@ -680,7 +680,13 @@ class LOBExecutionEnv(gym.Env):
         ]
         return np.array(values, dtype=np.float32)
 
-    def _build_info(self, *, step_fills: list[dict], canceled_unfilled: bool) -> dict[str, Any]:
+    def _build_info(
+        self,
+        *,
+        step_fills: list[dict],
+        canceled_via_market: bool = False,
+        canceled_via_replace: bool = False,
+    ) -> dict[str, Any]:
         tick = self._current_tick()
         return {
             "side": self.side,
@@ -690,7 +696,11 @@ class LOBExecutionEnv(gym.Env):
             "mid_price": tick.mid_price,
             "scenario_depth_ratio": getattr(self, "_scenario_depth_ratio", None),
             "fills_this_step": list(step_fills),
-            "canceled_unfilled": canceled_unfilled,
+            # Kept as the OR of the two so existing consumers of this info key
+            # keep working unchanged; the split is exposed alongside it.
+            "canceled_unfilled": canceled_via_market or canceled_via_replace,
+            "canceled_via_market": canceled_via_market,
+            "canceled_via_replace": canceled_via_replace,
             "resting_q_ahead": self._resting.q_ahead if self._resting is not None else None,
             "resting_own_remaining": self._resting.own_qty_remaining if self._resting is not None else None,
             "tick_idx": self._tick_idx,
@@ -755,7 +765,11 @@ class LOBExecutionEnv(gym.Env):
     def step(self, action):
         tick_before = self._current_tick()
         step_fills: list[dict] = []
-        canceled_unfilled = False
+        # Two flags instead of one canceled_unfilled: MARKET and
+        # CANCEL_AND_REPLACE tear a resting order down identically, but are
+        # priced differently by step_reward()'s r_queue -- see reward.py.
+        canceled_via_market = False
+        canceled_via_replace = False
         queue_ahead_at_cancel: float | None = None
         queue_at_level: float | None = None
 
@@ -780,8 +794,20 @@ class LOBExecutionEnv(gym.Env):
         offset = price_offset_idx - 5
         size_frac = SIZE_FRACTIONS[size_frac_idx]
 
-        if order_type in (ORDER_TYPE_CANCEL_REPLACE, ORDER_TYPE_MARKET) and self._resting is not None:
-            canceled_unfilled = True
+        # Teardown is identical for both actions (resting state cleared, queue
+        # state captured for the reward). They are split into two handlers
+        # purely so the reward can charge them differently: MARKET pays the
+        # full -beta - gamma*queue_ratio, CANCEL_AND_REPLACE pays only the
+        # queue-weighted part. See step_reward()'s r_queue block.
+        if order_type == ORDER_TYPE_MARKET and self._resting is not None:
+            canceled_via_market = True
+            queue_ahead_at_cancel = self._resting.q_ahead
+            queue_at_level = self._resting.q_ahead + self._resting.own_qty_remaining
+            self._resting = None
+            self._resting_price = None
+            self._resting_side = None
+        elif order_type == ORDER_TYPE_CANCEL_REPLACE and self._resting is not None:
+            canceled_via_replace = True
             queue_ahead_at_cancel = self._resting.q_ahead
             queue_at_level = self._resting.q_ahead + self._resting.own_qty_remaining
             self._resting = None
@@ -816,7 +842,8 @@ class LOBExecutionEnv(gym.Env):
             arrival_price=self.arrival_price, mid_price=tick_before.mid_price,
             qty_remaining=self.qty_remaining, qty_total=self.qty_total,
             dt=self.tick_interval_s, l1_risk_score=self.l1_risk_score,
-            canceled_unfilled=canceled_unfilled,
+            canceled_via_market=canceled_via_market,
+            canceled_via_replace=canceled_via_replace,
             queue_ahead_at_cancel=queue_ahead_at_cancel, queue_at_level=queue_at_level,
             resting=self._resting is not None,
             ticks_since_own_fill_norm=self._ticks_since_own_fill_norm(),
@@ -840,7 +867,11 @@ class LOBExecutionEnv(gym.Env):
             r += -self.reward_weights.kappa * terminal_is.is_total_bps
 
         obs = self._build_obs()
-        info = self._build_info(step_fills=step_fills, canceled_unfilled=canceled_unfilled)
+        info = self._build_info(
+            step_fills=step_fills,
+            canceled_via_market=canceled_via_market,
+            canceled_via_replace=canceled_via_replace,
+        )
         if terminal_is is not None:
             info["implementation_shortfall"] = terminal_is
 
