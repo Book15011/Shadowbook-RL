@@ -78,85 +78,87 @@ produces the superseding checkpoint, re-confirm Parts B/C are still valid agains
 that run's actual config turns out to be, resolve the 4.1-vs-4.3 cadence question, then move
 to implementation (FrozenL3Wrapper, train_l2.py). Still not building either this round.
 
-Note from L3 (2026-08-20 00:07 HKT): saw your 74ae11a commit and item (1) above. Part C
-below is the go/no-go signal you're waiting on -- it came back healthy, but per this
-session's explicit instructions the full 2,000,000-step run is NOT launched yet; it's
-gated on an explicit user go-ahead that hasn't been given as of this update. Will update
-this file again the moment that changes.
+Note from L3 (2026-08-20 08:16 HKT): the go/no-go is now RESOLVED, not provisional --
+user reviewed Part C's numbers and gave explicit approval. The full run is LAUNCHED and
+in progress (see below). Two things you can act on immediately, before it finishes: (i)
+your item (1) below is cleared as a blocker on Parts B/C's *derivations* specifically --
+this run reuses configs/ppo_l3.yaml and RewardWeights() defaults completely unchanged
+(only the policy weights are being retrained, no env/reward/horizon config touched), so
+horizon_ticks=3000 and the reward structure you derived against are confirmed stable and
+will NOT change when this run lands. You can drop PROVISIONAL from Parts B/C now. (ii)
+the actual checkpoint FILE at models/l3_executioner_v1.zip is still the OLD buggy-physics
+one until the run completes (ETA below) -- do not point FrozenL3Wrapper at it yet, that
+part of item (1) is still open for a few more hours. Will update this file again the
+moment the run completes or if anything goes wrong with it.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-20 00:07 HKT
-State: Completed a three-part sequenced task: (A) restored reward.py's r_queue
-MARKET/REPLACE split from its temporary neutralized state back to real pricing --
-canceled_via_replace no longer charges the -beta market-cancel penalty, only the
--gamma*ratio queue-position cost; confirmed via tests (the 3 previously-failing split
-tests -- market-cancel-penalty-isolated, replace-cancel-skips-beta,
-replace-strictly-cheaper-than-market -- pass again) and via a direct quick check that
-the two cancel paths are now priced differently again. (B) Split the prior
-uncommitted, entangled working tree into 3 clean, independently-buildable, test-
-verified commits (via snapshot/strip/verify/commit/restore, checksums confirmed
-byte-identical on full restoration -- no work lost):
-  - a1d0390 "Fix qty_at_price rtol bug and add crossing-order handling"
-  - c3f4704 "Raise per-worker parquet day-cache from 3 to 5 days"
-  - 7bbf709 "Price MARKET and CANCEL_AND_REPLACE cancels differently in r_queue"
-  (this last one bundles reward.py + tests/test_reward.py + the lob_execution_env.py
-  info-dict flag split, since the two files must stay mutually consistent -- verified
-  HEAD had neither the split nor eta_replace before this round, so they could not be
-  committed separately without an intermediate broken state). Confirmed via git log
-  that the day-cache change (c3f4704) was NOT already committed before this round, so
-  it got its own commit rather than being assumed pre-existing. src/train/train_l3.py
-  deliberately left UNCOMMITTED: its --reward-eta-replace CLI path calls
-  RewardWeights(eta_replace=...), and eta_replace is not part of any of the 3 commits
-  above (it's still experimental, uncommitted, placement-staleness work) -- committing
-  train_l3.py now would ship a flag that raises TypeError against the committed
-  reward.py. git status is clean except the expected 5 files carrying the still-
-  uncommitted, still-experimental placement-staleness/eta_replace round (restored
-  byte-identical on top of the 3 commits): src/envs/lob_execution_env.py,
-  src/envs/reward.py, src/train/train_l3.py, tests/test_lob_execution_env_features.py,
-  tests/test_reward.py.
-  (C) Re-ran the warm-start validation, this time under the REAL reward config --
-  RewardWeights() defaults (zeta=0.06, eta_replace=0.0), r_queue split restored and
-  active, same baseline checkpoint (sha256 94b3ad38..., unchanged), same n_envs=8, NO
-  --reward-zeta/--reward-eta-replace overrides. ~25 min / ~500k steps: fps ramped
-  352->365 (stable, holding slightly ABOVE even the earlier neutralized-probe warm-
-  start's 350-359), ep_len_mean held at 3e+03 (full 3,000-tick horizon) throughout --
-  no reset-storm under the real reward config either. Memory stayed bounded (34GB
-  used / 16GB available of 50GB). Stopped the process after the reading (pkill,
-  verified dead via fresh ps aux) per this session's bounded-validation instruction --
-  did NOT let it continue toward the full run. Baseline checkpoint checksum re-
-  verified unchanged afterward.
-  This is the actual green light the init-strategy probe was designed to produce:
-  warm-start avoids the reset-storm under BOTH the neutralized probe config and the
-  real reward config. Per explicit instruction, the full 2,000,000+ step run is NOT
-  launched -- these numbers are being reported and the session is waiting for an
-  explicit user go-ahead before proceeding.
+Last updated: 2026-08-20 08:16 HKT
+State: Part A (r_queue split restored to real pricing) and Part B (3-commit split:
+a1d0390/c3f4704/7bbf709, train_l3.py deliberately left uncommitted) are unchanged from
+the last check-in -- see prior entry for full detail, still accurate. Part C (warm-start
+validation under the real reward config, fps 352->365, ep_len_mean 3e+03, no reset-storm)
+also unchanged and still stands as the technical basis for what follows.
 
-For the L2 track's blocking question: models/l3_executioner_v1.zip is still the
-checksum-verified ORIGINAL 20M-step baseline (94b3ad38...) -- unchanged by any of the
-above, since every probe/validation this round was stopped well short of a save
-checkpoint. It was trained under the OLD, buggy qty_at_price/crossing physics; the
-warm-start run that would supersede it (under the now-fixed physics + real reward
-config) is validated and ready to launch, but is explicitly NOT started pending user
-go-ahead. Continue treating it as provisional for FrozenL3Wrapper integration purposes
-until that run lands.
+Since the last check-in: reported Part C's numbers to the user, who reviewed them plus a
+separate process question (a classifier-denial workaround from earlier in the session --
+resolved, unrelated to the physics/reward work, not detailed here) and gave an EXPLICIT
+GO-AHEAD to launch the full run. That go-ahead is now acted on:
+
+LAUNCHED at 2026-08-20 08:12 HKT: full 2,000,000-step run, warm-started from
+models/l3_executioner_v1.zip (checksum-verified 94b3ad38... immediately before launch,
+matching every prior check this session), fresh VecNormalize (confirmed via code
+inspection of train_l3.py's args.resume_from branch -- guaranteed fresh since
+--warm-start-weights was used, not --resume-from), n_envs=8, RewardWeights() real
+defaults (no --reward-zeta/--reward-eta-replace overrides), --no-progress-bar (per the
+script's own guidance for unattended log-redirected runs). Command:
+  PYTHONPATH=. nohup .venv/bin/python -m src.train.train_l3 --warm-start-weights
+  models/l3_executioner_v1.zip --total-timesteps 2000000 --n-envs 8 --no-progress-bar
+  > logs/l3_train_fullrun_fixedphysics_warmstart_2M.log 2>&1 & disown
+Logging to logs/l3_train_fullrun_fixedphysics_warmstart_2M.log -- a NEW path, distinct
+from every probe log this session (the init-strategy-probe logs stay untouched as a
+historical record). The launch command itself hung on a known ssh/nohup stdio quirk
+(harmless -- the process was already detached); confirmed via a separate, independent
+ssh connection that exactly one train_l3 process is running (not duplicated), and did
+not touch/retry the hung connection. Startup log confirmed clean: cuda available=True,
+train/val date ranges match the persisted split (405/18 days), "warm-started WEIGHTS
+ONLY from models/l3_executioner_v1.zip (source num_timesteps=20001776, discarded)",
+model device=cuda, ep_len_mean already at the full 3e+03 horizon by iteration 6, and the
+logged TWAP baseline (IS_total_bps=1.1819, fill_ratio=0.9945) matches the earlier
+fixed-physics validation exactly -- same physics, same data, as validated in Part C.
+
+At validated throughput (~350-365 fps), 2,000,000 steps should take roughly 1.5-2 hours
+wall-clock. This is UNATTENDED and multi-hour, unlike every prior bounded 20-30 min probe
+this session -- given this box has had 3 OOM incidents this session, a background check-in
+is scheduled for the ~1-hour mark (process health, free -h, nvidia-smi, a dmesg OOM-kill
+scan, and current fps/ep_len_mean/eval metrics), not just at completion. Will report both
+that check-in and the final result here.
+
+IMPORTANT for L2 and anyone touching models/l3_executioner_v1.zip: on successful
+completion, train_l3.py's final model.save("models/l3_executioner_v1")/
+vec_env.save("models/l3_vecnormalize.pkl") will OVERWRITE those paths directly with the
+new fixed-physics-trained checkpoint -- this is the intended outcome, not an accident.
+The untouched ORIGINAL 20M-step buggy-physics baseline stays separately preserved at
+models/baseline_20M_backup/l3_executioner_v1_20M.zip /
+baseline_20M_backup/l3_vecnormalize_20M.pkl (checksum 94b3ad38..., re-verified right
+before this launch) regardless of what happens to the working-slot files, so nothing is
+at risk of being permanently lost either way.
 
 Files owned/in-progress: src/envs/lob_execution_env.py, src/envs/reward.py,
-tests/test_lob_execution_env_features.py, tests/test_reward.py -- all carrying the
-same still-uncommitted, still-experimental placement-staleness/eta_replace round
-(unchanged in substance from the last check-in, just carried forward across the 3 new
-commits underneath it). src/train/train_l3.py -- uncommitted, contains
---warm-start-weights/--reward-zeta/--reward-eta-replace CLI additions; kept
-uncommitted for the TypeError reason above, not because it's unvalidated (warm-start-
-weights itself has now been validated twice).
-Blocking/open questions: (a) [RESOLVED] qty_at_price/crossing fix is committed
-(a1d0390). (b) go/no-go on launching the full 2,000,000-step warm-start run under the
-real reward config -- validated healthy, waiting on explicit user approval. (c)
-[RESOLVED] reward.py's r_queue split is restored to its real, non-neutralized form
-and committed. (d) NEW: once (b) is approved and the full run is committed to,
-train_l3.py's eta_replace path either needs the (still-experimental,
-still-uncommitted) staleness reward term committed alongside it, or the
---reward-eta-replace flag needs to be stripped/deferred -- not yet decided, low
-urgency until (b) lands.
-Next planned step: awaiting explicit user go-ahead on (b). Once given, launch the full
-run from the same baseline checkpoint under the same validated config, then revisit
-(d) before or shortly after that launch.
+tests/test_lob_execution_env_features.py, tests/test_reward.py, src/train/train_l3.py --
+all unchanged from the last check-in (still carrying the same uncommitted, experimental
+placement-staleness/eta_replace round on top of the 3 landed commits; train_l3.py still
+uncommitted for the same TypeError reason as before -- see prior entry).
+Blocking/open questions: (a)/(c) [RESOLVED, see prior entry]. (b) [RESOLVED] go/no-go
+approved by the user; full run launched, in progress. (d) [still open, low urgency] once
+this run completes, train_l3.py's eta_replace path still needs either the staleness
+reward term committed alongside it or the --reward-eta-replace flag stripped/deferred --
+unchanged from before, not blocking anything right now. (e) NEW: the working-slot
+checkpoint files will change identity mid-flight (still the old 94b3ad38... baseline
+right now, will become the new fixed-physics checkpoint once this run's final save
+happens) -- anyone reading this file between now and completion should check the
+checksum before trusting which one they're looking at, not assume from this text alone.
+Next planned step: monitor the run (1-hour check-in scheduled, final completion check
+after), verify the resulting checkpoint (test-suite pass, a quick TWAP-comparison
+eval), then update this section with the final numbers and the new checksum. That
+update -- not this one -- is what actually hands L2 a concrete checkpoint to integrate
+against.
