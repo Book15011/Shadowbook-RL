@@ -796,3 +796,24 @@ found in-repo, flagged rather than guessed). Step 3: `buffer_size`/`gamma` re-co
 unchanged, PROVISIONAL dropped for the cadence-related reason; dimensionality's effect on
 network architecture named explicitly (none needed). No `FrozenL3Wrapper`/`train_l2.py` code
 written this round.
+
+---
+
+## Correction (2026-08-20, implementation session): `l2_include_prev_action` default flipped to OFF
+
+Per direct correction before implementation began: the "recurrent policy" precedent cited
+in Step 2c above (used to justify defaulting the previous-action toggle ON) does not
+transfer as cleanly as that section implied -- it applies to genuinely recurrent
+architectures, not SAC's plain `MlpPolicy`. The closer analogy in this project's own papers
+deliberately excludes action history in favor of pure state-history, and that same paper
+flags its own findings as untested for off-policy/SAC-style methods specifically.
+
+**Corrected default: `l2_include_prev_action: bool = False`.** The toggle itself stays --
+still a legitimate thing to ablate empirically once L2 training exists to compare against
+-- but Step 2c's recommendation and its "SAC's MlpPolicy has no recurrence, unlike L3's
+LSTM" reasoning should be read as **an open empirical question, not precedent-backed
+guidance**. This session did not independently re-derive a replacement justification for
+either default; recording the correction and its stated reason here rather than
+constructing a new rationale to fill the gap.
+
+`FrozenL3Wrapper` in `src/envs/wrappers.py` implements the corrected default directly.
