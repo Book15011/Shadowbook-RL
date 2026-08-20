@@ -78,87 +78,96 @@ produces the superseding checkpoint, re-confirm Parts B/C are still valid agains
 that run's actual config turns out to be, resolve the 4.1-vs-4.3 cadence question, then move
 to implementation (FrozenL3Wrapper, train_l2.py). Still not building either this round.
 
-Note from L3 (2026-08-20 08:16 HKT): the go/no-go is now RESOLVED, not provisional --
-user reviewed Part C's numbers and gave explicit approval. The full run is LAUNCHED and
-in progress (see below). Two things you can act on immediately, before it finishes: (i)
-your item (1) below is cleared as a blocker on Parts B/C's *derivations* specifically --
-this run reuses configs/ppo_l3.yaml and RewardWeights() defaults completely unchanged
-(only the policy weights are being retrained, no env/reward/horizon config touched), so
-horizon_ticks=3000 and the reward structure you derived against are confirmed stable and
-will NOT change when this run lands. You can drop PROVISIONAL from Parts B/C now. (ii)
-the actual checkpoint FILE at models/l3_executioner_v1.zip is still the OLD buggy-physics
-one until the run completes (ETA below) -- do not point FrozenL3Wrapper at it yet, that
-part of item (1) is still open for a few more hours. Will update this file again the
-moment the run completes or if anything goes wrong with it.
+Note from L3 (2026-08-20 10:14 HKT): the full run COMPLETED cleanly (see below) --
+item (1) is now fully resolved, not just the go/no-go. models/l3_executioner_v1.zip is
+the new fixed-physics-retrained checkpoint (sha256 973b2883...) -- you can point
+FrozenL3Wrapper at it now. One thing to weigh before treating it as "the" L3 policy to
+build on: it lands at roughly PARITY with TWAP (val_l3_beats_twap_bps=-0.0631, i.e.
+L3's execution is statistically indistinguishable from TWAP at n=50, not a clear win)
+-- see the full numbers below. That's a judgment call for whoever decides L3 is "good
+enough" to integrate against; this track isn't making that call for you, just flagging
+it plainly rather than letting a checkpoint swap read as an implicit endorsement.
+Parts B/C's derivations (horizon_ticks=3000, reward structure) are confirmed correct
+and unchanged by this run, as stated last time -- safe to finalize those.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-20 08:16 HKT
-State: Part A (r_queue split restored to real pricing) and Part B (3-commit split:
-a1d0390/c3f4704/7bbf709, train_l3.py deliberately left uncommitted) are unchanged from
-the last check-in -- see prior entry for full detail, still accurate. Part C (warm-start
-validation under the real reward config, fps 352->365, ep_len_mean 3e+03, no reset-storm)
-also unchanged and still stands as the technical basis for what follows.
+Last updated: 2026-08-20 10:14 HKT
+State: Parts A/B/C (r_queue split restored, 3-commit split, warm-start validation) are
+unchanged from prior check-ins -- see earlier entries for full detail. This entry covers
+the full run itself: LAUNCHED, MONITORED, and now COMPLETED.
 
-Since the last check-in: reported Part C's numbers to the user, who reviewed them plus a
-separate process question (a classifier-denial workaround from earlier in the session --
-resolved, unrelated to the physics/reward work, not detailed here) and gave an EXPLICIT
-GO-AHEAD to launch the full run. That go-ahead is now acted on:
+LAUNCHED at 08:12 HKT, warm-started from models/l3_executioner_v1.zip (checksum-verified
+94b3ad38... immediately before launch), fresh VecNormalize, n_envs=8, RewardWeights()
+real defaults, --total-timesteps 2000000, logging to
+logs/l3_train_fullrun_fixedphysics_warmstart_2M.log (a new path, distinct from every
+probe log this session). Startup confirmed clean (cuda=True, 405/18 train/val days,
+warm-start confirmed, ep_len_mean at full horizon by iteration 6, TWAP baseline matching
+Part C exactly). The launch command's own ssh connection hung on a known stdio quirk
+(harmless, process already detached via nohup+disown) -- confirmed the real process via
+a separate connection instead of touching the hung one; that connection later closed on
+its own (exit 0) once its stdio backlog cleared, well after the real process was already
+independently verified.
 
-LAUNCHED at 2026-08-20 08:12 HKT: full 2,000,000-step run, warm-started from
-models/l3_executioner_v1.zip (checksum-verified 94b3ad38... immediately before launch,
-matching every prior check this session), fresh VecNormalize (confirmed via code
-inspection of train_l3.py's args.resume_from branch -- guaranteed fresh since
---warm-start-weights was used, not --resume-from), n_envs=8, RewardWeights() real
-defaults (no --reward-zeta/--reward-eta-replace overrides), --no-progress-bar (per the
-script's own guidance for unattended log-redirected runs). Command:
-  PYTHONPATH=. nohup .venv/bin/python -m src.train.train_l3 --warm-start-weights
-  models/l3_executioner_v1.zip --total-timesteps 2000000 --n-envs 8 --no-progress-bar
-  > logs/l3_train_fullrun_fixedphysics_warmstart_2M.log 2>&1 & disown
-Logging to logs/l3_train_fullrun_fixedphysics_warmstart_2M.log -- a NEW path, distinct
-from every probe log this session (the init-strategy-probe logs stay untouched as a
-historical record). The launch command itself hung on a known ssh/nohup stdio quirk
-(harmless -- the process was already detached); confirmed via a separate, independent
-ssh connection that exactly one train_l3 process is running (not duplicated), and did
-not touch/retry the hung connection. Startup log confirmed clean: cuda available=True,
-train/val date ranges match the persisted split (405/18 days), "warm-started WEIGHTS
-ONLY from models/l3_executioner_v1.zip (source num_timesteps=20001776, discarded)",
-model device=cuda, ep_len_mean already at the full 3e+03 horizon by iteration 6, and the
-logged TWAP baseline (IS_total_bps=1.1819, fill_ratio=0.9945) matches the earlier
-fixed-physics validation exactly -- same physics, same data, as validated in Part C.
+1-HOUR CHECK-IN (09:15 HKT): single process, no duplicates. Memory 35GB/50GB used, 14GB
+available -- no OOM risk (dmesg scanned, no OOM-kill signatures; box has had 3 OOM
+incidents earlier this session, so this was checked deliberately, not assumed). Progress
+1,179,648/2,000,000 steps (~59%), fps steady 306-311, ep_len_mean still 2.99e+03 (full
+horizon) -- healthy, no reset-storm.
 
-At validated throughput (~350-365 fps), 2,000,000 steps should take roughly 1.5-2 hours
-wall-clock. This is UNATTENDED and multi-hour, unlike every prior bounded 20-30 min probe
-this session -- given this box has had 3 OOM incidents this session, a background check-in
-is scheduled for the ~1-hour mark (process health, free -h, nvidia-smi, a dmesg OOM-kill
-scan, and current fps/ep_len_mean/eval metrics), not just at completion. Will report both
-that check-in and the final result here.
+COMPLETED at 10:11 HKT (~1h59m wall-clock, time_elapsed=7130s in-script). Process exited
+on its own after its own final save -- not killed. Memory returned to baseline (1.8GB
+used / 48GB available) confirming no leak. Final total_timesteps=2,002,944 (slightly over
+2M -- PPO's fixed rollout-chunk size, expected, not an error).
 
-IMPORTANT for L2 and anyone touching models/l3_executioner_v1.zip: on successful
-completion, train_l3.py's final model.save("models/l3_executioner_v1")/
-vec_env.save("models/l3_vecnormalize.pkl") will OVERWRITE those paths directly with the
-new fixed-physics-trained checkpoint -- this is the intended outcome, not an accident.
-The untouched ORIGINAL 20M-step buggy-physics baseline stays separately preserved at
-models/baseline_20M_backup/l3_executioner_v1_20M.zip /
-baseline_20M_backup/l3_vecnormalize_20M.pkl (checksum 94b3ad38..., re-verified right
-before this launch) regardless of what happens to the working-slot files, so nothing is
-at risk of being permanently lost either way.
+New checkpoint: models/l3_executioner_v1.zip (sha256 973b2883339568595188034c22be2fb3d
+0136abd0b325fb5e08d108735c6e739, 2,610,702 bytes -- sane vs. the old baseline's 2,609,950)
+and models/l3_vecnormalize.pkl (sha256 839ea093ed69169fc8444f9dc42e8c3cd90869ed38fc92c3
+56bc7f789ae14856). Verified, not assumed: zip integrity checked directly
+(zipfile.testzip(), all 6 expected SB3 entries present, none corrupt). models/*.zip is
+gitignored (confirmed via git check-ignore) -- correctly not committed; the ORIGINAL
+20M-step buggy-physics baseline remains separately preserved AND git-tracked at
+models/baseline_20M_backup/ (sha256 94b3ad38..., untouched, safe beyond local disk too).
+
+FINAL VALIDATION (ValISEvalCallback, step=2,000,000, paired seeds 5000000..5000049,
+n=50 episodes, same fixed-physics data as every eval this session):
+  L3 IS_total_bps mean=1.245 (std 4.74) vs TWAP baseline=1.182 (std ~5.03 elsewhere in
+  this session's TWAP measurements) -> val_l3_beats_twap_bps=-0.0631 -- L3 is marginally
+  WORSE than TWAP, but well within noise at this n (this session's own earlier
+  significance analysis put unpaired SE at ~0.7-1.3bps even with pairing's noise-
+  cancellation benefit) -- read this as a statistical DEAD HEAT with TWAP, not a loss.
+  fill_ratio mean=0.918 (TWAP=0.994) -- NOT a strong result on its own, but a large,
+  substantive recovery from the OLD checkpoint's fixed-physics fill_ratio of 0.2015
+  (measured in Phase 3, evaluating the never-retrained-under-fixed-physics checkpoint).
+  Read together: the Phase 3 figure of "L3 beats TWAP by 1.38bps" used a policy that
+  barely executed (0.2015 fill_ratio) -- its favorable IS number likely reflects avoided
+  price impact from incomplete trades, not real execution skill, making it a less
+  trustworthy comparison than this one. This retrained checkpoint actually executes
+  (0.918 fill_ratio) and, once it does, lands at parity with TWAP rather than clearly
+  beating it. That is a more honest number, even though it is a more modest headline.
+
+OBSERVATION (not investigated further this round): ep_len_mean declined from ~2.99e+03
+at the 1-hour/59% mark to ~1.74-1.83e+03 by the final iterations, while fps stayed
+healthy (280-290) and approx_kl/value_loss/explained_variance all looked like normal
+late-training convergence, not divergence. Plausible read: the policy learned to
+complete orders well before the 3,000-tick horizon in many episodes (a sensible
+execution-agent behavior, and consistent with the fill_ratio recovery above) rather than
+regressing toward the from-scratch reset-storm pathology (which showed fps 8-10, not
+280-290+, as its actual signature). Flagged for whoever looks at this checkpoint next,
+not confirmed via separate analysis.
 
 Files owned/in-progress: src/envs/lob_execution_env.py, src/envs/reward.py,
 tests/test_lob_execution_env_features.py, tests/test_reward.py, src/train/train_l3.py --
-all unchanged from the last check-in (still carrying the same uncommitted, experimental
-placement-staleness/eta_replace round on top of the 3 landed commits; train_l3.py still
-uncommitted for the same TypeError reason as before -- see prior entry).
-Blocking/open questions: (a)/(c) [RESOLVED, see prior entry]. (b) [RESOLVED] go/no-go
-approved by the user; full run launched, in progress. (d) [still open, low urgency] once
-this run completes, train_l3.py's eta_replace path still needs either the staleness
-reward term committed alongside it or the --reward-eta-replace flag stripped/deferred --
-unchanged from before, not blocking anything right now. (e) NEW: the working-slot
-checkpoint files will change identity mid-flight (still the old 94b3ad38... baseline
-right now, will become the new fixed-physics checkpoint once this run's final save
-happens) -- anyone reading this file between now and completion should check the
-checksum before trusting which one they're looking at, not assume from this text alone.
-Next planned step: monitor the run (1-hour check-in scheduled, final completion check
-after), verify the resulting checkpoint (test-suite pass, a quick TWAP-comparison
-eval), then update this section with the final numbers and the new checksum. That
-update -- not this one -- is what actually hands L2 a concrete checkpoint to integrate
-against.
+unchanged from prior check-ins (same uncommitted, experimental placement-staleness/
+eta_replace round on top of the 3 landed commits; train_l3.py still uncommitted for the
+same TypeError reason as before).
+Blocking/open questions: (a)/(b)/(c) [RESOLVED, see prior entries]. (d) [still open, low
+urgency] train_l3.py's eta_replace path still needs either the staleness reward term
+committed alongside it or the --reward-eta-replace flag stripped/deferred. (e)
+[RESOLVED] checkpoint identity is settled -- models/l3_executioner_v1.zip is now
+973b2883... going forward, not 94b3ad38.... (f) NEW: whether a near-parity-with-TWAP
+result is "good enough" to build L2 on top of, vs. training further (toward the full
+20M target) or iterating on the reward shape first, is an open judgment call this track
+is surfacing, not resolving.
+Next planned step: awaiting direction on (f) above. This track's own immediate work
+(items (d), and the still-uncommitted staleness/eta_replace round) can proceed
+independently of that decision whenever picked back up.
