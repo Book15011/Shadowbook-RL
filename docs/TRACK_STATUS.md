@@ -87,84 +87,155 @@ original wrapper-only mechanism, Part B) and train_l2.py, using the FINAL SPEC s
 observation space and hyperparameters directly -- no further design work anticipated before
 that.
 
+IMPORTANT correction from L3 (2026-08-20 23:05 HKT): the sha256 973b2883... referenced
+above is NO LONGER what's in models/l3_executioner_v1.zip -- see the incident writeup in
+the L3 section below before treating that checksum as current. Short version: a bounded
+probe launched from this track accidentally overwrote the working-slot checkpoint (every
+train_l3.py run saves to the same hardcoded path regardless of run type, and this track
+did not back up 973b2883... first before launching -- a real process gap, owned below).
+The true 973b2883... file cannot be recovered byte-for-byte. What's in the working slot
+right now (sha256 27afa91e...) is v1's own periodic checkpoint from 2,944 steps earlier
+in the same training run -- verified via full reproduction to match the officially
+reported v1 numbers (IS_total_bps=1.245, fill_ratio=0.918) exactly, so it is a faithful,
+numerically-confirmed stand-in, not a guess. If you have not yet pointed FrozenL3Wrapper
+at a specific file, no action needed -- 27afa91e... is safe to treat as "the v1 checkpoint"
+going forward. If you already loaded/hashed 973b2883... somewhere and are relying on that
+exact checksum, that specific artifact is gone; the behavioral numbers it reported are not
+in question, only the exact bytes.
+
 ## L3 / Env-Physics
-Last updated: 2026-08-20 10:14 HKT
-State: Parts A/B/C (r_queue split restored, 3-commit split, warm-start validation) are
-unchanged from prior check-ins -- see earlier entries for full detail. This entry covers
-the full run itself: LAUNCHED, MONITORED, and now COMPLETED.
+Last updated: 2026-08-20 23:05 HKT
+State: Ran a bounded probe testing whether inverting the r_queue REPLACE/MARKET
+queue-cost direction increases CANCEL_AND_REPLACE usage (near-0% in v1 -- see prior
+entries). Result: probe does NOT confirm the hypothesis. Also: an operational mistake
+during this probe overwrote the v1 checkpoint in the working slot -- recovered, but
+disclosing in full below since it affects what L2 (and anyone else) should trust right
+now.
 
-LAUNCHED at 08:12 HKT, warm-started from models/l3_executioner_v1.zip (checksum-verified
-94b3ad38... immediately before launch), fresh VecNormalize, n_envs=8, RewardWeights()
-real defaults, --total-timesteps 2000000, logging to
-logs/l3_train_fullrun_fixedphysics_warmstart_2M.log (a new path, distinct from every
-probe log this session). Startup confirmed clean (cuda=True, 405/18 train/val days,
-warm-start confirmed, ep_len_mean at full horizon by iteration 6, TWAP baseline matching
-Part C exactly). The launch command's own ssh connection hung on a known stdio quirk
-(harmless, process already detached via nohup+disown) -- confirmed the real process via
-a separate connection instead of touching the hung one; that connection later closed on
-its own (exit 0) once its stdio backlog cleared, well after the real process was already
-independently verified.
+INCIDENT, disclosed in full: train_l3.py's final save always writes to the same
+hardcoded path (models/l3_executioner_v1.zip / l3_vecnormalize.pkl) regardless of
+whether the run is a full commitment or a bounded probe. Every prior probe this session
+warm-started FROM a checkpoint without ever letting the run reach its own final save
+(always stopped/killed first) -- this is the first one that was deliberately allowed to
+run to completion, and its completion silently overwrote v1 (sha256 973b2883...) with
+the probe's own output. This should have been anticipated and backed up beforehand,
+the same way models/baseline_20M_backup/ protects the original 20M-step baseline -- it
+was not, which is a real process gap, not a tooling failure. Caught immediately once
+the probe's completion log showed a new checksum instead of 973b2883... (which is what
+prompted this disclosure, not a routine status update).
 
-1-HOUR CHECK-IN (09:15 HKT): single process, no duplicates. Memory 35GB/50GB used, 14GB
-available -- no OOM risk (dmesg scanned, no OOM-kill signatures; box has had 3 OOM
-incidents earlier this session, so this was checked deliberately, not assumed). Progress
-1,179,648/2,000,000 steps (~59%), fps steady 306-311, ep_len_mean still 2.99e+03 (full
-horizon) -- healthy, no reset-storm.
+RECOVERY: the true 973b2883... file is not byte-recoverable -- it was never backed up
+and the working slot is the only place it lived. Best available fallback: v1's own
+CheckpointCallback had already saved a periodic checkpoint at step 2,000,000 (10:07
+HKT, 4 minutes before v1's actual final save at step 2,002,944) to
+models/l3_checkpoints/l3_ppo_2000000_steps.zip -- essentially the same policy, short by
+2,944 steps of further training. Restored this into the working slot
+(models/l3_executioner_v1.zip, now sha256 27afa91e...). Verified, not assumed: ran the
+exact same reproduction/eval script used for the milestone report against it and got
+IS_total_bps=1.2450, fill_ratio=0.9180 -- bit-for-bit identical to the numbers
+973b2883... itself printed live during training at its own step=2,000,000 eval firing
+(this also resolves a discrepancy flagged in the milestone report, where a same-session
+reproduction against the truly-final 973b2883... checkpoint gave slightly different
+numbers, IS=1.265/fill=0.976 -- now explained: that gap was the extra 2,944 steps of
+training between this checkpoint and the true final save, not a bug or nondeterminism).
+The probe's own output was preserved under its own name before being overwritten
+further (models/l3_executioner_v1_replace_direction_probe.zip /
+l3_vecnormalize_replace_direction_probe.pkl) -- no data was lost, only the exact
+973b2883... bytes are gone. A permanent, git-tracked backup of the restored near-v1
+checkpoint now exists at models/v1_near_backup_step2M/ (committed as f848bba) so this
+specific failure mode cannot recur for THIS checkpoint -- the same discipline should be
+applied automatically before any future run that might reach its own final save,
+without needing to be told again.
 
-COMPLETED at 10:11 HKT (~1h59m wall-clock, time_elapsed=7130s in-script). Process exited
-on its own after its own final save -- not killed. Memory returned to baseline (1.8GB
-used / 48GB available) confirming no leak. Final total_timesteps=2,002,944 (slightly over
-2M -- PPO's fixed rollout-chunk size, expected, not an error).
+THE PROBE ITSELF, Steps 1-2 (src/envs/reward.py, tests/test_reward.py, both still
+UNCOMMITTED pending the result below): inverted the queue-weighted term in both
+canceled_via_market and canceled_via_replace branches of step_reward()'s r_queue block,
+from gamma*(queue_ahead/queue_at_level) to gamma*(1 - queue_ahead/queue_at_level) --
+charges more for discarding genuinely earned queue priority (q_ahead near 0 via real
+trade-through volume), less for a fresh order or one behind a deep/stalled level.
+Module docstring and RewardWeights.eta_replace's loophole derivation updated in place,
+old reasoning kept verbatim and marked SUPERSEDED rather than deleted. Loophole
+re-derivation (eta_replace stays 0.0/inert for this probe either way): the specific,
+previously-flagged off-book exploit (price outside the visible top-20 book giving
+EXACTLY zero replace-cost) is CLOSED -- inverted, in fact, to the maximum charge
+-gamma, not the minimum. A weaker residual remains and is stated plainly, not glossed
+over: a fresh, minimal-size order (size_frac has a 20% floor, never exactly 0) behind a
+level with substantial real ambient depth can still approach near-zero cost -- but that
+depends on actual market depth at the chosen tick, is not a free/guaranteed
+policy-controlled knob the way off-book was, and only approaches zero asymptotically,
+never hits it exactly. 17 reward tests pass (3 updated to the new numbers, 2 new tests
+added making the near-front/close-to-gamma and fresh-deep-level/close-to-zero cases
+explicit, 1 renamed to reflect the inverted off-book case -- see tests/test_reward.py).
+Full env/matching-engine suite (30 tests) also re-verified passing; 4 unrelated,
+pre-existing failures in test_bulk_backfill.py/test_l2_capture.py confirmed untouched by
+this change (no reward.py import, network/order-book-resync issues unrelated to reward
+shaping).
 
-New checkpoint: models/l3_executioner_v1.zip (sha256 973b2883339568595188034c22be2fb3d
-0136abd0b325fb5e08d108735c6e739, 2,610,702 bytes -- sane vs. the old baseline's 2,609,950)
-and models/l3_vecnormalize.pkl (sha256 839ea093ed69169fc8444f9dc42e8c3cd90869ed38fc92c3
-56bc7f789ae14856). Verified, not assumed: zip integrity checked directly
-(zipfile.testzip(), all 6 expected SB3 entries present, none corrupt). models/*.zip is
-gitignored (confirmed via git check-ignore) -- correctly not committed; the ORIGINAL
-20M-step buggy-physics baseline remains separately preserved AND git-tracked at
-models/baseline_20M_backup/ (sha256 94b3ad38..., untouched, safe beyond local disk too).
+Step 3 (bounded probe): warm-started from the checksum-verified v1 (973b2883..., verified
+immediately before launch -- this was correct; the overwrite happened at the END of the
+run, not the start), same real reward config as v1 (RewardWeights() defaults, no CLI
+overrides), n_envs=8, --total-timesteps 500000 (same order of magnitude as prior probes
+this session). Logged to logs/l3_train_replace_direction_probe.log (new, distinct path).
+Ran slower than v1's own run (~200-220 fps vs. v1's 350-365 -- not investigated further,
+did not affect the probe's validity, just took longer wall-clock, ~42 min instead of the
+~25-30 min originally estimated). Completed cleanly, no crash, no OOM (memory returned to
+baseline afterward).
 
-FINAL VALIDATION (ValISEvalCallback, step=2,000,000, paired seeds 5000000..5000049,
-n=50 episodes, same fixed-physics data as every eval this session):
-  L3 IS_total_bps mean=1.245 (std 4.74) vs TWAP baseline=1.182 (std ~5.03 elsewhere in
-  this session's TWAP measurements) -> val_l3_beats_twap_bps=-0.0631 -- L3 is marginally
-  WORSE than TWAP, but well within noise at this n (this session's own earlier
-  significance analysis put unpaired SE at ~0.7-1.3bps even with pairing's noise-
-  cancellation benefit) -- read this as a statistical DEAD HEAT with TWAP, not a loss.
-  fill_ratio mean=0.918 (TWAP=0.994) -- NOT a strong result on its own, but a large,
-  substantive recovery from the OLD checkpoint's fixed-physics fill_ratio of 0.2015
-  (measured in Phase 3, evaluating the never-retrained-under-fixed-physics checkpoint).
-  Read together: the Phase 3 figure of "L3 beats TWAP by 1.38bps" used a policy that
-  barely executed (0.2015 fill_ratio) -- its favorable IS number likely reflects avoided
-  price impact from incomplete trades, not real execution skill, making it a less
-  trustworthy comparison than this one. This retrained checkpoint actually executes
-  (0.918 fill_ratio) and, once it does, lands at parity with TWAP rather than clearly
-  beating it. That is a more honest number, even though it is a more modest headline.
+Step 4 (eval, reused the existing script unmodified in logic, only parameterized with a
+--model-path/--vecnorm-path CLI flag to point at either checkpoint): ran the identical
+50-paired-seed reproduction against BOTH the restored near-v1 checkpoint (clean baseline,
+numbers above) and the probe's own checkpoint, for a same-methodology, same-script,
+apples-to-apples comparison (deliberately not relying on the training log's own printed
+numbers for either arm, given the discrepancy explained above):
 
-OBSERVATION (not investigated further this round): ep_len_mean declined from ~2.99e+03
-at the 1-hour/59% mark to ~1.74-1.83e+03 by the final iterations, while fps stayed
-healthy (280-290) and approx_kl/value_loss/explained_variance all looked like normal
-late-training convergence, not divergence. Plausible read: the policy learned to
-complete orders well before the 3,000-tick horizon in many episodes (a sensible
-execution-agent behavior, and consistent with the fill_ratio recovery above) rather than
-regressing toward the from-scratch reset-storm pathology (which showed fps 8-10, not
-280-290+, as its actual signature). Flagged for whoever looks at this checkpoint next,
-not confirmed via separate analysis.
+  metric                near-v1 (baseline)   probe (500k more, inverted formula)
+  CANCEL_AND_REPLACE %  0.298% (263/88141)    0.336% (312/92810)
+  MARKET %              0.01%                 0.06%
+  HOLD %                47.64%                46.70%
+  LIMIT %               52.05%                52.91%
+  IS_total_bps           1.245                 1.829
+  fill_ratio              0.918                 0.942
+  vs TWAP (paired t)     t=0.13 p=0.90         t=1.12 p=0.27
+  vs TWAP (Wilcoxon)     W=572 p=0.53          W=487 p=0.15
 
-Files owned/in-progress: src/envs/lob_execution_env.py, src/envs/reward.py,
-tests/test_lob_execution_env_features.py, tests/test_reward.py, src/train/train_l3.py --
-unchanged from prior check-ins (same uncommitted, experimental placement-staleness/
-eta_replace round on top of the 3 landed commits; train_l3.py still uncommitted for the
-same TypeError reason as before).
-Blocking/open questions: (a)/(b)/(c) [RESOLVED, see prior entries]. (d) [still open, low
-urgency] train_l3.py's eta_replace path still needs either the staleness reward term
-committed alongside it or the --reward-eta-replace flag stripped/deferred. (e)
-[RESOLVED] checkpoint identity is settled -- models/l3_executioner_v1.zip is now
-973b2883... going forward, not 94b3ad38.... (f) NEW: whether a near-parity-with-TWAP
-result is "good enough" to build L2 on top of, vs. training further (toward the full
-20M target) or iterating on the reward shape first, is an open judgment call this track
-is surfacing, not resolving.
-Next planned step: awaiting direction on (f) above. This track's own immediate work
-(items (d), and the still-uncommitted staleness/eta_replace round) can proceed
-independently of that decision whenever picked back up.
+Step 5, reported honestly per instruction -- NOT a confirmation: CANCEL_AND_REPLACE usage
+moved from 0.298% to 0.336%, a change too small to trust. A two-proportion z-test on the
+raw counts (263/88141 vs 312/92810) gives z=1.43, p=0.15 -- not significant even under a
+naive test that ignores within-episode/within-policy autocorrelation, which would only
+inflate the true variance further and make this LESS significant, not more. This bounded
+probe does not show the direction-inversion unlocking meaningful REPLACE usage. IS_total_bps
+also got numerically worse (1.245->1.829) while fill_ratio improved slightly (0.918->0.942)
+-- neither reaches significance vs TWAP either, so this is not read as a real regression,
+but it is also not a case for "this direction is obviously fine, just needs more budget."
+Two honest, undecided readings, not a recommendation: (a) queue-cost direction was not
+the actual binding constraint on REPLACE usage -- something else (a strongly converged
+HOLD/LIMIT habit from the full 2M-step run, or genuinely low value of ever using REPLACE
+given how well passive LIMIT already performs) may dominate regardless of price signal;
+(b) 500k steps of continued fine-tuning from an already-deeply-converged policy may
+simply be too short a window to reveal a shift even if the corrected incentive matters at
+longer horizons -- v1's own split needed the full 2M-step run to show its effect, not a
+short probe, so this would not be an unprecedented pattern.
+
+Files owned/in-progress: src/envs/lob_execution_env.py (uncommitted, unchanged in
+substance -- staleness/eta_replace round only, not touched by this probe per the hard
+boundary), src/envs/reward.py + tests/test_reward.py (uncommitted, the direction
+inversion above -- NOT committed pending a decision on the result), src/train/train_l3.py
+(uncommitted, same TypeError reason as before). models/l3_executioner_v1.zip is
+currently the restored near-v1 checkpoint (27afa91e...) -- NOT the probe's checkpoint,
+which was rejected/not promoted given the result above and lives separately at
+models/l3_executioner_v1_replace_direction_probe.zip.
+Blocking/open questions: (g) NEW: does the checkpoint-overwrite incident above change
+anything for L2's item (2) -- the answer should be no, since the restored checkpoint is
+numerically verified equivalent to what was already being evaluated, but flagging since
+it is a new fact, not assuming it is obviously irrelevant. (h) NEW: given the probe's
+non-result, is further budget on this direction (longer probe, different formula
+entirely, or dropping the REPLACE-usage question as not worth chasing further right
+now) worth committing, or should focus shift elsewhere -- explicitly not this track's
+call to make unilaterally, surfacing for direction. (f) from the prior entry (is
+near-parity-with-TWAP good enough for L2 to build on) remains open and is unaffected by
+this probe either way.
+Next planned step: awaiting direction on (h) [this probe's own follow-up] and (f) [the
+still-open handoff question from before]. reward.py/test_reward.py stay uncommitted
+until one of those is resolved -- recommend not committing the direction inversion until
+it is either confirmed by more data or deliberately abandoned, rather than landing an
+unconfirmed change; that is a recommendation, not a decision made here.
