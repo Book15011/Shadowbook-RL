@@ -39,56 +39,53 @@ validation of L1MacroAnalyst stays paused until that decision + headroom
 are both confirmed.
 
 ## L2 -- Strategist
-Last updated: 2026-08-19 23:47 HKT
-State: PROVISIONAL -- PENDING PART A. Re-checked docs/TRACK_STATUS.md's L3 section fresh at
-the start of this session (per instruction, not reused from memory) -- it is byte-identical
-to the last check-in (same "20:47 HKT" timestamp, same content), so the checkpoint/go-no-go
-question remains unresolved. Per this session's own instructions, proceeded to derive SAC
-hyperparameters and propose an observation space anyway, with everything marked PROVISIONAL
--- PENDING PART A rather than stopping entirely, since arithmetic/design work here doesn't
-require picking a checkpoint. Did NOT read or touch lob_execution_env.py/reward.py/
-train_l3.py/the two test files this session (hard boundary); did not instantiate the env,
-run training, or touch the GPU. Sourced all real numbers directly: horizon_ticks=3000 from
-configs/ppo_l3.yaml, train_dates=405 verified against the real, persisted split artifact
-(data/splits/l2_bybit_btcusdt_split.json: 441 total days, 405 train/18 val/18 test/49 gap --
-NOT the spec's own illustrative "296" example). buffer_size=500,000 confirmed as-is (~8,333
-L2-episodes of buffer coverage, ~25% of the full 2M-step run). gamma=0.995 confirmed as a
-starting value with real (not copy-pasted) justification specific to L2's own cadence
-(effective horizon ~3.3x the episode length, defensible given the terminal-IS-dominated
-reward structure), with ~0.983 flagged as a concrete empirical alternative to test once
-training is unblocked. Proposed a concrete L2 observation space: Box(shape=(44,)) = the
-existing 42-dim vector reused as-is + 2 new scalars (schedule_deviation,
-fill_progress_since_last_decision) computed by the wrapper itself, not a new env-side
-downsampling pipeline. Also surfaced a real spec-internal inconsistency while sourcing
-inputs: Section 4.1's training cadence (ticks_per_l2_decision=50, 5s/decision) doesn't match
-Section 4.3's live-inference cadence (L2_EVERY_N_TICKS=10, 1s/decision) -- flagged as an open
-question, not resolved (needs a judgment call, not arithmetic).
+Last updated: 2026-08-20 10:44 HKT
+State: FINAL design spec produced for observation space + SAC hyperparameters -- no code
+written yet, this is still the planning phase. Step 1: re-read architecture_spec.md Section
+4.1/4.3 fresh (via git diff, not memory) -- confirmed the Section 4.1-vs-4.3 L2 cadence
+conflict flagged last round is fixed (L2_EVERY_N_TICKS is now 50, matching
+ticks_per_l2_decision=50), though the fix itself is a bare one-line edit with no restated
+rationale ("# I just change here") -- treating as resolved with moderate, not high,
+confidence, matching how this was framed going in. Grepped the whole real repo (configs/,
+src/, tests/, scripts/) for any other hardcoded 10-tick/1s L2 assumption: found none;
+configs/sac_l2.yaml exists but is an empty placeholder with no cadence or hyperparameter
+values at all. Step 2: built a concrete L2 observation space -- Box(shape=(41,)) base
+(Section 3.1's literal requirement: 40 features from the 42-dim vector, each individually
+assigned an aggregation rule -- last-value/instantaneous/mean-over-window/pass-through,
+grouped and justified by feature type, not one blanket rule -- plus 1 new
+schedule_deviation scalar, confirmed computable from existing env state
+(_compute_l2_target_slice_ratio() still the right hook, re-verified against the current,
+further-changed working tree) with zero new instrumentation needed) or Box(shape=(43,))
+recommended (adds an explicit, separately-flagged previous-action toggle,
+l2_include_prev_action, default ON, with reasoning -- SAC's plain MlpPolicy has no
+recurrence to fall back on unlike L3's LSTM). Could NOT locate "the recurrent-policy paper
+in this project's own PDFs" referenced in the handoff -- searched the whole box, no PDFs
+exist anywhere in this repo; flagged rather than guessed which paper was meant or
+fabricating a citation. Full index-mapping table (old idx -> new position -> transform) in
+the design doc. Step 3: buffer_size=500,000 and gamma=0.995 re-confirmed unchanged (both
+already assumed the 50-tick cadence throughout); PROVISIONAL dropped for the cadence-related
+reason specifically. Noted the dimensionality change (41->43) doesn't warrant any net_arch
+change from SB3's SAC default (256,256) -- too small a change (~5% wider input layer) to
+matter. Separately (not required this round, surfaced while re-reading the env code): the
+L3 track's full 2,000,000-step warm-start run has COMPLETED since last check-in --
+checkpoint identity is now resolved on that track too (models/l3_executioner_v1.zip,
+sha256 973b2883...), but a new, different judgment call has replaced it there (is a
+near-parity-with-TWAP result good enough to build on) -- not something this design doc
+resolves.
 Files owned/in-progress: none (still read-only/planning). Same file,
-docs/reports/phase4_l2_reconciliation_and_plan.md, now with Parts B/C appended (marked
-PROVISIONAL -- PENDING PART A throughout).
-Blocking/open questions: (1) still entirely downstream of the L3 track's own item (b), the
-go/no-go on the full 2,000,000-step warm-start run -- Parts B/C above are marked provisional
-specifically because a fixed-physics retrain could in principle change horizon_ticks or
-reward scaling in a way that would need re-deriving them. (2) NEW this round: Section
-4.1-vs-4.3 L2 decision-cadence mismatch (5s training vs. 1s inference) -- needs a judgment
-call on which is authoritative, or whether both are intentional for different contexts,
-before FrozenL3Wrapper's ticks_per_l2_decision is finalized.
-Next planned step: once the L3 go/no-go lands and (if warm-start is approved) that run
-produces the superseding checkpoint, re-confirm Parts B/C are still valid against whatever
-that run's actual config turns out to be, resolve the 4.1-vs-4.3 cadence question, then move
-to implementation (FrozenL3Wrapper, train_l2.py). Still not building either this round.
-
-Note from L3 (2026-08-20 10:14 HKT): the full run COMPLETED cleanly (see below) --
-item (1) is now fully resolved, not just the go/no-go. models/l3_executioner_v1.zip is
-the new fixed-physics-retrained checkpoint (sha256 973b2883...) -- you can point
-FrozenL3Wrapper at it now. One thing to weigh before treating it as "the" L3 policy to
-build on: it lands at roughly PARITY with TWAP (val_l3_beats_twap_bps=-0.0631, i.e.
-L3's execution is statistically indistinguishable from TWAP at n=50, not a clear win)
--- see the full numbers below. That's a judgment call for whoever decides L3 is "good
-enough" to integrate against; this track isn't making that call for you, just flagging
-it plainly rather than letting a checkpoint swap read as an implicit endorsement.
-Parts B/C's derivations (horizon_ticks=3000, reward structure) are confirmed correct
-and unchanged by this run, as stated last time -- safe to finalize those.
+docs/reports/phase4_l2_reconciliation_and_plan.md, now with a "FINAL SPEC" section appended
+covering Steps 1-3 above.
+Blocking/open questions: (1) awaiting a pointer to the specific recurrent-policy paper
+referenced for Step 2c, if the previous-action-toggle recommendation should incorporate it
+specifically rather than this session's own general reasoning. (2) implementation
+(FrozenL3Wrapper/train_l2.py) still depends on the L3 track's separate, still-open item (f)
+(is the current checkpoint's near-parity-with-TWAP result good enough to build on) -- this
+design doc's own content is final regardless of how that resolves, but starting real
+training is not yet cleared.
+Next planned step: once item (2) above is cleared, implement FrozenL3Wrapper (per this doc's
+original wrapper-only mechanism, Part B) and train_l2.py, using the FINAL SPEC section's
+observation space and hyperparameters directly -- no further design work anticipated before
+that.
 
 ## L3 / Env-Physics
 Last updated: 2026-08-20 10:14 HKT

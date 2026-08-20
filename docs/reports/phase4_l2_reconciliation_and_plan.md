@@ -525,3 +525,274 @@ treated as final until the L3 checkpoint question resolves, since the checkpoint
 still, in principle, come with its own guidance that affects these numbers (e.g. if a fixed-
 physics retrain changes `horizon_ticks` or reward scaling). No `FrozenL3Wrapper`/`train_l2.py`
 code written.
+
+---
+
+## FINAL SPEC (2026-08-20, this session): L2 observation space + SAC hyperparameters
+
+Supersedes the "PROVISIONAL -- PENDING PART A" Parts B/C above for the specific items
+resolved below (cadence, observation space). Concrete enough to implement `FrozenL3Wrapper`
+directly from this section without re-deriving anything -- implementation itself is still
+not done this round, per instruction.
+
+### Step 1 -- Cadence conflict: confirmed resolved in the spec, confirmed clean elsewhere
+
+Re-read architecture_spec.md Section 4.1 and Section 4.3 fresh this session (not reused from
+a prior read) via `git diff docs/architecture_spec.md` against the last commit, to see the
+actual change rather than infer it:
+
+```diff
+ L1_EVERY_N_TICKS = 600   # ~60s at 100ms ticks
+-L2_EVERY_N_TICKS = 10    # ~1s at 100ms ticks
++L2_EVERY_N_TICKS = 50    #  I just change here
+```
+
+`L2_EVERY_N_TICKS` is now `50`, matching Section 4.1's `ticks_per_l2_decision=50` exactly --
+the conflict this doc flagged previously is gone. **Flagging the fix's own confidence
+level, not just its outcome:** this is a bare one-line value change with the comment
+`# I just change here` -- unlike its `L1_EVERY_N_TICKS` sibling (which recomputes and states
+"~60s at 100ms ticks"), there is no updated timing comment, no stated rationale for why 50 is
+now the right number for the *inference*-loop context specifically (Section 4.3 describes a
+live/backtest orchestration loop, a different context from Section 4.1's *training*-time
+wrapper). Treating this as **resolved with moderate, not high, confidence** -- matches how
+this task's own instructions characterized it going in.
+
+**Grepped the real repo** (not just the spec doc) for anything else that hardcodes or
+assumes the old 10-tick/1s L2 cadence -- `configs/`, `src/`, `tests/`, `scripts/`, plus a
+broad `L2_EVERY_N_TICKS|ticks_per_l2_decision|l2.{cadence,frequency}` sweep across all
+`.py`/`.md`/`.yaml`/`.json` files. **Nothing else in the codebase references either
+constant at all.** The only other L2-related config artifact, `configs/sac_l2.yaml`, is an
+empty placeholder (`# Placeholder SAC (L2) config keys only`, every key unfilled) -- no
+cadence value, no hyperparameter value, nothing to conflict with. No test file, script, or
+config hardcodes a 10-tick/1s L2 assumption anywhere. **Stating this explicitly, per
+instruction: nothing else turned up.** `configs/sac_l2.yaml` is the natural landing spot for
+this section's finalized hyperparameters once someone is ready to fill it in -- not done this
+round (no code/config writing this round).
+
+### Step 2 -- Concrete L2 observation-space spec
+
+#### 2a. Per-feature aggregation rule for all 40 non-excluded indices (0-14, 17-41)
+
+Grouped by feature type/mechanism, not decided index-by-index blind:
+
+**Group 1 -- already rolling-window features computed by the base env (idx 3, 4, 5, 12, 40):
+use the LAST (freshest) value at decision time, no further transformation.**
+These are already trailing-window quantities (`_precompute_feature_series()`, confirmed
+unchanged in the current working tree). Re-averaging an already-smoothed series over the L2
+window would double-smooth it and destroy the "how fresh is this read" property that makes a
+short-window z-score useful at all.
+- **idx 4 `mid_return_5s_z`** and **idx 12 `trade_flow_imbalance_5s`**: both 5s windows.
+  With the cadence now settled at 50 ticks x 0.1s = **exactly 5.0s**, these two are not just
+  "close to" but **exactly aligned** with the L2 decision window -- their last value at
+  decision time already *is* "return / net flow since my last decision" to a very good
+  approximation. No transformation needed, confirmed the intended reading.
+- **idx 3 `mid_return_1s_z`** (1s window, shorter than the 5s decision cadence) and
+  **idx 5 `realized_vol_60s_z`**, **idx 40 `taker_buy_sell_ratio_1m`** (60s windows, longer):
+  kept as complementary multi-timescale reads (fast + slow, bracketing the ~5s decision-
+  scale read from Group above) -- also last-value, no new aggregation.
+
+**Group 2 -- point-in-time state/stock variables (idx 0, 1, 13, 14, 41): instantaneous
+snapshot at decision time.**
+`time_remaining_norm`, `inventory_remaining_norm`, `queue_position_ratio`,
+`ticks_since_own_fill_norm`, `own_open_orders_norm`. These describe "what state am I in
+right now" (time/inventory left, current resting-order queue position, recency since last
+fill, current resting-order size) -- state, not a flow. A mean/max/sum over the window
+doesn't correspond to any real quantity for a stock variable; the decision-relevant value is
+always "current state as of decision time," which is operationally identical to "last value
+in the window."
+
+**Group 3 -- instantaneous microstructure reads with no built-in persistence (idx 2, 6, 7, 8,
+9): aggregate via MEAN over the 50-tick window.**
+`spread_norm`, `OBI_1`, `OBI_5`, `OBI_10`, `micro_mid_dev_ticks` -- each computed fresh every
+tick directly from the current top-of-book snapshot, with no trailing window in their own
+formula (confirmed against the current `_build_obs()`: OBI/micro-price/spread-ratio are all
+single-tick computations). A single instantaneous tick's reading is noisy and can flip
+sign/swing tick-to-tick; MEAN over the window turns this into "was there sustained
+imbalance/spread-widening/micro-price pressure over the period I'm evaluating," which is
+what L2 actually needs at its coarser cadence. Ranges are unchanged by meaning (mean of
+values already in `[-1,1]`/`[0,1]`/`[-5,5]` stays in the same range).
+
+**Group 4 -- structurally zero, no design decision needed (idx 10, 11): pass through as-is.**
+`cancel_add_ratio_bid`, `cancel_add_ratio_ask` -- both hardcoded `0.0` in the real env
+(confirmed in this doc's original Part A read, unchanged since -- genuinely blocked by the
+data source, not a stub awaiting a real signal). Mean/max/last of a constant 0.0 is still
+0.0; noting this explicitly rather than silently omitting the two indices.
+
+**Group 5 -- depth-level snapshots (idx 19-38, 20 dims): aggregate via MEAN over the window,
+per level.**
+`book_depth_norm_0..19`. Individual order placements/cancellations at a given book level
+cause sharp, transient jumps tick-to-tick; a single instantaneous depth reading at decision
+time is a weak proxy for "how deep was this level, typically, during the period I'm
+evaluating." MEAN per level gives a materially more stable read, same rationale as Group 3.
+(MIN per level, for a "worst-case thinness" read, is a documented alternative -- not adopted
+here since MEAN is the more standard default and this is unvalidated either way until real
+L2 training exists to compare against.)
+
+**Group 6 -- slow-moving external context, changes far slower than the L2 window (idx 17,
+18, 39): instantaneous/last-value; aggregation is a mathematical no-op here, not just an
+approximation.**
+`l1_risk_score`, `l1_confidence` are mutated externally on the L1 track's own
+`L1_EVERY_N_TICKS=600` (~60s) cadence -- 12x slower than the 50-tick L2 window, so within any
+single L2 decision window these are constant in the large majority of cases. `funding_rate_z`
+is stronger still: confirmed (current code) it is computed **exactly once, at `reset()`**,
+not per-tick at all -- it is the *same* value for the entire episode, so "aggregating" it over
+any window, L2-sized or otherwise, cannot change its value. Last-value is not an
+approximation for idx 39; it is exact by construction.
+
+Total: 5 + 5 + 5 + 2 + 20 + 3 = **40 indices**, every one of 0-14/17-41 accounted for exactly
+once.
+
+#### 2b. TWAP-schedule-deviation scalar -- confirmed computable from existing state, no new instrumentation
+
+Re-read the current, live working tree of `lob_execution_env.py` (post-physics-fix; this
+session did not modify it) to confirm this against real code rather than an earlier read from
+memory. `_compute_l2_target_slice_ratio()` (still the right hook, unchanged) and the
+attributes it depends on (`self.qty_total`, `self.qty_remaining`, `self._tick_idx`,
+`self._episode_start`, `self.horizon_ticks`) are all present, unchanged, at the same names:
+
+```python
+schedule_deviation = (qty_total - qty_remaining) / qty_total - twap_baseline
+# twap_baseline = env._compute_l2_target_slice_ratio(), read BEFORE the wrapper
+# overrides l2_target_slice_ratio_override for the upcoming decision window (so it
+# reads the env's own default linear-TWAP path: ticks_elapsed / horizon_ticks).
+# Positive = ahead of schedule, negative = behind. Clip to [-1, 1].
+```
+
+**No new env instrumentation needed.** Everything on the right-hand side is already tracked
+by the live env; this is arithmetic the wrapper performs on values it already has to read
+anyway (it already reads/overrides `l2_target_slice_ratio_override` per this doc's original
+Part B design).
+
+#### 2c. Previous-action-as-input -- explicit, separate toggle (not silently baked in)
+
+**Could not locate the referenced precedent.** Searched the repo (`find ... -iname '*.pdf'`)
+and the wider box for "the recurrent-policy paper in this project's own PDFs" -- there are no
+PDFs anywhere inside `lob-execution-hma` at all; the only PDFs on the box belong to unrelated
+projects/coursework. **Flagging this as something I could not find rather than guessing which
+paper was meant or fabricating a citation** -- if there's a specific paper you have in mind,
+point me to it and I'll fold its guidance in; the recommendation below is my own reasoning,
+not sourced from that paper.
+
+**Why this is a genuinely separate question from idx 15/16's exclusion:** idx 15/16
+(`l2_target_slice_ratio`, `l2_urgency`) are *excluded* from this proposal per Section 3.1's
+own instruction ("naturally excluded since L2 produces them") -- but even if they weren't,
+they would not reliably let L2 recover its own previous *raw* action. idx 16 (`urgency`) is
+copied through unchanged, but idx 15 is `twap_baseline * participation_rate_multiplier`
+(clipped to `[0,1]`) -- recovering the raw multiplier from idx 15 requires dividing by
+`twap_baseline`, which is near-zero at the start of every episode (the exact regime where
+knowing your own last action matters for producing a smooth next one). So "does L2 see its
+own last action" and "are idx 15/16 in the vector" are not the same question, and conflating
+them would silently under- or over-specify the design -- treating them as separate, as
+instructed.
+
+**Recommendation: include it, as an explicit, named, off-by-default-able parameter --
+default ON.** `FrozenL3Wrapper(..., l2_include_prev_action: bool = True)`, adding 2 raw
+scalars (`prev_participation_rate_mult` in `[0, 2]`, `prev_urgency` in `[0, 1]`) -- direct,
+unlossy copies of L2's own last action, not the derived idx-15-style proxy.
+Reasoning: Section 4.1 specifies plain `SAC("MlpPolicy", ...)` for L2 -- a feedforward,
+non-recurrent policy, unlike L3's `MlpLstmPolicy`. L3's LSTM can in principle learn to
+remember its own recent actions internally across a sequence without being told explicitly;
+a memoryless `MlpPolicy` genuinely cannot -- each `predict()` call sees only the current
+observation, with zero information about what it just committed to unless that information
+is explicitly present in the vector. This is the standard justification for previous-action
+conditioning in continuous-control RL generally (reducing action chatter/oscillation between
+consecutive decisions, since the policy can see and smooth relative to its own last output)
+-- not sourced from a specific paper here, flagged above. The toggle exists so this can be
+turned off cheaply as an ablation if it doesn't help empirically, without touching the rest
+of the observation-space design.
+
+#### 2d. Final dimension count -- stated explicitly
+
+- **Base (Section 3.1's literal requirement only, no previous-action):**
+  40 (Step 2a) + 1 (schedule_deviation, 2b) = **`Box(shape=(41,), dtype=np.float32)`**.
+- **Recommended (with `l2_include_prev_action=True`, 2c):**
+  41 + 2 = **`Box(shape=(43,), dtype=np.float32)`**.
+
+One item from this doc's own prior round is deliberately **not** carried into this final
+spec: the previously-proposed `fill_progress_since_last_decision` scalar. This round's task
+scoped Step 2 tightly to Section 3.1's literal requirement (downsampled view + TWAP-deviation
+scalar) plus the explicitly-requested previous-action toggle -- adding a third, previously-
+invented scalar back in without being asked would be exactly the kind of silent inclusion
+this round's instructions are pushing against. Recorded here for traceability, not carried
+forward: still a plausible future enhancement, not part of the final spec.
+
+#### 2e. Concrete index-mapping table (old idx -> new position, transform)
+
+| New pos | Old idx | Feature | Transform | Range |
+|---|---|---|---|---|
+| 0 | 0 | `time_remaining_norm` | instantaneous | [0,1] |
+| 1 | 1 | `inventory_remaining_norm` | instantaneous | [-1,1] |
+| 2 | 2 | `spread_norm` | mean/50-tick window | [0,1] |
+| 3 | 3 | `mid_return_1s_z` | last value | [-5,5] |
+| 4 | 4 | `mid_return_5s_z` | last value (= since-last-decision, exact match) | [-5,5] |
+| 5 | 5 | `realized_vol_60s_z` | last value | [-5,5] |
+| 6 | 6 | `OBI_1` | mean/window | [-1,1] |
+| 7 | 7 | `OBI_5` | mean/window | [-1,1] |
+| 8 | 8 | `OBI_10` | mean/window | [-1,1] |
+| 9 | 9 | `micro_mid_dev_ticks` | mean/window | [-5,5] |
+| 10 | 10 | `cancel_add_ratio_bid` | pass-through (always 0.0) | [0,5] |
+| 11 | 11 | `cancel_add_ratio_ask` | pass-through (always 0.0) | [0,5] |
+| 12 | 12 | `trade_flow_imbalance_5s` | last value (= since-last-decision, exact match) | [-1,1] |
+| 13 | 13 | `queue_position_ratio` | instantaneous | [-1,1] |
+| 14 | 14 | `ticks_since_own_fill_norm` | instantaneous | [0,1] |
+| 15 | 17 | `l1_risk_score` | instantaneous (~constant within window) | [-1,1] |
+| 16 | 18 | `l1_confidence` | instantaneous (~constant within window) | [0,1] |
+| 17-36 | 19-38 | `book_depth_norm_0..19` | mean/window, per level | [-5,5] |
+| 37 | 39 | `funding_rate_z` | instantaneous (exactly constant per episode) | [-5,5] |
+| 38 | 40 | `taker_buy_sell_ratio_1m` | last value | [-1,1] |
+| 39 | 41 | `own_open_orders_norm` | instantaneous | [0,1] |
+| 40 | -- | `schedule_deviation` (new, 2b) | computed | [-1,1] |
+| 41 | -- | `prev_participation_rate_mult` (new, 2c, toggle) | raw copy of L2's last action | [0,2] |
+| 42 | -- | `prev_urgency` (new, 2c, toggle) | raw copy of L2's last action | [0,1] |
+
+### Step 3 -- SAC hyperparameters re-confirmed against the now-settled cadence
+
+The prior round's `buffer_size=500,000` and `gamma=0.995` derivations already assumed
+`ticks_per_l2_decision=50` throughout (Section 4.1's literal training-time value, used
+consistently even while Section 4.3's *inference*-time constant conflicted with it) -- the
+arithmetic does not change now that Section 4.3 has been patched to match. What changes is
+the caveat: previously PROVISIONAL for two independent reasons (the cadence conflict, and the
+separate L3-checkpoint question); the cadence reason is now resolved (Step 1, moderate
+confidence). **Dropping PROVISIONAL on `buffer_size` and `gamma` specifically** -- both stand
+as this doc's earlier Part B stated them:
+- `buffer_size=500,000` -- confirmed: ~8,333 L2-episode-equivalents of buffer coverage, ~25%
+  of the full 2,000,000-step run's transition volume. No change.
+- `gamma=0.995` -- confirmed as a starting value with L2-specific justification (effective
+  horizon ~3.3x the 60-decision episode length, defensible given the terminal-IS-dominated
+  reward), `~0.983` still flagged as the concrete empirical alternative to test once training
+  runs. No change.
+
+**Observation-dimensionality effect on network architecture, per instruction:** Section 4.1's
+SAC reference (`SAC("MlpPolicy", env, buffer_size=..., ...)`) does not specify a `net_arch`,
+meaning SB3's SAC default applies (`[256, 256]` for both actor and critic). The dimensionality
+change here (41 -> 43 with the recommended toggle) only changes the first layer's input width
+by 2 columns (~5%) -- not large enough on its own to justify widening or deepening the default
+net_arch. No `net_arch` change proposed; noting this explicitly rather than leaving it
+implicit, per instruction, precisely because the answer is "no architecture change needed,"
+not because the question doesn't apply.
+
+**Context noted, not required by this round's task, worth stating for anyone reading this
+doc next:** `docs/TRACK_STATUS.md`'s L3 section (checked fresh while re-reading the env code
+for Step 2b) now shows the full 2,000,000-step warm-start run **completed** --
+`models/l3_executioner_v1.zip` (sha256 `973b2883...`) is the new checkpoint, superseding the
+old buggy-physics baseline, with checkpoint identity itself marked RESOLVED there. That
+closes this doc's *other* prior blocker (which checkpoint) independently of this round's work.
+A new, different open question has taken its place on that track (item (f): whether a
+near-parity-with-TWAP validation result is "good enough" to build L2 on top of, vs. training
+further) -- a judgment call for whoever owns that decision, not something this design doc
+resolves. **This design doc's observation-space and hyperparameter spec above is now final
+on its own terms**, but actually starting `FrozenL3Wrapper`/`train_l2.py` implementation
+still depends on that separate, still-open call.
+
+## Summary of this round
+
+Step 1: cadence conflict confirmed resolved in the spec (moderate confidence -- bare one-line
+patch, no restated rationale), confirmed nothing else in the real repo hardcodes the old
+value. Step 2: concrete L2 observation space specified -- `Box(shape=(41,))` base or
+`Box(shape=(43,))` recommended (toggle default ON), full index-mapping table, TWAP-deviation
+scalar confirmed computable from existing env state with zero new instrumentation, previous-
+action inclusion presented as an explicit toggle with a recommendation (paper precedent not
+found in-repo, flagged rather than guessed). Step 3: `buffer_size`/`gamma` re-confirmed
+unchanged, PROVISIONAL dropped for the cadence-related reason; dimensionality's effect on
+network architecture named explicitly (none needed). No `FrozenL3Wrapper`/`train_l2.py` code
+written this round.
