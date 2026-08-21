@@ -27,11 +27,26 @@ not assumed from memory):
 
 Run: PYTHONPATH=. .venv/bin/python -m src.train.train_l3 [--total-timesteps N]
 [--n-envs N] [--eval-freq N] [--n-eval-episodes N] [--config configs/ppo_l3.yaml]
-[--no-progress-bar]
+[--no-progress-bar] [--run-name NAME] [--overwrite-canonical]
+
+Save-path safety (added after a bounded probe run's final save silently
+overwrote a verified checkpoint -- see docs/reports/l3_replace_value_probe.md's
+"separately flagged" note): the final save no longer unconditionally writes to
+models/l3_executioner_v1.zip / l3_vecnormalize.pkl. If those files already
+exist, the save is redirected to a run-tagged path instead
+(models/l3_executioner_v1_<run-name>.zip, etc.) unless --overwrite-canonical is
+passed explicitly. --run-name also namespaces this run's periodic
+CheckpointCallback files, so two runs' intermediate checkpoints can no longer
+silently collide either (confirmed this had already happened once, silently,
+before this fix: a later probe's own periodic checkpoints overwrote an
+earlier, unrelated run's identically-named ones). See
+resolve_final_save_paths() below for the exact logic, and
+tests/test_train_l3.py for its test coverage.
 """
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +79,34 @@ def make_env(
             reward_weights=reward_weights,
         )
     return _init
+
+
+def resolve_final_save_paths(
+    run_name: str, overwrite_canonical: bool, models_dir: Path = Path("models"),
+) -> tuple[str, str]:
+    """Decide where this run's final model/VecNormalize save should go.
+    Refuses to silently overwrite an existing canonical checkpoint -- a
+    bounded probe run's final save clobbered a verified one here once
+    already (see docs/reports/l3_replace_value_probe.md) -- unless
+    overwrite_canonical is explicitly True. The two canonical files are
+    treated as a pair (checked with OR, not AND): if either already exists,
+    both outputs redirect together, so a run can never leave a mismatched
+    model/VecNormalize pair behind by only overwriting one of them.
+    Pure path-decision logic, no I/O beyond the existence check -- kept
+    separate from main() specifically so it's unit-testable without a GPU,
+    training loop, or real config/data files.
+
+    Returns (model_save_stem, vecnorm_save_path). model_save_stem has no
+    .zip suffix, matching SB3 model.save()'s own convention (it appends
+    .zip itself)."""
+    canonical_model = models_dir / "l3_executioner_v1.zip"
+    canonical_vecnorm = models_dir / "l3_vecnormalize.pkl"
+    if (canonical_model.exists() or canonical_vecnorm.exists()) and not overwrite_canonical:
+        return (
+            str(models_dir / f"l3_executioner_v1_{run_name}"),
+            str(models_dir / f"l3_vecnormalize_{run_name}.pkl"),
+        )
+    return str(models_dir / "l3_executioner_v1"), str(models_dir / "l3_vecnormalize.pkl")
 
 
 class ValISEvalCallback(BaseCallback):
@@ -250,9 +293,28 @@ def main() -> None:
         "(including in parallel) off one checkout. Unset keeps RewardWeights()'s "
         "own default.",
     )
+    parser.add_argument(
+        "--run-name", type=str, default=None,
+        help="Tag for this run's checkpoint filenames, used (a) as the fallback "
+        "final-save name if models/l3_executioner_v1.zip already exists and "
+        "--overwrite-canonical is not given, and (b) to namespace this run's "
+        "periodic CheckpointCallback files so two runs' intermediate checkpoints "
+        "can never silently collide. Defaults to a UTC timestamp "
+        "(YYYYmmdd_HHMMSS) if not given.",
+    )
+    parser.add_argument(
+        "--overwrite-canonical", action="store_true",
+        help="Allow this run's final save to overwrite an existing "
+        "models/l3_executioner_v1.zip / l3_vecnormalize.pkl. Off by default -- a "
+        "bounded probe run silently overwrote a verified checkpoint here once "
+        "already (see docs/reports/l3_replace_value_probe.md). Pass this only "
+        "when this run is deliberately meant to supersede the current canonical "
+        "checkpoint.",
+    )
     args = parser.parse_args()
     if bool(args.resume_from) != bool(args.resume_vecnormalize):
         raise ValueError("--resume-from and --resume-vecnormalize must be given together")
+    run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -337,7 +399,7 @@ def main() -> None:
     checkpoint_cb = CheckpointCallback(
         save_freq=max(1, ckpt_cfg["save_freq_timesteps"] // n_envs),
         save_path="models/l3_checkpoints/",
-        name_prefix="l3_ppo",
+        name_prefix=f"l3_ppo_{run_name}",
         save_vecnormalize=ckpt_cfg["save_vecnormalize"],
     )
     eval_cb = ValISEvalCallback(
@@ -356,9 +418,21 @@ def main() -> None:
     )
 
     Path("models").mkdir(exist_ok=True)
-    model.save("models/l3_executioner_v1")
-    vec_env.save("models/l3_vecnormalize.pkl")
-    print("Saved model to models/l3_executioner_v1, VecNormalize to models/l3_vecnormalize.pkl")
+    model_save_stem, vecnorm_save_path = resolve_final_save_paths(
+        run_name, args.overwrite_canonical, Path("models")
+    )
+    if model_save_stem != "models/l3_executioner_v1":
+        print(
+            "models/l3_executioner_v1.zip already exists and --overwrite-canonical "
+            "was not given -- NOT overwriting it (this is exactly what silently "
+            f"clobbered a verified checkpoint once before). Saving this run's final "
+            f"checkpoint to {model_save_stem}.zip / {vecnorm_save_path} instead. Pass "
+            "--overwrite-canonical if this run is deliberately meant to supersede the "
+            "current canonical checkpoint."
+        )
+    model.save(model_save_stem)
+    vec_env.save(vecnorm_save_path)
+    print(f"Saved model to {model_save_stem}, VecNormalize to {vecnorm_save_path}")
 
 
 if __name__ == "__main__":
