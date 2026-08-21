@@ -104,7 +104,48 @@ exact checksum, that specific artifact is gone; the behavioral numbers it report
 in question, only the exact bytes.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-21 17:20 HKT
+Last updated: 2026-08-21 20:40 HKT
+State: Two more tasks landed since the last check-in, both no-GPU/no-training. Pointer
+update again -- see docs/reports/l3_replace_value_probe.md (Task 1) and
+docs/reports/l3_twap_baseline_reward.md (Task 2, new file) for full detail.
+
+TASK 1 (v1 re-evaluated at n=500, committed 332d1b9): checkpoint verified before running
+anything -- models/l3_executioner_v1.zip is still the step-2,000,000 stand-in
+(27afa91e...), NOT true v1 (973b2883..., unrecoverable), consistent with every check this
+session. Result: v1's own headline numbers barely moved from n=50 (IS 1.245->1.2607, fill
+0.918->0.892), but the gap vs TWAP grew ~6x (0.063bps->0.372bps) and now clears p<0.05 by
+the paired t-test (p=0.0327) though NOT by Wilcoxon (p=0.115) -- stated plainly rather than
+picking whichever test agrees. Three-way n=500 point-estimate ordering: TWAP (0.889) <
+best-B (1.103) < v1 (1.261) -- v1 worst of the three, a more robust version of the
+milestone report's own "near-parity, if anything slightly worse" framing, not a reversal
+like best-B's sign flip was. Read as meaningfully suggestive, not fully unanimous, evidence
+that the RL policy underperforms simple baselines here.
+
+TASK 2 (TWAP-baseline variance-reduction reward, implemented + tested, NOT trained,
+committed 1b442f9 -- separately from Task 1 and from the still-unconfirmed r_queue
+direction-inversion, see Files owned/in-progress below): terminal reward becomes
+-kappa*(IS_total_bps - twap_shadow_IS_total_bps), gated behind
+RewardWeights.subtract_twap_baseline (default False, same opt-in convention as
+zeta/eta_replace). Explicitly a baseline subtraction, not an objective change -- the
+subtracted quantity never observes the real episode's policy, so it shifts reward scale,
+not the argmax. Design decision (asked for, not picked silently): computed fresh in
+reset(), NOT cached -- caching would not help training resets regardless of choice, since
+training draws from ~349M possible windows with ~0% real repeat rate; caching only helps
+periodic eval (same fixed seeds reused across firings), a separate, not-yet-built
+optimization. Measured cost on REAL market data, not guessed: +48ms/reset (2.4% of
+reset()'s own ~2027ms baseline, dominated by day-load I/O), ~0.1% of a full episode's
+wall-clock budget at v1's measured throughput -- much cheaper than an initial
+back-of-envelope worry (~2x) suggested; measuring instead of assuming caught that worry
+being wrong. 4 new tests (tests/test_twap_baseline_reward.py) verify the subtraction
+arithmetic, the flag's inertness, and that info["implementation_shortfall"] never changes
+-- the key integration test (a policy matching TWAP exactly must get ~0 terminal
+contribution) caught two real implementation bugs before either reached committed code
+(missing discrete-SIZE_FRACTIONS rounding, and a decision/evolution ordering mismatch) --
+concrete evidence the test design did its job, not just satisfied a checklist.
+
+Old narrative retained below unchanged for context on the checkpoint-overwrite incident,
+the direction-inversion probe, and the prior REPLACE-value follow-up:
+
 State: Two follow-up tasks on top of the direction-inversion probe below (still the most
 recent full narrative; this entry is a pointer + headline update, not a restatement --
 see docs/reports/l3_replace_value_probe.md for the complete account of both).
