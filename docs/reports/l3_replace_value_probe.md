@@ -17,14 +17,21 @@ prior question directly, with hand-written heuristic policies run through the
 real environment -- no RL, no training, no GPU, no model loading anywhere in
 this analysis.
 
-**Bottom line: the evidence supports (b).** No REPLACE-based heuristic, given
-a genuinely fair and reasonably wide parameter sweep, beats a fair comparison
-point (TWAP, or a comparably-filling alternative) by a margin that survives
-scrutiny -- not even the single best-of-18 configuration, selected
-post hoc, which should if anything be an optimistic estimate. The near-0%
-REPLACE usage the trained agent converged to looks like correct behavior on
-this data, not a training failure. See "Answering the actual question" below
-for the full reasoning and its scope.
+**Bottom line: the evidence supports (b), and this has since been confirmed
+at adequate statistical power (n=500; see "Higher-n follow-up" below).** No
+REPLACE-based heuristic, given a genuinely fair and reasonably wide parameter
+sweep, beats a fair comparison point (TWAP, or a comparably-filling
+alternative) by a margin that survives scrutiny -- not even the single
+best-of-18 configuration, selected post hoc, which should if anything be an
+optimistic estimate. The near-0% REPLACE usage the trained agent converged to
+looks like correct behavior on this data, not a training failure. **Update
+(n=500):** the original n=50 result even had the WRONG SIGN -- best-B looked
+numerically better than TWAP at n=50 (a selection artifact from screening 18
+configs), but at n=500 it is numerically worse, still not significant
+(p=0.10), and TWAP itself beats v1's trained RL policy's reported IS outright.
+See "Higher-n follow-up" for the full account -- this is now a more strongly
+supported (b), not merely a repeated one. See "Answering the actual question"
+below for the original full reasoning and its scope.
 
 ## Step 0 -- Resolving the near-v1 action-distribution inconsistency
 
@@ -288,7 +295,134 @@ this environment's IS metric rewards behavior consistent with good execution
 at all, or something else, is a direction question for whoever weighs it
 next.
 
-## Separately flagged, not part of this task
+## Higher-n follow-up (n=500) -- what changed, what held
+
+The comparisons above were run at n=50, which was never sized for statistical
+power in the first place -- it was inherited from the milestone report's own
+eval cadence. This section checks that directly and re-runs the single most
+relevant comparison at adequate power.
+
+### Power arithmetic, verified independently
+
+At n=50, best-B vs TWAP: mean diff=-0.482bps, std_diff=3.71bps (paired
+differences, ddof=1). Achieved power to detect this observed effect at n=50:
+**14.7%** -- not "weak evidence," essentially no ability to distinguish the
+observed effect from zero. Required n for 80% power to detect an effect of
+this magnitude, given this std: **~465** (normal approximation,
+alpha=0.05 two-sided), confirmed via the noncentral-t achieved-power
+function directly, not just the closed-form approximation. Chosen run size:
+**n=500** (~83% power for the originally-observed effect).
+
+### Config selection: PASSIVE dropped, not substituted
+
+The plan called for a "best fully-filling PASSIVE config" alongside best-B
+and TWAP. Checking this before committing to n=500 revealed it does not
+exist: extending the A sweep to offsets +2 through +5 (n=50 each, cheap
+since crossing orders resolve fast) reproduced offset=+1's exact numbers
+(IS=-0.056, fill=0.364) at every offset tested. This is not a coincidence --
+once an offset crosses (offset >= +1 here, spread = 1 tick), `_place_limit()`
+routes it through `walk_market_fill()` against whatever depth is visible on
+that single tick; the price beyond the crossing threshold no longer matters,
+only the size does, and the unfilled remainder is discarded (crossing prices
+never create a resting order, so PASSIVE -- which only ever places once --
+gets no second attempt at it). offset=0 (resting exactly at best_bid,
+non-crossing) does slightly better, 40.4%, precisely because it keeps the
+full 3,000-tick horizon to accumulate fills organically instead of spending
+its one shot against a single tick's snapshot of depth. **40.4% is therefore
+a structural ceiling for "place once, then only HOLD," not a point an
+under-sized sweep missed.** No configuration in this policy family can be
+made fill-comparable to TWAP/B, so no PASSIVE arm was run at n=500 --
+substituting the 40%-fill config anyway would have repeated the exact
+apples-to-oranges comparison this report already flagged as unreliable,
+just at a higher n. `scripts/replace_value_probe_n500.py` runs only the two
+configs this reasoning actually supports testing: best-B and TWAP.
+
+### Results
+
+| | n=50 (original) | n=500 (this follow-up) |
+|---|---|---|
+| best-B IS_total_bps | 0.700 | 1.103 |
+| TWAP IS_total_bps | 1.182 | 0.889 |
+| mean diff (B - TWAP) | -0.482bps | **+0.214bps** |
+| paired t | t=-0.919, p=0.363 | t=1.643, **p=0.101** |
+| Wilcoxon | W=600, p=0.723 | W=58394, p=0.191 |
+
+**The sign flipped.** At n=50, best-B looked numerically better than TWAP --
+this was the number that motivated running a properly-powered follow-up in
+the first place. At n=500, best-B is numerically *worse* than TWAP. Neither
+is statistically significant, but the reversal itself is the more important
+finding: it is closer to a textbook illustration of post-hoc-selection bias
+than to a threshold-crossing result. Best-B was the single best performer
+selected out of 18 configurations screened at n=50; regression to the mean
+at proper power is exactly what should be expected of a screening winner,
+and that is what happened here, not a subtle effect that needed a larger
+sample to resolve in the *predicted* direction.
+
+**Significance vs. practical effect size, stated separately as required:**
+p=0.101 is not significant at the conventional 0.05 threshold, though it is
+closer than the n=50 result was. Read the effect size on its own terms
+regardless of the p-value: +0.214bps is small in absolute terms -- roughly
+4% of TWAP's own std (4.35bps) -- and this project's own established
+significance framework (used throughout this whole L3 track) would not
+treat an effect this size as economically meaningful even if it had cleared
+significance. At n=500 (std_diff=2.91bps here, tighter than the n=50
+estimate), the minimum effect detectable at 80% power is ~0.365bps -- the
+observed +0.214bps sits below even that, meaning n=500 gives good power to
+rule out anything *larger* than roughly a third of a basis point, and finds
+nothing bigger than that. This is a well-powered null, not an underpowered
+maybe.
+
+**Comparison against v1's trained RL policy, stated plainly, not buried:**
+v1's reported IS_total_bps is **1.245** (n=50, from the milestone report).
+At their respective sample sizes, **both TWAP (0.889 at n=500) and even the
+scripted, hand-tuned REPLACE-ACTIVE heuristic (1.103 at n=500) come in lower
+(better) than v1's trained policy's own reported number.** This is a
+descriptive comparison of point estimates, not a new formal paired test --
+v1's 1.245 is an n=50 estimate with its own uncertainty (std=4.74 per the
+milestone report) that was not itself re-run at n=500, and no per-episode
+v1 data exists at n=500 to pair against these results directly. With that
+caveat stated, not hidden: a simple fixed-schedule baseline (TWAP) and an
+untrained, hand-written heuristic both nominally outperforming a policy that
+went through 2,000,000 steps of RL training is a real finding about the RL
+setup, not a footnote to the REPLACE question. It does not, on its own,
+prove the trained policy is worse in a statistically rigorous sense (that
+would need its own properly-powered, paired follow-up, not attempted here)
+-- but it is not a result to let pass without comment either, and it raises
+the same question the original milestone report's "near-parity with TWAP"
+finding already raised: whether this environment's training setup is
+producing genuine execution skill, or converging to something that merely
+avoids doing obviously worse.
+
+### What changed, what held
+
+- **Held:** the answer is (b) -- REPLACE is not shown to be valuable in this
+  environment on this data. This conclusion is now *more* strongly supported
+  than at n=50, not merely repeated at higher confidence -- the specific
+  number that made REPLACE look promising at n=50 did not survive proper
+  power.
+- **Changed:** the direction of the point estimate. At n=50, best-B nominally
+  beat TWAP by 0.48bps; at n=500, it nominally loses by 0.21bps. Neither
+  point estimate should be treated as "the" effect -- the honest summary is
+  that proper power finds no distinguishable difference, in either direction,
+  larger than a few tenths of a basis point.
+- **New:** the explicit comparison against v1's trained policy, which did not
+  appear in the original version of this report at all. Both TWAP and best-B
+  nominally beat it. Flagged plainly above, not resolved here.
+
+## Fixed since the original version of this report
+
+`train_l3.py`'s hardcoded final-save path -- flagged below in its original
+form when this report was first written -- has since been fixed in a
+separate commit: the final save now refuses to overwrite an existing
+`models/l3_executioner_v1.zip` / `l3_vecnormalize.pkl` unless
+`--overwrite-canonical` is passed explicitly, redirecting to a run-tagged
+path otherwise. While implementing that fix, the same hazard was found to
+have already independently bitten the periodic `CheckpointCallback` saves
+too (not just the final save) -- see `docs/TRACK_STATUS.md` for the scope of
+what was silently lost there. Original flagged text kept below as the
+historical record of what prompted the fix.
+
+## Separately flagged, not part of this task (original text, now resolved -- see above)
 
 `train_l3.py`'s final save writes to a hardcoded path
 (`models/l3_executioner_v1.zip` / `l3_vecnormalize.pkl`) regardless of
@@ -310,3 +444,9 @@ report's numbers exactly. Raw per-episode results were saved to
 `/tmp/replace_value_probe_results.json` (scratch, not committed -- easily
 regenerated, and not needed to trust this report's aggregates, which were
 computed directly by the same script run that produced this write-up).
+
+`scripts/replace_value_probe_n500.py` is the adequate-power follow-up --
+same determinism properties, reuses `run_config`/`paired_report` and the
+policy classes from `replace_value_probe.py` directly rather than
+duplicating them. Raw results at `/tmp/replace_value_probe_n500_results.json`
+(scratch, same regenerability note as above).

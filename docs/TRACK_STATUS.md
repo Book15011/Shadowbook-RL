@@ -104,7 +104,61 @@ exact checksum, that specific artifact is gone; the behavioral numbers it report
 in question, only the exact bytes.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-20 23:05 HKT
+Last updated: 2026-08-21 17:20 HKT
+State: Two follow-up tasks on top of the direction-inversion probe below (still the most
+recent full narrative; this entry is a pointer + headline update, not a restatement --
+see docs/reports/l3_replace_value_probe.md for the complete account of both).
+
+TASK 1 (safety fix, committed c803249, separate from Task 2): train_l3.py's final-save
+landmine flagged in the entry below is FIXED -- the final save now refuses to overwrite
+an existing models/l3_executioner_v1.zip/l3_vecnormalize.pkl unless --overwrite-canonical
+is passed explicitly, redirecting to a run-tagged path otherwise. IMPORTANT scope note
+requested explicitly, recorded here per instruction: while building this fix, the SAME
+hardcoded-path bug was found to ALSO affect CheckpointCallback's periodic saves
+(name_prefix="l3_ppo" was shared across every run) -- and it had ALREADY silently
+overwritten data before this fix landed, independently of the final-save incident already
+documented below. Specifically: v1's own periodic checkpoints at steps 250,000 and
+500,000 (from its 2,000,000-step run) were silently overwritten by the direction-inversion
+probe's own periodic checkpoints at those same step numbers (confirmed via file
+timestamps -- the surviving 250k/500k files are dated to the probe's run window, not
+v1's). Consequence: v1's intermediate training trajectory below step 750,000 is no
+longer recoverable from checkpoints (750k onward still exist and were unaffected). This
+did not affect anything already reported -- v1's FINAL numbers came from the step-2M
+checkpoint (recovered separately, see below) and the milestone report's own eval, neither
+of which depended on the 250k/500k files -- but the early trajectory is gone, for the
+record. Both this and the final-save fix are now namespaced by --run-name (auto-generated
+timestamp if not given), so this cannot recur for either save path going forward. 4 new
+tests in tests/test_train_l3.py cover the guard logic directly (tmp_path-based, no
+GPU/training needed).
+
+TASK 2 (adequate-power re-test of the direction-inversion probe's own follow-up question,
+i.e. "is CANCEL_AND_REPLACE actually valuable" -- heuristic simulation only, no training,
+no GPU): the original scripted-heuristic probe (docs/reports/l3_replace_value_probe.md)
+concluded REPLACE shows no value at n=50, but n=50 had only 14.7% power to detect the
+effect it actually observed (best-B nominally beat TWAP by 0.48bps). Re-ran best-B vs TWAP
+ONLY (pre-registered, no re-sweep) at n=500 (~83% power for that effect size). RESULT: the
+sign flipped -- best-B is now numerically WORSE than TWAP (+0.214bps, not -0.482bps),
+still not significant (p=0.101), and the practical effect size is small either way
+(~4% of TWAP's own std). This is a stronger, not weaker, confirmation of "REPLACE isn't
+valuable here" -- the n=50 number that made REPLACE look promising was a selection
+artifact from screening 18 configs, and did not survive proper power. Separately, and
+stated plainly per instruction: at their respective sample sizes, BOTH TWAP (0.889 at
+n=500) and best-B (1.103 at n=500) come in numerically better than v1's trained RL
+policy's own reported IS_total_bps (1.245 at n=50) -- not a formal paired test against
+v1 (no n=500 v1 data exists to pair against), but a real, plainly-stated finding about
+the RL setup itself, not buried as a footnote. Also confirmed independently before running
+anything: no PASSIVE-family config can reach comparable fill to TWAP/B (40.4% at offset=0
+is a structural ceiling, not a sweep gap -- crossing offsets all collapse to the same
+single-tick-depth-limited outcome regardless of how aggressive), so no PASSIVE arm was
+re-tested at n=500; substituting it would have repeated a known apples-to-oranges
+comparison at higher n rather than fixing anything.
+
+Both tasks committed locally (Task 1: c803249; Task 2: pending commit alongside this
+update), not pushed.
+
+PRIOR ENTRY BELOW, unchanged, for full context on the checkpoint-overwrite incident and
+the direction-inversion probe itself:
+
 State: Ran a bounded probe testing whether inverting the r_queue REPLACE/MARKET
 queue-cost direction increases CANCEL_AND_REPLACE usage (near-0% in v1 -- see prior
 entries). Result: probe does NOT confirm the hypothesis. Also: an operational mistake
