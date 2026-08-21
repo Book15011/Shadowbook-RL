@@ -221,15 +221,99 @@ this decision: whether the single-env, no-parallelism design itself should chang
 real run, given the throughput implication above -- flagged as a related open question, not
 decided here.)
 
+### Throughput measurement (2026-08-21, this round) -- real numbers, not arithmetic
+
+Measured from the existing 200-step smoke test's own artifacts (no new run launched, per
+instruction) -- three independent sources, cross-checked against each other:
+
+1. **Checkpoint file mtimes** (`models/l2_checkpoints_smoke/l2_sac_smoke_{50,100,150,200}_steps.zip`,
+   `stat`'d to second precision): step 50 at `20:49:00.03`, step 200 at `20:49:36.19` --
+   **150 steps in 36.16s**, the cleanest available measurement since it excludes the
+   one-time startup window (env/model construction, first reset).
+2. **TensorBoard event log** (`logs/l2_sac_smoke/SAC_1`): two `time/fps` points (3.0 at
+   step 60, 4.0 at step 165), consistent with the above.
+3. **Console output** (already reported): `time_elapsed=16s` at step 60, `=37s` at step
+   165 -- same underlying data as (2), included for cross-reference.
+
+**Steady-state rate: ~4.15 decisions/sec** (150 steps / 36.16s), with the three 50-step
+sub-intervals ranging 3.92-4.39/sec -- used as the basis for extrapolation below rather
+than the noisier startup-inclusive rate (~3.75/sec over the first 60 steps, which bundles
+in one-time model/env construction cost).
+
+**Extrapolated wall-clock for a real 2,000,000-step run: ~5.3-5.9 days**, roughly
+**~5.5 days central estimate**, at this measured rate held constant. Explicitly not a
+validated forecast -- real-run throughput could shift either direction (day-cache
+warm-up improving it, GPU contention with concurrent work degrading it, replay-buffer
+growth, etc.) -- but the order of magnitude (multiple days on a single env) is not in
+doubt from a ~150-step, cleanly-measured sample this consistent across three sources.
+
+**Where the time actually goes -- decomposed, not guessed:** `env.reset()`'s cost is
+already independently measured on this project (L3's own TASK 2 report,
+`docs/TRACK_STATUS.md`'s L3 section: "~2027ms baseline... dominated by day-load I/O") --
+citing that figure, not re-measuring it here (no new run). The smoke test's own
+`ep_len_mean` readings (15.0 at step 60, 20.625 at step 165, average ~17.8 L2-decisions/
+episode) mean L2 episodes end far short of the full 60-decision horizon -- consistent with
+L3's own observation that its retrained policy tends to complete orders well before the
+3,000-tick horizon. Combining: in the 150-step/36.16s window, ~8.4 episodes occurred
+(150/17.8), each paying one `reset()` (~2.0s) -- **`reset()` alone accounts for ~16.85s of
+the 36.16s window, ~47%.** The remaining ~19.3s across 150 decisions is ~129ms/decision for
+the actual inner-loop work (up to 50 `L3.predict()` calls + 50 `env.step()` calls + 1 SAC
+gradient update after `learning_starts`) -- this round did not further decompose that
+129ms across predict/step/gradient-update individually (would need per-call profiling, a
+new run, out of scope this round); flagged as a natural next measurement if the
+recommendation below is pursued.
+
+**This is the headline finding, not a footnote:** roughly HALF of L2's current training
+wall-clock is `reset()` overhead, not the 50-tick inner loop the original concern named.
+L2 pays this disproportionately more than L3's own tick-level training does, because L2
+episodes are short in *decision* terms (~18, not 60) while `reset()` is paid once per
+episode regardless -- the same `reset()` cost that's a rounding error against L3's
+~3,000-tick episodes is a much larger fraction of a ~18-decision L2 episode.
+
+**Plainly: not practical at this throughput.** A ~5.5-day unattended run is impractical in
+absolute terms (L3's own comparable-magnitude run took ~2 hours) and specifically
+impractical to run *blind* -- which is exactly why Task 2 below treats a held-out eval
+callback as blocking, not optional, for launching at this rate.
+
+**Recommendation, with rough expected gains, not implemented this round:**
+- **Primary: parallelize across multiple envs** (`SubprocVecEnv`, mirroring L3's own
+  established `n_envs=8` pattern). Addresses BOTH halves of the problem at once -- the
+  inner-loop cost parallelizes across workers, and `reset()`'s I/O-bound cost (multiple
+  concurrent day-loads) can overlap across workers rather than serializing on one env.
+  Rough expected gain: not a clean 8x (subprocess/IPC overhead, GPU contention from 8x as
+  many concurrent `L3.predict()` calls), but plausibly enough to bring ~5.5 days down to
+  **under a day**. Real, practical caveat: L3's own matched A/B training already uses
+  significant GPU with its own 8 parallel envs -- running L2's 8 envs concurrently, each
+  independently calling the frozen L3 policy on GPU, risks real contention with whatever
+  L3 is doing at the time; needs scheduling coordination, not just the code change.
+- **Secondary, after parallelizing, if still needed: batch the inner L3 `predict()` calls**
+  across whatever parallel envs exist, rather than N separate small-batch GPU calls.
+  Expected gain unquantified without profiling (flagged above) -- plausible but not sized.
+- **Not recommended as the primary fix: reducing `ticks_per_l2_decision`.** Would shrink
+  the inner-loop half of the cost proportionally, but does nothing for the `reset()`-bound
+  half (paid per-episode, not per-decision) -- and changes L2's actual decision cadence
+  away from the now-settled Section 4.1/4.3 value (50), which would ripple into
+  re-deriving `buffer_size`/`gamma`/the observation-space window (all cadence-dependent per
+  the FINAL SPEC above) for a fix that only addresses half the problem.
+- **Not a lever L2 can pull:** why episodes are short (~18 decisions, not 60) is a property
+  of how fast the *frozen L3 policy* completes orders, not something L2's own design
+  controls -- noted as context for the `reset()` finding, not something to "fix" here.
+
+
 ### What's currently blocking
 
-**L3's matched A/B training runs, which will determine the final frozen L3 checkpoint.**
-L2's own design and code are otherwise ready. When the A/B result lands, the only things
-that need to change on L2's side are `--l3-checkpoint` and `--l3-vecnormalize` -- everything
-else (observation space, action-space transform, hyperparameters, wrapper mechanics) is
-independent of which specific checkpoint wins. Two decisions above ((a) VecNormalize, (b)
-eval callback) are recommended before a *real* run specifically, not before the A/B result
-lands -- they can be built in parallel with waiting, if useful.
+**Two things, not one.** (1) L3's matched A/B training runs, which will determine the final
+frozen L3 checkpoint -- when that result lands, the only things that need to change on L2's
+side are `--l3-checkpoint` and `--l3-vecnormalize`; everything else (observation space,
+action-space transform, hyperparameters, wrapper mechanics) is independent of which
+checkpoint wins. (2) **Throughput, newly confirmed this round (see above) -- a real run at
+the current single-env design is impractical (~5.5 days), not just slow.** Parallelizing
+(the primary recommendation above) is not yet built. Recommend treating both as blocking a
+*real* launch: even once the A/B result lands, launching at ~5.5 days/run without
+parallelization would be a real cost, not a formality. The two decisions from the prior
+round ((a) VecNormalize, (b) eval callback -- (b) now built, see below) remain recommended
+before a real run specifically; none of the four items here block further design or
+CPU-only wiring work, and can be built in parallel with waiting on the A/B result.
 
 ---
 
