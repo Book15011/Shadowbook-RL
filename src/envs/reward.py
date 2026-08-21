@@ -54,6 +54,39 @@ correcting a stale order) needs to account for this: a zero-cost regime
 at prices outside the visible book means such a term could be gamed by
 spam-replacing there for free -- this is not benign, work it out
 explicitly before adding one.
+
+EXPERIMENTAL ADDITION 5 (variance reduction, NOT an objective change --
+this distinction matters and is stated explicitly so it is not later
+mistaken for one): IS_total_bps variance across episodes is dominated by
+market drift (observed std ~4-5bps across every eval this project has run)
+while the agent's own execution-quality contribution is fractions of a
+basis point. The critic cannot learn the drift component away -- the agent
+has no way to observe FUTURE price drift over its own episode window, so
+the value function is structurally blind to the single largest source of
+variance in the terminal reward signal it is trying to predict. TWAP's own
+terminal IS_total_bps over that SAME window is a natural proxy for "how
+much of this episode's outcome was just the market moving," because TWAP
+has no timing or venue-selection skill of its own (it slices blindly on a
+fixed schedule) -- what's left in (agent_IS - TWAP_IS) is closer to the
+agent's own execution-quality contribution than agent_IS alone is.
+
+Critically: TWAP's shadow run for a given episode NEVER observes or reacts
+to what the real policy does that episode -- it is a fixed function of the
+market window alone (same day, same start tick, same side, same
+qty_total), computed once in reset() before the real episode's own step()
+calls begin (see LOBExecutionEnv._compute_twap_shadow_terminal_is()). That
+makes it a per-episode CONSTANT with respect to the policy's actions,
+which is what makes this a baseline subtraction rather than an objective
+change: subtracting a constant from the reward at every point in the
+policy's action space shifts the SCALE of the return but not the ARGMAX --
+it cannot change which policy is optimal, and it creates no new incentive
+to "beat" TWAP or anything else. It only changes how much of the reward
+signal's variance is attributable to something the critic could never have
+learned to predict in the first place. Gated behind
+RewardWeights.subtract_twap_baseline, default False (inert) -- same
+opt-in convention as zeta above, so nothing changes until deliberately
+tested. See that field's docstring for the mechanism and docs/reports/ for
+the measured per-reset cost of computing it.
 """
 from __future__ import annotations
 
@@ -83,6 +116,22 @@ class RewardWeights:
     # single fill r_slip magnitude (order 1-2 for a couple bps on a full
     # fill) -- see module docstring.
     zeta: float = 0.06
+    # EXPERIMENTAL 5 (see module docstring): variance reduction, NOT an
+    # objective change -- read the module docstring's EXPERIMENTAL 5 section
+    # before touching this. Defaults to False -- inert unless explicitly
+    # overridden, same opt-in convention as zeta above. When True,
+    # LOBExecutionEnv subtracts a TWAP shadow-execution's terminal
+    # IS_total_bps (computed once per episode in reset(), over the identical
+    # window -- see LOBExecutionEnv._compute_twap_shadow_terminal_is()) from
+    # the terminal reward's kappa*IS_total_bps term. Because that subtracted
+    # quantity does not depend on the agent's actions at all (TWAP's shadow
+    # run never sees or reacts to what the real episode's policy does), it
+    # is a per-episode CONSTANT with respect to the policy -- it cannot
+    # change which policy is optimal, only reduce the variance of the signal
+    # the critic has to learn from. This field does not affect
+    # info["implementation_shortfall"] anywhere -- that always reports the
+    # real, un-adjusted execution outcome; only the scalar reward changes.
+    subtract_twap_baseline: bool = False
 
 
 def step_reward(

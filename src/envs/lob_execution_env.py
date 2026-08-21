@@ -575,9 +575,182 @@ class LOBExecutionEnv(gym.Env):
         self._last_fill_tick_idx = None
         self._terminated_early = False
 
+        # EXPERIMENTAL 5 (reward.py module docstring): computed once here,
+        # BEFORE the real episode's own step() calls begin, over the
+        # identical window this reset() just drew -- never touches
+        # self._resting/self.qty_remaining/self._tick_idx, so it cannot
+        # interfere with (or be interfered with by) the real episode that
+        # follows. None (not computed) when the flag is off, so this costs
+        # nothing unless deliberately enabled.
+        self._twap_shadow_terminal_is_bps: float | None = None
+        if self.reward_weights.subtract_twap_baseline:
+            self._twap_shadow_terminal_is_bps = self._compute_twap_shadow_terminal_is()
+
         obs = self._build_obs()
         info = self._build_info(step_fills=[])
         return obs, info
+
+    def _compute_twap_shadow_terminal_is(self) -> float:
+        """Simulates a TWAP execution (n_slices=10) over the SAME window
+        (self._ticks/self._episode_start/self.side/self.qty_total/
+        self.arrival_price) the real episode just drew, entirely via LOCAL
+        state -- never reads or writes self._resting/self.qty_remaining/
+        self._tick_idx. Reuses the exact matching-engine primitives step()
+        itself uses (walk_market_fill, update_queue, TickView.qty_at_price,
+        compute_implementation_shortfall, self._estimate_trade_volume) --
+        only the TWAP-specific slicing/routing decision is duplicated here
+        rather than imported, since scripts/phase2a_sanity_suite.py (where
+        the canonical TWAPPolicy lives) is documented as a throwaway
+        evaluation script, not something core env code should import from.
+        tests/test_lob_execution_env_features.py's
+        test_twap_shadow_matches_real_twap_policy_exactly runs the REAL
+        TWAPPolicy through the REAL env on the same seeds and asserts this
+        method's output matches info["implementation_shortfall"] exactly --
+        that integration test is what actually guards against drift between
+        this duplicated decision logic and the canonical policy, not just
+        code review.
+
+        See RewardWeights.subtract_twap_baseline and the reward.py module
+        docstring's EXPERIMENTAL 5 section for why this exists (variance
+        reduction, not an objective change) and docs/reports/ for the
+        measured per-reset cost of calling this."""
+        n_slices = 10
+        side = self.side
+        qty_total = self.qty_total
+        qty_remaining = qty_total
+        resting: QueueState | None = None
+        resting_price: float | None = None
+        resting_side: str | None = None
+        episode_fills: list[dict] = []
+        current_slice = -1
+        qty_remaining_at_slice_start = qty_total
+
+        tick_idx = self._episode_start
+        for _ in range(self.horizon_ticks + 1):
+            tick = self._ticks[tick_idx]
+
+            # Snapshot BEFORE this tick's resting-order evolution runs --
+            # this is exactly what TWAPPolicy.act() sees in the real
+            # run_episode() loop, since act() is always called BEFORE
+            # step()'s own evolution for the tick about to be processed
+            # (env.qty_remaining/env._resting reflect the END of the
+            # PREVIOUS step() call, not this tick's evolution yet). The
+            # decision below (slice accounting, is_last_tick_of_slice,
+            # size_frac, and whether a new order may be placed) must use
+            # THESE snapshots, not the live post-evolution values, or the
+            # shadow silently sees a one-tick-later reality than the real
+            # policy decided against -- this was caught by
+            # test_subtract_twap_baseline_matches_real_twap_policy_exactly
+            # diverging by a small but real amount before this fix.
+            qty_remaining_decision = qty_remaining
+            resting_active_decision = resting is not None
+
+            if resting is not None and not resting.is_resolved:
+                v_trade, q_p_before = self._estimate_trade_volume(
+                    tick_idx - 1, tick_idx, resting_price, resting_side
+                )
+                prev_filled = resting.filled_qty
+                resting = update_queue(resting, v_trade=v_trade, v_cancel=0.0, q_p_before=q_p_before)
+                newly_filled = resting.filled_qty - prev_filled
+                if newly_filled > 0:
+                    episode_fills.append({"price": resting_price, "qty": newly_filled, "is_maker": True})
+                    qty_remaining = max(0.0, qty_remaining - newly_filled)
+                if resting.is_resolved:
+                    resting = None
+                    resting_price = None
+                    resting_side = None
+
+            ticks_elapsed = tick_idx - self._episode_start
+            slice_ticks = self.horizon_ticks / n_slices
+            slice_idx = min(n_slices - 1, int(ticks_elapsed // slice_ticks))
+            slice_end_tick = (slice_idx + 1) * slice_ticks
+            if slice_idx != current_slice:
+                current_slice = slice_idx
+                qty_remaining_at_slice_start = qty_remaining_decision
+            slice_target = qty_total / n_slices
+            filled_this_slice = qty_remaining_at_slice_start - qty_remaining_decision
+            slice_unfilled = max(0.0, slice_target - filled_this_slice)
+
+            if slice_unfilled > 1e-9 and qty_remaining_decision > 1e-9:
+                is_last_tick_of_slice = (ticks_elapsed + 1) >= slice_end_tick
+                # TWAPPolicy.act() computes this same continuous fraction, but the
+                # action space only has 5 discrete SIZE_FRACTIONS -- the real system
+                # snaps to the nearest one (scripts/phase2a_sanity_suite.py's
+                # _closest_size_frac_idx) before step() ever sizes an order. Skipping
+                # this rounding was the actual source of the mismatch
+                # test_subtract_twap_baseline_matches_real_twap_policy_exactly caught
+                # (an 0.02bps drift from using the un-rounded continuous fraction).
+                frac_of_remaining = min(1.0, slice_unfilled / qty_remaining_decision)
+                size_frac = min(SIZE_FRACTIONS, key=lambda f: abs(f - frac_of_remaining))
+
+                if is_last_tick_of_slice:
+                    # MARKET, forcing this slice's completion -- tears down any
+                    # resting order first, exactly as step()'s own MARKET path does.
+                    resting = None
+                    resting_price = None
+                    resting_side = None
+                    # Actual requested quantity uses the LIVE (post-evolution)
+                    # qty_remaining, matching step()'s own self.qty_remaining
+                    # usage at the point it applies the action -- only the
+                    # DECISION (size_frac, above) uses the pre-evolution snapshot.
+                    mkt_qty = min(size_frac * qty_remaining, qty_remaining)
+                    if mkt_qty > 0:
+                        book_prices, book_sizes = (
+                            (tick.ask_prices, tick.ask_sizes) if side == 1
+                            else (tick.bid_prices, tick.bid_sizes)
+                        )
+                        level_fills, qty_unfilled = walk_market_fill(mkt_qty, book_prices, book_sizes)
+                        for level_price, level_qty in level_fills:
+                            episode_fills.append({"price": level_price, "qty": level_qty, "is_maker": False})
+                        filled_qty = mkt_qty - qty_unfilled
+                        qty_remaining = max(0.0, qty_remaining - filled_qty)
+                elif not resting_active_decision:
+                    # LIMIT at the touch (offset 0), same as TWAPPolicy.act().
+                    # Gated on the PRE-evolution resting snapshot, not the live
+                    # value -- if evolution just resolved a fill THIS tick,
+                    # TWAPPolicy.act() had already decided HOLD before it knew
+                    # that, and the real system honors that stale decision.
+                    if side == 1:
+                        price = round(tick.best_bid, 1)
+                        place_side = "bid"
+                        crossed = price >= tick.best_ask
+                    else:
+                        price = round(tick.best_ask, 1)
+                        place_side = "ask"
+                        crossed = price <= tick.best_bid
+                    size = min(size_frac * qty_remaining, qty_remaining)
+                    if size > 0:
+                        if crossed:
+                            book_prices, book_sizes = (
+                                (tick.ask_prices, tick.ask_sizes) if side == 1
+                                else (tick.bid_prices, tick.bid_sizes)
+                            )
+                            level_fills, qty_unfilled = walk_market_fill(size, book_prices, book_sizes)
+                            for level_price, level_qty in level_fills:
+                                episode_fills.append({"price": level_price, "qty": level_qty, "is_maker": False})
+                            filled_qty = size - qty_unfilled
+                            qty_remaining = max(0.0, qty_remaining - filled_qty)
+                        else:
+                            q_ahead = tick.qty_at_price(price, place_side)
+                            resting = QueueState(q_ahead=q_ahead, own_qty_remaining=size)
+                            resting_price = price
+                            resting_side = place_side
+                # else: decision snapshot already had a resting order -> HOLD,
+                # nothing to do this tick (matches the real one-tick lag).
+
+            if qty_remaining <= 1e-12:
+                break
+            tick_idx += 1
+            if (tick_idx - self._episode_start) >= self.horizon_ticks or tick_idx >= len(self._ticks):
+                break
+
+        terminal_tick_idx = min(tick_idx, len(self._ticks) - 1)
+        terminal_is = compute_implementation_shortfall(
+            side=side, fills=episode_fills, qty_total=qty_total,
+            arrival_price=self.arrival_price, terminal_mid_price=self._ticks[terminal_tick_idx].mid_price,
+            fee_bps_per_fill=self.fee_bps_per_fill,
+        )
+        return terminal_is.is_total_bps
 
     def _current_tick(self) -> TickView:
         return self._ticks[self._tick_idx]
@@ -864,7 +1037,14 @@ class LOBExecutionEnv(gym.Env):
                 arrival_price=self.arrival_price, terminal_mid_price=terminal_tick.mid_price,
                 fee_bps_per_fill=self.fee_bps_per_fill,
             )
-            r += -self.reward_weights.kappa * terminal_is.is_total_bps
+            # EXPERIMENTAL 5 (reward.py module docstring): baseline-subtracted
+            # for the REWARD only when enabled -- info["implementation_shortfall"]
+            # below still reports terminal_is UNCHANGED, the real, un-adjusted
+            # execution outcome. Only this scalar used for r is ever adjusted.
+            terminal_is_for_reward = terminal_is.is_total_bps
+            if self.reward_weights.subtract_twap_baseline and self._twap_shadow_terminal_is_bps is not None:
+                terminal_is_for_reward -= self._twap_shadow_terminal_is_bps
+            r += -self.reward_weights.kappa * terminal_is_for_reward
 
         obs = self._build_obs()
         info = self._build_info(
