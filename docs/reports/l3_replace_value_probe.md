@@ -409,6 +409,75 @@ avoids doing obviously worse.
   appear in the original version of this report at all. Both TWAP and best-B
   nominally beat it. Flagged plainly above, not resolved here.
 
+## v1 itself, re-tested at n=500
+
+Every comparison against v1 up to this point rested on its n=50 number
+(IS_total_bps=1.245). The best-B-vs-TWAP sign flip above is a direct
+demonstration of why that is not good enough on its own -- the "RL loses to
+trivial baselines" premise driving project direction deserved the same
+standard, not just best-B.
+
+**Checkpoint verified, not assumed:** `models/l3_executioner_v1.zip` currently
+holds sha256 `27afa91e...` -- the step-2,000,000 stand-in, NOT true v1
+(`973b2883...`, step 2,002,944, not recoverable -- see the checkpoint-overwrite
+incident in the entry below). This was checked directly before running
+anything, given this session's overwrite history. The stand-in was already
+verified (prior entry) to reproduce true v1's own reported n=50 numbers
+bit-for-bit, so this result is treated as representative of v1, with that
+provenance stated plainly rather than assumed.
+
+**Method:** identical 500-seed methodology to the best-B/TWAP comparison
+above -- same seeds (5,000,000..5,000,499), same val population, TWAP's
+per-episode IS reused directly from that run's own output (not recomputed) so
+the comparison is exactly poolable.
+
+**Result:**
+
+| | n=50 (prior reports) | n=500 (this entry) |
+|---|---|---|
+| IS_total_bps | 1.245 | 1.2607 (std 4.2423) |
+| fill_ratio | 0.918 | 0.8922 |
+| CANCEL_AND_REPLACE % | 0.30-0.36% | 0.27% |
+| vs TWAP mean diff | +0.063bps | **+0.3715bps** |
+| paired t | p=0.83-0.90 | **p=0.0327** |
+| Wilcoxon | p=0.53-0.72 | p=0.1150 |
+
+v1's own headline numbers barely moved (1.245->1.2607 IS, 0.918->0.892 fill,
+action distribution essentially unchanged) -- this is NOT the kind of
+sign-flip best-B showed. What changed is the COMPARISON against TWAP: the gap
+grew roughly 6x (0.063bps -> 0.372bps) and the paired t-test now clears the
+conventional 0.05 threshold. The Wilcoxon test does not (p=0.115) -- stated
+plainly rather than picking whichever test agrees with the headline: the two
+tests disagree here, which is itself informative (consistent with a
+real-but-modest, not uniformly-distributed-across-episodes effect, or with a
+distribution skewed enough that the mean-sensitive t-test and the
+rank-sensitive Wilcoxon diverge) rather than a clean, unanimous result.
+
+**Effect size, stated alongside the p-value as required:** +0.372bps is
+~8.5% of TWAP's own std (4.35bps) -- larger than best-B's 4% relative to
+TWAP but still modest in absolute terms, well within the noise band any
+single episode's outcome carries. This is exactly the kind of small,
+real-but-buried-in-variance signal Task 2's baseline-subtraction reward
+targets addressing for training, though that is a training-signal question,
+not an evaluation-methodology one -- proper power here required 10x the
+episodes specifically because the mean shift is small relative to per-episode
+noise.
+
+**Does "RL loses to trivial baselines" survive at proper power?** Partially,
+with the disagreement between tests stated honestly: TWAP beats v1 with
+p=0.033 by the parametric test, not quite by the nonparametric one (p=0.115).
+This is a MORE robust version of the same direction the milestone report
+already reported (v1 marginally worse than TWAP, not significant at n=50) --
+not a reversal like best-B's. The three-way point-estimate ordering at n=500
+is TWAP (0.889) < best-B (1.103) < v1 (1.261) -- v1 comes in worst of the
+three by point estimate, consistent across both this and the prior
+best-B/TWAP comparison, though only the TWAP-vs-v1 gap clears significance
+by one of two tests. Read this as meaningfully suggestive evidence that the
+RL policy underperforms simple baselines here, not as fully unanimous proof
+-- and as one more piece of context (alongside the milestone report's own
+near-parity framing) for whoever weighs whether this checkpoint's training
+setup is producing genuine execution skill.
+
 ## Fixed since the original version of this report
 
 `train_l3.py`'s hardcoded final-save path -- flagged below in its original
