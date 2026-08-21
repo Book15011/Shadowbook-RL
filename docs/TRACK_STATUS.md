@@ -5,39 +5,45 @@ Each session owns and updates only its own section -- merge on conflict,
 never overwrite another track's section.
 
 ## L1 -- Macro Analyst
-Last updated: 2026-08-19 19:20 HKT
-State: L1MacroAnalyst (architecture_spec.md Section 1.2: MacroRiskContext
-schema, cache/throttle/fail-closed maybe_refresh()) and a minimal
-orchestrator_graph.macro_tick() (Section 4.3, proves the L1-cache ->
-observation idx 17/18 path via the Phase 3 env stub hooks at the spec's
-L1_EVERY_N_TICKS=600 cadence) are built, unit-tested (11/11 passing,
-requests.post mocked throughout -- no real Ollama call anywhere yet), and
-committed locally as bb47856 (not pushed). Separately, the Ollama systemd
-unit had a wrong ExecStart path (/bin/ollama vs the real
-/usr/local/bin/ollama, crash-looping); fixed, reloaded, and confirmed
-serving (`curl localhost:11434/api/tags` -> `{"models":[]}`), with no GPU
-memory change (539 MiB before/after) -- infra fix only, not a repo commit.
-No l1_features.py / feature_summary-construction pipeline exists yet (not
-started). No real-model (Ollama) validation has been attempted -- explicitly
-paused per instruction, not blocked on anything technical.
-Files owned/in-progress: src/agents/l1_macro_analyst.py,
-src/agents/orchestrator_graph.py, tests/test_l1_macro_analyst.py,
-tests/test_orchestrator_graph.py (all committed, bb47856). No file
-currently in-progress/uncommitted on this track.
-Blocking/open questions: 14B vs 32B model choice still open -- only
-qwen2.5:14b-instruct-q4_K_M is pulled on disk (8.4GB); the spec's default,
-qwen2.5:32b-instruct-q4_K_M (~20-21GB VRAM), is not pulled and would need
-a fresh download plus confirmed GPU headroom before use. Real-model
-validation is also gated on the other session's live training settling
-(4090 has ~24GB total; do not want to contend with an active run).
-Next planned step: build the feature_summary construction pipeline
-(src/data/l1_features.py or similar) from data/raw_l1's already-collected
-klines/funding/open_interest into the rolling numeric summary
-L1MacroAnalyst.maybe_refresh() expects -- this can proceed independently
-of the model-size/GPU-headroom decision above. Real-model (Ollama)
-validation of L1MacroAnalyst stays paused until that decision + headroom
-are both confirmed.
-
+Last updated: 2026-08-21 23:18 HKT
+State: L1MacroAnalyst + orchestrator_graph.macro_tick() (committed bb47856, as before)
+and the Ollama systemd fix (infra only, not a repo commit, as before) are unchanged this
+round. NEW this round: src/data/l1_features.py (build_l1_feature_summary()) is built,
+tested, and committed (8d905e5) -- the point-in-time rolling numeric summary that turns
+data/raw_l1's collected klines_1m/funding_rate/open_interest into the feature_summary
+dict L1MacroAnalyst.maybe_refresh() consumes. Built only after inventorying the real
+data on disk directly (not assumed from the spec): klines_1m and funding_rate are
+gap-free with zero duplicate rows (full sweep, not sampled); open_interest has zero
+missing days but 263 consecutive days (2020-09-01..2021-05-21) with every row exactly
+duplicated (confirmed byte-identical, not assumed) -- deduplicated unconditionally on
+load. Order-book imbalance is deliberately NOT included -- data/raw_l1 has no book-depth
+data at all; real OBI belongs to the separate Bybit L2 pipeline that feeds L2/L3, and
+faking one from L1-only data would misrepresent a signal this module cannot see. Every
+derived field is explicitly None (not NaN) when its window lacks sufficient real
+coverage, so the eventual Ollama prompt never receives invalid JSON -- verified directly
+(json.dumps round-trip test, plus a real-data sanity run against actual data/raw_l1
+producing sensible, valid output end to end). 15 hand-computed tests, all passing.
+Also this round: authored CLAUDE.md (committed ca28939) -- repo-wide standing rules
+distilled from real incidents already logged across all three tracks' sections here
+(classifier-denial handling, canonical-checkpoint safety, this file's own merge
+discipline, live-verification-over-cached-citations, comment/code drift, judgment-call
+escalation, spec-vs-real-code precedence). Not L1-scoped work specifically, but
+authored from this track this round, recorded here for provenance.
+No real Ollama call has been made anywhere yet, unchanged -- still explicitly paused.
+Files owned/in-progress: src/agents/l1_macro_analyst.py, src/agents/orchestrator_graph.py
+(bb47856); src/data/l1_features.py, tests/test_l1_features.py (8d905e5);
+tests/test_l1_macro_analyst.py, tests/test_orchestrator_graph.py (bb47856); CLAUDE.md
+(ca28939, repo root). Nothing currently uncommitted on this track.
+Blocking/open questions: 14B vs 32B model choice still open, unchanged -- only
+qwen2.5:14b-instruct-q4_K_M is pulled (8.4GB); the spec's default 32B variant is not
+pulled and needs both a fresh download and confirmed GPU headroom. Real-model validation
+stays gated on both that decision and the other tracks' live GPU work settling.
+Next planned step: two independent options, neither gated on the model-size decision --
+(a) wire orchestrator_graph.macro_tick() to call build_l1_feature_summary() instead of
+accepting a caller-supplied feature_summary dict directly (closes the last plumbing gap
+between real data and the live orchestration path); (b) once GPU headroom and the 14B/32B
+decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
+L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
 Last updated: 2026-08-21 22:42 HKT
 State: Consolidation round -- no new features, no training. DONE: FrozenL3Wrapper
