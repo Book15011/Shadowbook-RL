@@ -1,15 +1,239 @@
 # Phase 4 prep, L2 (Strategist) track: reconciliation + integration plan
 
-Read-only reconciliation of architecture_spec.md Section 4.1's FrozenL3Wrapper/train_l2.py
-reference code against the real, current `LOBExecutionEnv` (`src/envs/lob_execution_env.py`,
-916 lines as of this writing) and `RewardWeights`/`step_reward` (`src/envs/reward.py`). No code
-written yet -- this is the design doc called for before FrozenL3Wrapper/train_l2.py are built.
-
-Precedent: `train_l3.py`'s own module docstring already did this exact reconciliation for L3's
-own constructor call (`tier=`, `l2_override=`, `seed=` on the constructor -- none real). This
-doc is the same exercise for the L2/L3 boundary Section 4.1 describes.
+Reconciliation of architecture_spec.md Section 4.1's FrozenL3Wrapper/train_l2.py reference
+code against the real `LOBExecutionEnv` (`src/envs/lob_execution_env.py`) and
+`RewardWeights`/`step_reward` (`src/envs/reward.py`), the resulting design, and its
+implementation. `FrozenL3Wrapper` (`src/envs/wrappers.py`) and `src/train/train_l2.py` are
+now both built, tested, and smoke-tested -- see CURRENT STATE below for where things
+actually stand; the DECISION TRAIL further down preserves the full reasoning that got here,
+including reasoning later corrected or superseded, rather than deleting it.
 
 ---
+
+## CURRENT STATE (as of 2026-08-21, this round) -- read this first
+
+### Snapshot
+
+Built, tested, committed locally (not pushed): `src/envs/wrappers.py::FrozenL3Wrapper`,
+`src/train/train_l2.py`, `tests/test_wrappers.py` (20/20 passing). A 200-step mechanics-only
+smoke test ran end-to-end against the current checkpoint with no shape/interface errors.
+**L2 cannot launch a real training run yet** -- not because anything on L2's side is
+unfinished, but because the L3 track is running matched A/B training and has not yet landed
+on a final frozen checkpoint (see "What's blocking" below). When it does, only
+`--l3-checkpoint`/`--l3-vecnormalize` need to change on L2's side.
+
+### What's built
+
+- **`src/envs/wrappers.py::FrozenL3Wrapper`** -- the entire L2/L3 integration layer (the
+  real env has none of Section 4.1's assumed tier-native support, see Decision Trail Part A).
+  Implements: the action-space transform, the observation-space downsampling below, VecNormalize
+  applied to the frozen L3 policy's own inputs, and explicit LSTM state/`episode_start`
+  threading across the inner tick loop.
+- **`src/train/train_l2.py`** -- SAC wiring against `FrozenL3Wrapper`. CLI requires
+  `--l3-checkpoint`/`--l3-vecnormalize`/`--total-timesteps` explicitly (no defaults, so a real
+  run can't be launched by omission). No reward-override flags -- see "Reward function" below.
+- **`tests/test_wrappers.py`** -- 19 fast hand-computed-fixture tests (no GPU) + 1 gated
+  integration smoke test against the real current checkpoint.
+- **Smoke test** (2026-08-20, `git log` `87d7ba7`): 200 `total_timesteps`, ran cleanly
+  end-to-end, no shape/interface errors between the wrapper and SAC. Validated **wiring**,
+  not policy quality -- see "Checkpoint identity" below for why this holds regardless of
+  which checkpoint bytes were actually loaded.
+
+### Checkpoint identity -- corrected
+
+The prior report on the smoke test cited it as running against sha256 `973b2883...` and
+called this "matches L3's own recorded checksum." **Accurate when written, now stale --
+corrected here, not retracted.** Both the smoke test's own live-computed hash (`train_l2.py`'s
+`_sha256()` reads the file's actual bytes at runtime, never hardcoded) and
+`docs/TRACK_STATUS.md`'s L3 entry independently agreed on `973b2883...` at the time (smoke
+test artifacts timestamped 2026-08-20 20:49 HKT).
+
+What happened after: per `docs/TRACK_STATUS.md`'s L3 section (its own 2026-08-20 23:05 HKT
+correction, and the fuller incident writeup further down the same section), a separately
+launched L3-track probe run was, for the first time, allowed to run all the way to its own
+final save -- and `train_l3.py`'s save path is hardcoded, so that save silently overwrote
+`models/l3_executioner_v1.zip` at ~22:42 HKT the same day (confirmed via the file's mtime --
+about two hours after the smoke test ran). The true `973b2883...` bytes were never backed up
+and are not recoverable. The canonical path now holds sha256 `27afa91e...` -- L3's own
+step-2,000,000 periodic checkpoint from the *same* original training run (2,944 steps short
+of the true final save), restored as a verified stand-in: L3's own reproduction eval against
+it reproduced `IS_total_bps=1.245`/`fill_ratio=0.918`, bit-for-bit identical to what
+`973b2883...` itself printed live during training. **Re-verified directly this round**
+(`sha256sum`): the file at `models/l3_executioner_v1.zip` right now is exactly `27afa91e...`.
+
+**Why this doesn't invalidate the smoke test:** the smoke test's purpose was to catch
+shape/interface bugs between `FrozenL3Wrapper` and SAC -- wiring, not policy quality. Whether
+observation shapes matched, VecNormalize applied correctly, and LSTM state threaded correctly
+does not depend on which specific checkpoint bytes were loaded. The result stands; only the
+citation of which exact file it ran against needed correcting.
+
+### Final L2 observation space
+
+`Box(shape=(41,), dtype=np.float32)` -- 40 features downsampled from the base env's 42-dim
+vector (indices 15/16 excluded -- L2 produces them) plus `schedule_deviation`. Full
+per-feature aggregation rule (last-value / instantaneous / mean-over-window / pass-through)
+and rationale in Decision Trail, FINAL SPEC Step 2. Index-mapping table (implemented
+verbatim in `wrappers.py`):
+
+| New pos | Old idx | Feature | Transform | Range |
+|---|---|---|---|---|
+| 0 | 0 | `time_remaining_norm` | instantaneous | [0,1] |
+| 1 | 1 | `inventory_remaining_norm` | instantaneous | [-1,1] |
+| 2 | 2 | `spread_norm` | mean/50-tick window | [0,1] |
+| 3 | 3 | `mid_return_1s_z` | last value | [-5,5] |
+| 4 | 4 | `mid_return_5s_z` | last value (= since-last-decision, exact match) | [-5,5] |
+| 5 | 5 | `realized_vol_60s_z` | last value | [-5,5] |
+| 6 | 6 | `OBI_1` | mean/window | [-1,1] |
+| 7 | 7 | `OBI_5` | mean/window | [-1,1] |
+| 8 | 8 | `OBI_10` | mean/window | [-1,1] |
+| 9 | 9 | `micro_mid_dev_ticks` | mean/window | [-5,5] |
+| 10 | 10 | `cancel_add_ratio_bid` | pass-through (always 0.0) | [0,5] |
+| 11 | 11 | `cancel_add_ratio_ask` | pass-through (always 0.0) | [0,5] |
+| 12 | 12 | `trade_flow_imbalance_5s` | last value (= since-last-decision, exact match) | [-1,1] |
+| 13 | 13 | `queue_position_ratio` | instantaneous | [-1,1] |
+| 14 | 14 | `ticks_since_own_fill_norm` | instantaneous | [0,1] |
+| 15 | 17 | `l1_risk_score` | instantaneous (~constant within window) | [-1,1] |
+| 16 | 18 | `l1_confidence` | instantaneous (~constant within window) | [0,1] |
+| 17-36 | 19-38 | `book_depth_norm_0..19` | mean/window, per level | [-5,5] |
+| 37 | 39 | `funding_rate_z` | instantaneous (exactly constant per episode) | [-5,5] |
+| 38 | 40 | `taker_buy_sell_ratio_1m` | last value | [-1,1] |
+| 39 | 41 | `own_open_orders_norm` | instantaneous | [0,1] |
+| 40 | -- | `schedule_deviation` (computed) | see below | [-1,1] |
+
+**`l2_include_prev_action` toggle (default OFF)**: optionally appends
+`prev_participation_rate_mult` ([0,2]) and `prev_urgency` ([0,1]) -- raw copies of L2's own
+last action -- making the observation `Box(shape=(43,))`. Originally recommended default ON
+on a "recurrent-policy precedent" basis; **corrected before implementation** -- that
+precedent applies to genuinely recurrent architectures, not SAC's plain `MlpPolicy`, and the
+closer in-repo precedent excludes action history and flags itself as untested for off-policy
+methods. Implemented as `False` by default in `wrappers.py`; the toggle itself stays as a
+legitimate future ablation, framed as an open empirical question, not precedent-backed
+guidance.
+
+**`schedule_deviation`, corrected mechanism**: `(qty_total - qty_remaining)/qty_total -
+twap_baseline`, clipped to `[-1,1]`. The design doc originally described `twap_baseline` as
+read via `env._compute_l2_target_slice_ratio()`. **This was a real bug, caught during
+implementation, not a style choice**: that hook silently returns whatever override is
+currently set rather than the default TWAP formula, once the override is non-None -- which
+it always is after the wrapper's first-ever `step()`. Calling it post-window would have
+collapsed `schedule_deviation` to ~0 (executed-so-far minus itself) after the very first
+window. Fixed in `wrappers.py` by recomputing the same formula directly from the env's
+*public* `info["ticks_elapsed"]` (present on every `step()`/`reset()` return) and the public
+`horizon_ticks` attribute -- no private-attribute coupling, and mathematically correct
+regardless of override state.
+
+**Action-space transform (implemented, not in the original design doc)**:
+`Box(low=[0,0], high=[2,1])`, matching architecture_spec.md Section 3.2 exactly.
+`participation_rate_multiplier` scales the env's own default TWAP baseline into
+`l2_target_slice_ratio_override` (0 = defer, 1 = on-schedule, up to 2 = catch-up burst) --
+**not** a 1:1 map onto that attribute's own `[0,1]` range. `urgency` *is* a direct 1:1 map
+(its action-space range already matches `env.l2_urgency`'s). The multiplier-relative-to-a-
+baseline design mirrors L1's own real `urgency_multiplier` (`src/agents/l1_macro_analyst.py`:
+`Field(ge=0.5, le=2.0)`, "a direct, bounded multiplier applied to L2's participation-rate
+target" per architecture_spec.md) -- an established pattern in this project, not invented
+for this wrapper.
+
+### Final SAC hyperparameters
+
+Implemented in `train_l2.py`, each commented with its provenance so the script doesn't read
+as if everything in it was independently checked:
+
+| Param | Value | Provenance |
+|---|---|---|
+| `buffer_size` | 500,000 | **Derived + re-confirmed** for L2's real 60-decisions/episode cadence: ~8,333 episode-equivalents of buffer coverage, ~25% of the full 2M-step run. |
+| `gamma` | 0.995 | **Derived + re-confirmed** on L2's own cadence (not L3's tick-level reasoning): effective horizon ~3.3x the episode length, defensible given the terminal-IS-dominated reward. |
+| `batch_size` | 256 | Section 4.1 reference value, carried over as-is -- never independently derived for L2. |
+| `tau` | 0.005 | Same. |
+| `learning_rate` | 3e-4 | Same. |
+| `train_freq` | 1 | Same. |
+| `gradient_steps` | 1 | Same. |
+
+`ticks_per_l2_decision=50` (Section 4.1 and 4.3 both settled at 50 -- moderate, not high,
+confidence; Section 4.3's fix was an unexplained one-line edit). `train_dates=405`,
+independently verified against the real persisted split artifact
+(`data/splits/l2_bybit_btcusdt_split.json`), not the spec's own illustrative example.
+
+### Reward function -- L2 has none of its own
+
+`FrozenL3Wrapper.step()` aggregates L3's existing per-tick `reward.step_reward()` output
+as-is (`agg_reward` summed across the window) -- no new L2-specific term anywhere. There is
+therefore no L2-analogous surface to `train_l3.py`'s `--reward-zeta`/`--reward-eta-replace`
+override flags to mirror; `train_l2.py` deliberately does not override the underlying env's
+`reward_weights` (left at `RewardWeights()`'s own default), which also happens to match what
+the current frozen L3 checkpoint was actually trained under.
+
+### Two decisions on deferred items (Step 2, this round) -- decided, not implemented
+
+Both were correctly out of scope for "wiring only" when deferred. Decided now so whoever
+picks this up next isn't re-deriving them.
+
+**(a) VecNormalize on L2's own observation/reward space** (distinct from the frozen L3
+stats the wrapper already applies to L3's *inputs* -- this is about SAC's own inputs).
+**Recommend adding it. Does not block further design or a mechanics smoke test; should be
+added before committing to a real full-budget run.**
+
+Reasoning: Section 4.1's reference `train_l2.py` snippet doesn't wrap `env` in
+`VecNormalize` at all, unlike its L3 counterpart -- but given how much *else* in that same
+reference snippet turned out to be either wrong (`tier=`, `l2_action_space`, etc.) or simply
+incomplete, its silence here reads as another gap, not a considered design choice, and
+shouldn't be trusted as one. Separately, and more concretely: L2's 41-dim observation is
+*not* uniformly one statistical character the way L3's raw 42-dim vector is. 25 of its 41
+dims (the 20 book-depth dims plus `spread_norm`/`OBI_1`/`OBI_5`/`OBI_10`/
+`micro_mid_dev_ticks`) are *means* over a 50-tick window -- averaging mechanically reduces
+variance relative to a single fresh tick -- while the other 15 carried-over dims (the
+instantaneous/last-value groups) retain full single-tick variance, and `schedule_deviation`
+is a genuinely new, non-stationary scalar whose typical magnitude shifts as training
+progresses (exactly the "slow drift" architecture_spec.md's own Section 3.1 cites as
+`VecNormalize`'s second purpose, beyond static per-feature clipping). This heterogeneity is,
+if anything, a *stronger* case for adaptive normalization than L3's own already-homogeneous
+per-tick vector. SAC also benefits from reward normalization independently of the
+observation question -- L2's `agg_reward` is a sum of up to 50 raw per-tick rewards, a
+mechanically different scale/variance than a single-tick reward. Cost to add is low (the
+same `VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=0.995)` pattern
+L3 already uses). It doesn't block wiring correctness (the smoke test's shape/interface
+validation holds either way), but retrofitting normalization after a long run has already
+accumulated buffer data would be wasteful -- so: before the real budget, not before further
+design work.
+
+**(b) A held-out eval callback analogous to L3's `ValISEvalCallback`.**
+**Recommend building one. Unlike (a), this DOES block a real full-budget run.**
+
+Reasoning: without any periodic evaluation, there is no way to tell *during* a long run
+whether L2 is learning anything useful, diverging, or performing no better than a trivial
+fixed baseline (e.g. always outputting `participation_mult=1.0`/`urgency=0.5`, i.e. pure
+TWAP passthrough) -- and no way to catch a problem early rather than only at the very end.
+This matters more for L2 than it might otherwise: the wrapper's mechanism is structurally
+expensive per SAC "step" (`train_freq=1`/`gradient_steps=1` means a gradient update on
+every single L2 decision, and each L2 decision costs up to 50 real `L3.predict()` +
+`env.step()` calls, not one cheap gym step) and the current design runs a single env, no
+parallelism. The smoke test observed roughly 4-5 fps -- explicitly not being treated as a
+validated performance number here (per this round's own instruction not to extrapolate from
+it), but the *structural* reason for that throughput (the per-decision cost above) is not
+something scale alone fixes, and if that order of magnitude holds even roughly at real
+scale, a full 2,000,000-step run would plausibly take multiple days of wall-clock time on
+a single env. Launching a multi-day run with zero visibility into whether it's working
+would be a real risk, not a hypothetical one. Recommend a *simpler* version than L3's full
+`ValISEvalCallback` -- periodic rollout over a small fixed held-out seed set, comparing L2's
+aggregate outcome against a fixed TWAP-passthrough baseline action -- not full parity with
+L3's paired-seed significance-testing machinery, to keep scope proportionate to what's
+actually needed to catch a broken run early. (Also worth a future look, though not part of
+this decision: whether the single-env, no-parallelism design itself should change before a
+real run, given the throughput implication above -- flagged as a related open question, not
+decided here.)
+
+### What's currently blocking
+
+**L3's matched A/B training runs, which will determine the final frozen L3 checkpoint.**
+L2's own design and code are otherwise ready. When the A/B result lands, the only things
+that need to change on L2's side are `--l3-checkpoint` and `--l3-vecnormalize` -- everything
+else (observation space, action-space transform, hyperparameters, wrapper mechanics) is
+independent of which specific checkpoint wins. Two decisions above ((a) VecNormalize, (b)
+eval callback) are recommended before a *real* run specifically, not before the A/B result
+lands -- they can be built in parallel with waiting, if useful.
+
+---
+
+## DECISION TRAIL (historical -- preserved for context; the reasoning that got to CURRENT STATE above, including reasoning later corrected or superseded, kept rather than deleted)
 
 ## Part A -- Reconciliation
 
@@ -221,6 +445,11 @@ is unaffected by L3's own VecNormalize reward scaling).
 Flagging this now since it's the kind of gap that would otherwise surface only as "L2 training
 mysteriously doesn't work" much later.
 
+*[Implemented -- see CURRENT STATE above. `wrappers.py` loads the actual saved `.pkl` via
+`DummyVecEnv` + `VecNormalize.load()` rather than a hand-rolled `obs_rms` loader as
+illustrated above; verified in `tests/test_wrappers.py` against the exact SB3 formula with
+known stats.]*
+
 ### B.4 Other minor gaps/fragilities in the illustrative code above
 
 - `self.env._compute_l2_target_slice_ratio()` and `self.env._build_obs()` are both
@@ -232,6 +461,12 @@ mysteriously doesn't work" much later.
   `episode_start=`) silently drops LSTM recurrence for a `RecurrentPPO` policy -- this is a
   correctness gap in the reference code itself, not just an API-naming mismatch. The plan above
   threads `state=`/`episode_start=` explicitly and resets both in `reset()`.
+
+*[Implemented -- see CURRENT STATE above. The private-method coupling flagged here for
+`_compute_l2_target_slice_ratio()` was ultimately avoided entirely, not just accepted: the
+implemented `schedule_deviation` mechanism reads only public `info`/`horizon_ticks` state --
+see CURRENT STATE's "schedule_deviation, corrected mechanism" for why the private hook
+turned out to be actively wrong to use here, not just stylistically undesirable.]*
 
 ### B.5 `ticks_per_l2_decision=50` given the real `tick_interval_s`
 
@@ -366,6 +601,10 @@ anything it was trained against). This doc uses the Section 4.1 training-time va
 4.3 discrepancy as a separate open question, not resolving it here (it needs a judgment call,
 not arithmetic, and isn't blocking the derivations below).
 
+*[Resolved in the FINAL SPEC round below -- Section 4.3 was patched to 50, matching Section
+4.1. Superseded, not retracted: this flag turned out to matter, and the resolution's own
+confidence level is discussed there.]*
+
 ### B.2 `buffer_size=500_000` -- confirmed as reasonable, with arithmetic
 
 Each L2 episode (one parent order = one env episode) yields at most 60 L2-cadence transitions
@@ -470,6 +709,9 @@ flag above), idx 4/12's fixed 5s windows would stop lining up with the decision 
 Noting this explicitly rather than silently relying on a coincidence that could silently break
 under a config change nobody thinks to re-check.
 
+*[This "coincidence" turned out to be an exact match, not a coincidence -- Section 4.3 was
+patched to 50, matching 4.1, per the FINAL SPEC round below.]*
+
 ### C.2 What is genuinely missing from the 42-dim vector for L2's purposes
 
 - **TWAP-schedule deviation** -- Section 3.1 explicitly calls for this, and it does not exist
@@ -487,6 +729,12 @@ under a config change nobody thinks to re-check.
   `qty_remaining` before/after its own inner tick loop) without any env change.
 - Time-remaining-in-episode is **not** missing -- idx 0 `time_remaining_norm` already covers
   it identically for both tiers; not duplicating it.
+
+*[The `_compute_l2_target_slice_ratio()`-based mechanism sketched above for TWAP-schedule
+deviation was later found to be a real bug once the override is ever set -- see CURRENT
+STATE's "schedule_deviation, corrected mechanism" and B.4's implementation note above.
+"Fill progress since L2's own last decision" was NOT carried into the FINAL SPEC or the
+implementation -- see 2d below for why.]*
 
 ### C.3 Concrete proposed observation space
 
@@ -512,6 +760,10 @@ supply for free from state it already has to touch. A true temporally-downsample
 (rolling mean/std of all 42 dims over each 50-tick window) is left as a documented future
 enhancement, to be built only if this simpler version proves empirically insufficient once L2
 training can actually run -- not built preemptively against an unvalidated need.
+
+*[Superseded by the FINAL SPEC round below -- this 44-dim shape (raw 42-dim vector + 2
+scalars) was replaced by the genuine downsampling this section considered "future
+enhancement," once the next round's task explicitly asked for it built for real.]*
 
 ## Summary of this round
 
@@ -663,6 +915,13 @@ by the live env; this is arithmetic the wrapper performs on values it already ha
 anyway (it already reads/overrides `l2_target_slice_ratio_override` per this doc's original
 Part B design).
 
+*[This mechanism was a real bug, caught during implementation -- see CURRENT STATE's
+"schedule_deviation, corrected mechanism." `env._compute_l2_target_slice_ratio()` does NOT
+read "the env's own default linear-TWAP path" once the wrapper has ever set the override
+(which is always, after its first step()) -- it short-circuits to echo the override back.
+Fixed by recomputing the formula from public `info`/`horizon_ticks` state instead of calling
+this hook at all.]*
+
 #### 2c. Previous-action-as-input -- explicit, separate toggle (not silently baked in)
 
 **Could not locate the referenced precedent.** Searched the repo (`find ... -iname '*.pdf'`)
@@ -700,6 +959,11 @@ consecutive decisions, since the policy can see and smooth relative to its own l
 -- not sourced from a specific paper here, flagged above. The toggle exists so this can be
 turned off cheaply as an ablation if it doesn't help empirically, without touching the rest
 of the observation-space design.
+
+*[Default corrected to OFF before implementation -- see the Correction section below and
+CURRENT STATE above. The "recurrent policy" precedent this recommendation leaned on doesn't
+transfer to SAC's plain MlpPolicy the way implied; the closer in-repo precedent excludes
+action history and flags itself as untested for off-policy methods.]*
 
 #### 2d. Final dimension count -- stated explicitly
 
@@ -784,6 +1048,17 @@ resolves. **This design doc's observation-space and hyperparameter spec above is
 on its own terms**, but actually starting `FrozenL3Wrapper`/`train_l2.py` implementation
 still depends on that separate, still-open call.
 
+**CORRECTION (2026-08-21): the sha256 `973b2883...` cited immediately above is stale.** It
+was accurate when written (both this session's live-computed hash and
+`docs/TRACK_STATUS.md`'s then-current L3 entry agreed) but was superseded the same day when a
+later L3-track probe run overwrote `models/l3_executioner_v1.zip` at its own final save
+(~22:42 HKT, per file mtime -- well after this entry was written). The true `973b2883...`
+bytes are unrecoverable; the canonical path now holds sha256 `27afa91e...` (L3's own
+step-2,000,000 periodic checkpoint from the same original run, numerically verified
+equivalent). Full corrected account in CURRENT STATE above -- this note exists so this
+specific paragraph doesn't mislead a reader scanning history, not to restate the full story
+twice.
+
 ## Summary of this round
 
 Step 1: cadence conflict confirmed resolved in the spec (moderate confidence -- bare one-line
@@ -817,3 +1092,29 @@ either default; recording the correction and its stated reason here rather than
 constructing a new rationale to fill the gap.
 
 `FrozenL3Wrapper` in `src/envs/wrappers.py` implements the corrected default directly.
+
+---
+
+## Implementation round (2026-08-20): FrozenL3Wrapper + train_l2.py built and smoke-tested
+
+Not previously recorded in this doc -- summarized here for completeness; full detail in
+`git log` (`1603c61` wrapper+tests, `87d7ba7` train_l2.py) and `docs/TRACK_STATUS.md`'s L2
+section.
+
+Built `src/envs/wrappers.py::FrozenL3Wrapper` and `tests/test_wrappers.py` (20 tests, all
+passing -- 19 fast hand-computed-fixture/mechanics tests with a tiny freshly-initialized
+`RecurrentPPO` and no GPU, plus 1 gated integration smoke test against the real checkpoint).
+Two correctness-critical pieces from B.3/B.4 above implemented and tested: VecNormalize
+loaded from the actual saved `.pkl` (not hand-reconstructed) and applied to every raw L3
+observation before `predict()`; LSTM `state=`/`episode_start=` threaded explicitly across
+the inner tick loop, including across L2 window boundaries within the same episode. One real
+bug caught during implementation that this doc's earlier B.2/2b sketches did not anticipate:
+`schedule_deviation`'s TWAP baseline cannot be read via
+`env._compute_l2_target_slice_ratio()` post-override -- see CURRENT STATE above for the
+corrected mechanism.
+
+Built `src/train/train_l2.py` (SAC wiring against `FrozenL3Wrapper`) and ran a 200-step
+mechanics-only smoke test against the then-current checkpoint. Established during this round,
+also not previously recorded here: L2 has no reward function of its own (the wrapper
+aggregates L3's existing per-tick reward as-is), so there is no L2-analogous surface to
+`train_l3.py`'s `--reward-zeta`/`--reward-eta-replace` flags.

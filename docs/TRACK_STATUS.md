@@ -39,69 +39,51 @@ validation of L1MacroAnalyst stays paused until that decision + headroom
 are both confirmed.
 
 ## L2 -- Strategist
-Last updated: 2026-08-20 10:44 HKT
-State: FINAL design spec produced for observation space + SAC hyperparameters -- no code
-written yet, this is still the planning phase. Step 1: re-read architecture_spec.md Section
-4.1/4.3 fresh (via git diff, not memory) -- confirmed the Section 4.1-vs-4.3 L2 cadence
-conflict flagged last round is fixed (L2_EVERY_N_TICKS is now 50, matching
-ticks_per_l2_decision=50), though the fix itself is a bare one-line edit with no restated
-rationale ("# I just change here") -- treating as resolved with moderate, not high,
-confidence, matching how this was framed going in. Grepped the whole real repo (configs/,
-src/, tests/, scripts/) for any other hardcoded 10-tick/1s L2 assumption: found none;
-configs/sac_l2.yaml exists but is an empty placeholder with no cadence or hyperparameter
-values at all. Step 2: built a concrete L2 observation space -- Box(shape=(41,)) base
-(Section 3.1's literal requirement: 40 features from the 42-dim vector, each individually
-assigned an aggregation rule -- last-value/instantaneous/mean-over-window/pass-through,
-grouped and justified by feature type, not one blanket rule -- plus 1 new
-schedule_deviation scalar, confirmed computable from existing env state
-(_compute_l2_target_slice_ratio() still the right hook, re-verified against the current,
-further-changed working tree) with zero new instrumentation needed) or Box(shape=(43,))
-recommended (adds an explicit, separately-flagged previous-action toggle,
-l2_include_prev_action, default ON, with reasoning -- SAC's plain MlpPolicy has no
-recurrence to fall back on unlike L3's LSTM). Could NOT locate "the recurrent-policy paper
-in this project's own PDFs" referenced in the handoff -- searched the whole box, no PDFs
-exist anywhere in this repo; flagged rather than guessed which paper was meant or
-fabricating a citation. Full index-mapping table (old idx -> new position -> transform) in
-the design doc. Step 3: buffer_size=500,000 and gamma=0.995 re-confirmed unchanged (both
-already assumed the 50-tick cadence throughout); PROVISIONAL dropped for the cadence-related
-reason specifically. Noted the dimensionality change (41->43) doesn't warrant any net_arch
-change from SB3's SAC default (256,256) -- too small a change (~5% wider input layer) to
-matter. Separately (not required this round, surfaced while re-reading the env code): the
-L3 track's full 2,000,000-step warm-start run has COMPLETED since last check-in --
-checkpoint identity is now resolved on that track too (models/l3_executioner_v1.zip,
-sha256 973b2883...), but a new, different judgment call has replaced it there (is a
-near-parity-with-TWAP result good enough to build on) -- not something this design doc
-resolves.
-Files owned/in-progress: none (still read-only/planning). Same file,
-docs/reports/phase4_l2_reconciliation_and_plan.md, now with a "FINAL SPEC" section appended
-covering Steps 1-3 above.
-Blocking/open questions: (1) awaiting a pointer to the specific recurrent-policy paper
-referenced for Step 2c, if the previous-action-toggle recommendation should incorporate it
-specifically rather than this session's own general reasoning. (2) implementation
-(FrozenL3Wrapper/train_l2.py) still depends on the L3 track's separate, still-open item (f)
-(is the current checkpoint's near-parity-with-TWAP result good enough to build on) -- this
-design doc's own content is final regardless of how that resolves, but starting real
-training is not yet cleared.
-Next planned step: once item (2) above is cleared, implement FrozenL3Wrapper (per this doc's
-original wrapper-only mechanism, Part B) and train_l2.py, using the FINAL SPEC section's
-observation space and hyperparameters directly -- no further design work anticipated before
-that.
-
-IMPORTANT correction from L3 (2026-08-20 23:05 HKT): the sha256 973b2883... referenced
-above is NO LONGER what's in models/l3_executioner_v1.zip -- see the incident writeup in
-the L3 section below before treating that checksum as current. Short version: a bounded
-probe launched from this track accidentally overwrote the working-slot checkpoint (every
-train_l3.py run saves to the same hardcoded path regardless of run type, and this track
-did not back up 973b2883... first before launching -- a real process gap, owned below).
-The true 973b2883... file cannot be recovered byte-for-byte. What's in the working slot
-right now (sha256 27afa91e...) is v1's own periodic checkpoint from 2,944 steps earlier
-in the same training run -- verified via full reproduction to match the officially
-reported v1 numbers (IS_total_bps=1.245, fill_ratio=0.918) exactly, so it is a faithful,
-numerically-confirmed stand-in, not a guess. If you have not yet pointed FrozenL3Wrapper
-at a specific file, no action needed -- 27afa91e... is safe to treat as "the v1 checkpoint"
-going forward. If you already loaded/hashed 973b2883... somewhere and are relying on that
-exact checksum, that specific artifact is gone; the behavioral numbers it reported are not
-in question, only the exact bytes.
+Last updated: 2026-08-21 22:42 HKT
+State: Consolidation round -- no new features, no training. DONE: FrozenL3Wrapper
+(src/envs/wrappers.py), train_l2.py, tests/test_wrappers.py (20/20 passing) are all built,
+committed locally, and smoke-tested (200-step mechanics-only run, no shape/interface
+errors between the wrapper and SAC). Design doc (docs/reports/
+phase4_l2_reconciliation_and_plan.md) reorganized this round -- a "CURRENT STATE" section
+now sits at the top and reads standalone, with the full decision trail (including reasoning
+later corrected or superseded) preserved below it rather than interleaved.
+Checkpoint-citation correction (thanks to L3's own proactive note on this section, folded
+in here): the smoke test's earlier reported sha256 973b2883... was genuinely live-computed
+and accurate at the time (20:49 HKT that day) -- it went stale ~2 hours later when a
+separate L3-track probe run's own final save overwrote models/l3_executioner_v1.zip
+(confirmed via file mtime and TRACK_STATUS's own incident writeup). Re-verified directly
+this round: the canonical path now holds sha256 27afa91e... (L3's numerically-verified
+step-2,000,000 stand-in). Corrected everywhere this track owns it (design doc, this
+section); nothing in wrappers.py/train_l2.py/test_wrappers.py needed correction since none
+of them ever hardcoded a checksum -- all checked, all compute/reference by path, not by
+hash. The smoke test's own validity is unaffected: it tested wiring, not policy quality.
+Two items flagged last round as deliberately deferred are now decided (not implemented):
+(a) VecNormalize on L2's OWN observation/reward space (distinct from the frozen L3 stats
+already applied to L3's inputs) -- recommend adding before a real run, does not block
+further work; L2's 41-dim obs mixes window-averaged features (lower variance) with
+instantaneous ones (full variance) plus a genuinely non-stationary new scalar
+(schedule_deviation), arguably a stronger case for adaptive normalization than L3's own
+already-homogeneous vector. (b) A held-out eval callback analogous to L3's
+ValISEvalCallback -- recommend building one, and unlike (a) this DOES block a real run: the
+wrapper's mechanism is structurally expensive per SAC step (a gradient update on every
+single L2 decision, each costing up to 50 real L3-predict+env.step calls, single env, no
+parallelism), so a real 2,000,000-step run could plausibly take multiple days of wall-clock
+time with zero visibility into whether it's working without one. Full reasoning for both in
+the design doc's CURRENT STATE section.
+Files owned/in-progress: none uncommitted. src/envs/wrappers.py, src/train/train_l2.py,
+tests/test_wrappers.py all committed (1603c61, 87d7ba7). docs/reports/
+phase4_l2_reconciliation_and_plan.md reorganized and committed this round.
+Blocking/open questions: L3's matched A/B training runs, which will determine the final
+frozen L3 checkpoint -- this is now the ONLY thing blocking a real L2 training launch. When
+the A/B result lands, only --l3-checkpoint/--l3-vecnormalize need to change on L2's side;
+everything else (observation space, action-space transform, hyperparameters, wrapper
+mechanics) is independent of which specific checkpoint wins. Separately, not blocking: (a)
+and (b) above are recommended before a REAL full-budget run specifically, not before the
+A/B result lands -- could be built in parallel with waiting, if useful.
+Next planned step: awaiting the L3 A/B result. Candidate parallel work if useful before
+then: build the VecNormalize wrapping and/or the simplified held-out eval callback decided
+above (neither implemented yet, both are "decided, not built"). No training launch planned
+until both the checkpoint question resolves and, ideally, (b) exists.
 
 ## L3 / Env-Physics
 Last updated: 2026-08-21 20:40 HKT
