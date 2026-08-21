@@ -86,7 +86,32 @@ above (neither implemented yet, both are "decided, not built"). No training laun
 until both the checkpoint question resolves and, ideally, (b) exists.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-21 20:40 HKT
+Last updated: 2026-08-21 23:20 HKT
+State: GPU work IN PROGRESS -- matched A/B test of the TWAP-baseline reward
+(docs/reports/l3_twap_baseline_reward.md, Task 2 below). Two sequential 8-env
+RecurrentPPO runs, both warm-started (weights only) from the canonical checkpoint
+models/l3_executioner_v1.zip (checksum 27afa91e..., the step-2,000,000 stand-in --
+re-verified fresh before each run), 1,000,000 steps each. ARM A (control,
+subtract_twap_baseline=False) COMPLETE: 21:39-23:09 HKT, exited cleanly, fps
+~193-208 throughout, in-training paired eval at step 1M (n=50) gave L3
+IS_total_bps mean=0.7481 vs TWAP baseline 1.1819 -- saved to
+models/l3_executioner_v1_twap_ab_armA_control.zip /
+models/l3_vecnormalize_twap_ab_armA_control.pkl via the --overwrite-canonical
+guard (canonical checkpoint confirmed untouched, checksum unchanged, after this
+run). ARM B (treatment, subtract_twap_baseline=True) LAUNCHED 23:10 HKT, PID
+verified via a fresh independent SSH connection, startup log confirmed clean
+(reward_weights override: {'subtract_twap_baseline': True} logged explicitly,
+same 405/18 train/val split and same source checkpoint as ARM A) -- run-tagged
+to models/l3_executioner_v1_twap_ab_armB_treatment.zip when done, will NOT touch
+the canonical path either. Expect ~90 min wall-clock based on ARM A's timing.
+Both arms' n=500 evaluation (Step 2, pooling with the existing TWAP
+0.889/best-B 1.103/v1 1.261 table) plus the direct ARM-B-vs-ARM-A paired
+comparison happen once ARM B finishes -- not yet run.
+
+Old narrative below, from before this A/B test started, retained for context on
+Task 1 (v1 re-evaluated at n=500) and Task 2's implementation (not yet its
+training result):
+
 State: Two more tasks landed since the last check-in, both no-GPU/no-training. Pointer
 update again -- see docs/reports/l3_replace_value_probe.md (Task 1) and
 docs/reports/l3_twap_baseline_reward.md (Task 2, new file) for full detail.
