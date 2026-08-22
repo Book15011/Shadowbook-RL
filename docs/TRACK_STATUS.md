@@ -92,31 +92,49 @@ above (neither implemented yet, both are "decided, not built"). No training laun
 until both the checkpoint question resolves and, ideally, (b) exists.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-21 23:20 HKT
-State: GPU work IN PROGRESS -- matched A/B test of the TWAP-baseline reward
-(docs/reports/l3_twap_baseline_reward.md, Task 2 below). Two sequential 8-env
-RecurrentPPO runs, both warm-started (weights only) from the canonical checkpoint
-models/l3_executioner_v1.zip (checksum 27afa91e..., the step-2,000,000 stand-in --
-re-verified fresh before each run), 1,000,000 steps each. ARM A (control,
-subtract_twap_baseline=False) COMPLETE: 21:39-23:09 HKT, exited cleanly, fps
-~193-208 throughout, in-training paired eval at step 1M (n=50) gave L3
-IS_total_bps mean=0.7481 vs TWAP baseline 1.1819 -- saved to
-models/l3_executioner_v1_twap_ab_armA_control.zip /
-models/l3_vecnormalize_twap_ab_armA_control.pkl via the --overwrite-canonical
-guard (canonical checkpoint confirmed untouched, checksum unchanged, after this
-run). ARM B (treatment, subtract_twap_baseline=True) LAUNCHED 23:10 HKT, PID
-verified via a fresh independent SSH connection, startup log confirmed clean
-(reward_weights override: {'subtract_twap_baseline': True} logged explicitly,
-same 405/18 train/val split and same source checkpoint as ARM A) -- run-tagged
-to models/l3_executioner_v1_twap_ab_armB_treatment.zip when done, will NOT touch
-the canonical path either. Expect ~90 min wall-clock based on ARM A's timing.
-Both arms' n=500 evaluation (Step 2, pooling with the existing TWAP
-0.889/best-B 1.103/v1 1.261 table) plus the direct ARM-B-vs-ARM-A paired
-comparison happen once ARM B finishes -- not yet run.
+Last updated: 2026-08-22 22:20 HKT
+State: TWAP-baseline reward A/B test COMPLETE -- clean negative result,
+committed 83508dc. Full detail in docs/reports/l3_twap_baseline_reward.md's
+"A/B test result" section. Both arms trained 1M steps, warm-started from the
+same canonical checkpoint (27afa91e..., re-verified before each run, and
+confirmed untouched by either run afterward). n=500 eval (same paired seeds
+5,000,000-5,000,499 as every prior n=500 eval this session; TWAP numbers
+reused byte-for-byte, not recomputed):
 
-Old narrative below, from before this A/B test started, retained for context on
-Task 1 (v1 re-evaluated at n=500) and Task 2's implementation (not yet its
-training result):
+Pooled ordering: TWAP (0.889) < Arm A/control (0.994) < best-B (1.103) < v1
+(1.261) < Arm B/treatment (1.341). Arm A (plain continued training, no
+reward change) ties with TWAP (p=0.534/0.653) and is now the
+best-performing RL variant measured this session. Arm B (the TWAP-baseline
+reward under test) is significantly WORSE than TWAP (p=0.0092/0.0140) --
+and critically, the direct Arm-B-vs-Arm-A paired test (the one that actually
+isolates the reward change from "more training helped") is also significant
+in the same worse-for-B direction: mean diff +0.347bps, paired t p=0.0097,
+Wilcoxon p=0.0224, Cohen's d_z=0.116 (small but real effect, ~8% of TWAP's
+own std -- comparable in magnitude to the v1-vs-TWAP effect size found
+earlier). Diagnostic: the mean difference is tail-driven (median diff ~0.02
+bps, but the worst 10/500 episodes account for 69% of the net gap) -- most
+episodes are near parity, a minority go badly for Arm B. The mechanism DID
+reduce outcome variance as designed (Arm B std=2.405 vs Arm A std=3.570 vs
+TWAP std=4.353, Levene p<0.0001) -- that reduction just didn't translate
+into better, or even equal, mean execution quality. Arm B also converged to
+a behaviorally different policy (fill_ratio 0.919->0.990, mean ep_len
+1572->811 ticks), not simply a faster/cleaner version of Arm A's policy,
+which the baseline-subtraction design's own premise (subtracting a
+per-episode constant cannot change the optimal policy) did not anticipate.
+Caveat carried into the report: single seed per arm, so this cannot fully
+rule out single-run training variance as part of the explanation, though the
+two-test agreement plus the coherent behavioral shift argue against pure
+noise.
+
+Not spun as a partial win around the variance reduction -- reported as what
+it is, a negative result for the reward-change hypothesis as implemented and
+tested here. No iteration on the reward formulation attempted this pass; no
+multi-seed replication run (flagged as the natural next step if this
+direction is worth another look, not decided here).
+
+Old narrative below, from before this A/B test started, retained for context
+on Task 1 (v1 re-evaluated at n=500) and Task 2's implementation (the reward
+mechanism this A/B test above evaluates):
 
 State: Two more tasks landed since the last check-in, both no-GPU/no-training. Pointer
 update again -- see docs/reports/l3_replace_value_probe.md (Task 1) and
