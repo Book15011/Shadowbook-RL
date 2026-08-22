@@ -184,6 +184,31 @@ box. The ONLY difference between the two runs is `--subtract-twap-baseline`.
   `models/l3_executioner_v1_twap_ab_armB_treatment.zip`. Canonical checkpoint
   confirmed byte-for-byte untouched (checksum unchanged) after both runs.
 
+**CORRECTION (added 2026-08-22, discovered while prepping a follow-up run):**
+both arms trained with the r_queue queue-weighted term in the INVERTED
+direction (EXPERIMENTAL 4 in reward.py's module docstring, commit `4d81a96`),
+not the ORIGINAL direction implied above and elsewhere in this session's
+reporting. This was not a deliberate choice for this A/B test -- it was
+inline, unconditional code left uncommitted in the working tree since the
+separate direction-inversion probe (~22:00 HKT 2026-08-20) and never
+reverted, so every run launched afterward silently inherited it. v1's own
+original training (the `27afa91e...` checkpoint both arms warm-started from)
+DID use the original direction -- confirmed via file mtimes and training
+logs, see commit `4d81a96`'s message for the full reconstruction.
+
+**What this does and doesn't affect:** the ARM B vs ARM A comparison below
+is NOT confounded by this -- both arms shared the identical (inverted)
+r_queue formula, so it remains a clean, isolated test of
+`subtract_twap_baseline` alone. What IS affected: the framing of "Arm A
+reaches parity with TWAP, up from v1's 1.261" as "same reward config as v1,
+just more training" is wrong -- it is "more training AND r_queue direction
+flipped from original to inverted," not disentangled. Some unknown share of
+Arm A's apparent improvement over v1 could be attributable to the r_queue
+change rather than training budget alone. This was not tested cleanly by
+anything run so far: the original direction-inversion probe compared
+inverted-vs-TWAP and original-vs-TWAP separately (both n=50, neither
+significant), never inverted-vs-original directly and never at n=500.
+
 1M steps per arm was chosen over matching v1's own 2M-step run: this is a
 probe of whether the reward change helps at all, not a from-scratch training
 commitment, and 1M steps still gives multiple in-training eval firings to see

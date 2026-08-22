@@ -92,7 +92,26 @@ above (neither implemented yet, both are "decided, not built"). No training laun
 until both the checkpoint question resolves and, ideally, (b) exists.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-22 22:20 HKT
+Last updated: 2026-08-22 23:50 HKT
+State: CORRECTION to the entry below, discovered while prepping a follow-up
+run (reward.py inversion now committed 4d81a96, see that commit message for
+the full reconstruction): both arms of the TWAP-baseline A/B test actually
+trained with the r_queue queue-weighted term INVERTED (EXPERIMENTAL 4), not
+in the original direction as implied below and in the report. This was
+inline, unconditional, uncommitted code left over from the separate
+direction-inversion probe (~22:00 HKT 2026-08-20) that was never reverted --
+every run since silently inherited it, including both A/B arms (confirmed
+via file mtimes: reward.py unchanged from 20:38 HKT 2026-08-21 through both
+launches). v1's own original training DID use the original direction --
+only the CONTINUED training (both arms, warm-started from v1) picked up the
+inversion. The ARM B vs ARM A comparison itself is unaffected (both arms
+shared it equally, so it's still a clean isolated test of
+subtract_twap_baseline). What IS affected: "Arm A ties with TWAP, up from
+v1's 1.261" is not "same reward + more training" as stated -- it's "more
+training AND r_queue flipped," undisentangled. Full correction in
+docs/reports/l3_twap_baseline_reward.md's "A/B test result" section.
+
+PRIOR ENTRY BELOW, otherwise unchanged:
 State: TWAP-baseline reward A/B test COMPLETE -- clean negative result,
 committed 83508dc. Full detail in docs/reports/l3_twap_baseline_reward.md's
 "A/B test result" section. Both arms trained 1M steps, warm-started from the
