@@ -1,8 +1,10 @@
 # TWAP-baseline (variance-reduction) reward: implementation
 
-**Date:** 2026-08-21
-**Status:** Implemented, tested, gated OFF by default. No training run launched
-this pass -- implementation and design review only, per instruction.
+**Date:** 2026-08-21 (implementation), 2026-08-22 (A/B test result, see bottom)
+**Status:** Implemented, tested, gated OFF by default. Matched A/B test run
+2026-08-22 -- see "A/B test result" section at the bottom for the outcome:
+a clean negative (Arm B, the treatment, is significantly WORSE than the
+matched control).
 
 ## What this is, stated explicitly so it is not later mistaken for something else
 
@@ -162,9 +164,166 @@ full project suite 104 passed (same 4 pre-existing, unrelated failures in
 `test_bulk_backfill.py`/`test_l2_capture.py` as every prior round this
 session -- confirmed untouched by this change).
 
-## Not done this pass
+## A/B test result (step 3): does the reward change improve the trained policy?
 
-No training run launched, per explicit instruction -- this is implementation
-and design review, not a probe result. The actual test of whether this
-reward change helps training is a separate, future GPU run once this
-implementation is reviewed.
+**Date:** 2026-08-22
+**Design:** matched A/B, single seed per arm. Both arms warm-started (weights
+only, VecNormalize fresh, step counter reset to 0) from the same canonical
+checkpoint (`models/l3_executioner_v1.zip`, checksum `27afa91e...`, the
+step-2,000,000 stand-in -- re-verified immediately before each launch), same
+`--n-envs 8`, same `--total-timesteps 1000000`, run sequentially on the same
+box. The ONLY difference between the two runs is `--subtract-twap-baseline`.
+
+- **ARM A (control, flag off):** 21:39-23:09 HKT, ~90 min wall-clock, fps
+  ~193-208 throughout. Saved to
+  `models/l3_executioner_v1_twap_ab_armA_control.zip`.
+- **ARM B (treatment, flag on):** 23:10-01:00 HKT, ~110 min wall-clock (the
+  extra ~20 min is consistent with the measured ~48ms/reset TWAP-shadow
+  overhead accumulating over ~1M/[ep_len] resets), fps ~152-208, trending
+  down as episodes shortened over training (see below). Saved to
+  `models/l3_executioner_v1_twap_ab_armB_treatment.zip`. Canonical checkpoint
+  confirmed byte-for-byte untouched (checksum unchanged) after both runs.
+
+1M steps per arm was chosen over matching v1's own 2M-step run: this is a
+probe of whether the reward change helps at all, not a from-scratch training
+commitment, and 1M steps still gives multiple in-training eval firings to see
+a trajectory, comfortably past the expected initial value-loss recalibration
+window. Both arms' `value_loss` had settled to the same order of magnitude
+(0.015-0.03) by step 1M with no sign of an unresolved recalibration in
+progress -- so the step budget was not obviously too short for a fair read.
+
+### Results at n=500
+
+Same paired seeds (5,000,000-5,000,499) as every prior n=500 eval this
+session; TWAP's per-episode numbers reused byte-for-byte from
+`scripts/replace_value_probe_n500.py`'s output, not recomputed.
+
+| | IS_total_bps mean | std | fill_ratio | vs TWAP (paired t / Wilcoxon) |
+|---|---|---|---|---|
+| TWAP | 0.889 | 4.353 | 0.994 | -- |
+| **Arm A (control)** | **0.994** | 3.570 | 0.919 | diff +0.105bps, t p=0.534, W p=0.653 -- **not significant** |
+| best-B (REPLACE probe, unrelated track) | 1.103 | -- | -- | (from `l3_replace_value_probe.md`, pooled for context) |
+| v1 (2M-step, own checkpoint) | 1.261 | -- | 0.892 | (from earlier this session, pooled for context) |
+| **Arm B (treatment)** | **1.341** | 2.405 | 0.990 | diff +0.452bps, t p=0.0092, W p=0.0140 -- **significantly worse** |
+
+Pooled ordering at n=500: TWAP (0.889) < **Arm A (0.994)** < best-B (1.103) <
+v1 (1.261) < **Arm B (1.341)**. Arm A -- plain continued training from the
+v1 checkpoint, no reward change at all -- is now the best-performing RL
+variant measured this session, closest to TWAP of any of them. Arm B is the
+worst.
+
+### The comparison that actually answers the question: Arm B vs Arm A, direct paired test
+
+Arm-B-vs-TWAP and Arm-A-vs-TWAP separately can't distinguish "the reward
+change helped" from "more training helped" -- both arms got 1M more steps
+than v1's stand-in checkpoint had at warm-start. This is the test that
+isolates the reward change specifically, both arms having received identical
+training otherwise:
+
+- **mean diff (B - A) = +0.347 bps** (B worse), std of the paired
+  differences = 2.991 bps
+- **paired t-test: t=2.595, p=0.0097** -- significant
+- **Wilcoxon signed-rank: W=54561, p=0.0224** -- significant, agrees with
+  the t-test on direction (unlike the v1-vs-TWAP case earlier this session,
+  where the two tests disagreed)
+- **Effect size:** Cohen's d_z (paired) = 0.116 (small); the mean difference
+  is 7.98% of TWAP's own std -- comparable in magnitude to the v1-vs-TWAP
+  effect size found earlier (~8.5% of TWAP's std), i.e. a real but modest
+  effect, not a large one
+- **Win/loss:** Arm A better (lower IS) in 271/500 episodes (54.2%), Arm B
+  better in 226/500 (45.2%), 3 ties -- not a lopsided split
+
+### Diagnosing the effect: broad shift or tail-driven?
+
+Same diagnostic used for the earlier v1-vs-TWAP disagreement, applied here
+even though both tests already agree, because it changes what the result
+means:
+
+- **Median diff (B - A) = 0.022 bps** -- essentially zero. The *typical*
+  episode shows no meaningful difference between arms.
+- **The worst 10 of 500 episodes for Arm B (2% of the sample) account for
+  119.4 bps of the 173.7 bps total net difference (69%).** Gross positive
+  (B worse) sum = 504.6 bps over 271 episodes; gross negative (B better) sum
+  = -330.9 bps over 226 episodes -- both sides are large and mostly cancel;
+  the net comes from a heavier right tail on Arm B's side, not a uniform
+  shift.
+
+So: Arm B is **not** uniformly worse than Arm A -- most episodes are at or
+near parity. What moved the mean (and drove both tests to significance) is a
+minority of episodes where Arm B does substantially worse. This matters for
+interpreting the mechanism below.
+
+### The variance-reduction mechanism did work, mechanically -- it just didn't help
+
+Arm B's own outcome distribution has **lower** std (2.405 bps) than both Arm
+A's (3.570 bps) and TWAP's own (4.353 bps) -- Levene's test confirms this
+variance difference is highly significant (stat=27.48, p<0.0001). The
+mechanism did exactly what `docs/reports/l3_twap_baseline_reward.md`'s design
+section said it would do: reduce the variance of the terminal outcome the
+critic has to predict. **That reduction did not translate into a better, or
+even equal, mean outcome** -- the mean got significantly worse instead.
+
+### A converged policy that looks behaviorally different, not just "same policy, cleaner"
+
+The baseline-subtraction design is explicitly built on the premise that
+subtracting a per-episode constant cannot change which policy is optimal --
+only how much reward-signal variance the critic has to fight through to find
+it. The behavioral numbers don't fully match a "same policy, found faster or
+cleaner" story:
+
+- **fill_ratio: Arm A 0.919 -> Arm B 0.990** -- Arm B completes far more of
+  its target quantity
+- **mean episode length: Arm A 1,572 ticks -> Arm B 811 ticks** -- Arm B
+  finishes (or gives up) roughly twice as fast
+- **terminated-early rate (order fully completed before horizon): Arm A
+  384/500 (76.8%) -> Arm B 473/500 (94.6%)**
+
+Read together with the tail-driven mean difference above, a plausible (not
+proven) story: Arm B converged toward a more aggressive completion style --
+finish the order fully and quickly -- which costs little extra on most
+episodes but produces occasional expensive fills when that aggression meets
+unfavorable conditions, and the occasional expensive tail outweighs the
+frequent small gains from fuller/faster completion. This is offered as a
+hypothesis for why the numbers look the way they do, not as a confirmed
+causal mechanism -- distinguishing it from pure single-run training noise
+would need a multi-seed replication (see caveat below).
+
+### Caveat, stated plainly
+
+This is a **single seed per arm**, as the task specified (a probe, not a
+multi-seed study). A single matched pair cannot fully separate "the reward
+mechanism is causally responsible" from "this particular stochastic training
+run landed somewhere worse." What argues against pure noise: the effect
+reaches significance on both a mean-sensitive test (paired t) and a
+rank-sensitive test (Wilcoxon) that disagree when a result is fragile (as
+they did for v1-vs-TWAP) and agree here; and the behavioral shift
+(fill_ratio, episode length, termination rate) is large and directionally
+coherent with the outcome shift, not just a noisy IS number moving on its
+own. But it remains one training run per condition, and that should not be
+overstated into more certainty than the design supports.
+
+### Answer, plainly
+
+**The TWAP-baseline (variance-reduction) reward did not improve the trained
+policy over the matched control at this step budget -- it produced a policy
+that is significantly worse, both against the control (Arm B vs Arm A:
+p=0.0097 / p=0.0224) and against TWAP itself (p=0.0092 / p=0.0140), where the
+control was statistically indistinguishable from TWAP.** Neither arm beats
+TWAP: Arm A ties with it, Arm B loses to it. The reward change did achieve
+its stated mechanical goal -- materially lower outcome variance (Levene
+p<0.0001) -- but that did not carry through to better, or even equal,
+execution quality, and the resulting policy looks behaviorally different
+(fuller, faster, tail-costlier completions) rather than simply a
+faster-converged version of the control's policy. This is a clean negative
+result for the variance-reduction hypothesis as implemented and tested here,
+reported as such rather than reframed around the one thing (variance) that
+did move in the predicted direction.
+
+### Not done this round
+
+No multi-seed replication (would be needed to fully separate the reward
+mechanism's effect from single-run training variance, per the caveat above).
+No investigation of *why* Arm B's fill/episode-length behavior shifted
+beyond the hypothesis offered above. No attempt to fix or iterate on the
+reward formulation in this pass -- reported as a negative result for
+direction, not patched in place.
