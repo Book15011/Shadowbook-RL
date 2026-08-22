@@ -34,9 +34,10 @@ def test_step_reward_inventory_holding_isolated():
 
 
 def test_step_reward_market_cancel_penalty_isolated():
-    # MARKET path keeps the full Section 3.3 charge (EXPERIMENTAL 3 split):
-    # queue_ahead=30, queue_at_level=100
-    # r_queue = -0.5 - 0.3*(30/100) = -0.59
+    # MARKET path keeps the full Section 3.3 charge (EXPERIMENTAL 3 split).
+    # EXPERIMENTAL 4: queue-weighted term inverted to gamma*(1 - ratio).
+    # queue_ahead=30, queue_at_level=100 -> ratio=0.3, 1-ratio=0.7
+    # r_queue = -0.5 - 0.3*0.7 = -0.71
     w = RewardWeights()
     r = step_reward(
         w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
@@ -44,13 +45,14 @@ def test_step_reward_market_cancel_penalty_isolated():
         canceled_via_market=True, canceled_via_replace=False,
         queue_ahead_at_cancel=30.0, queue_at_level=100.0,
     )
-    assert r == pytest.approx(-0.59)
+    assert r == pytest.approx(-0.71)
 
 
 def test_step_reward_cancel_with_zero_queue_at_level_skips_gamma_term():
     # queue_at_level=0 is falsy -> gamma term skipped (matches spec reference code's
     # `if queue_ahead_at_cancel is not None and queue_at_level:` truthiness check,
-    # which also avoids a division by zero here).
+    # which also avoids a division by zero here). Direction-invariant: the term is
+    # skipped entirely regardless of which way it would have pointed.
     w = RewardWeights()
     r = step_reward(
         w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
@@ -63,8 +65,9 @@ def test_step_reward_cancel_with_zero_queue_at_level_skips_gamma_term():
 
 def test_step_reward_replace_cancel_penalty_skips_beta():
     # EXPERIMENTAL 3 split: CANCEL_AND_REPLACE drops the flat -beta and pays
-    # only the queue-weighted charge. Same queue state as the MARKET test:
-    # r_queue = -0.3*(30/100) = -0.09  (vs -0.59 for MARKET)
+    # only the queue-weighted charge. EXPERIMENTAL 4: that charge is now
+    # gamma*(1-ratio). Same queue state as the MARKET test:
+    # r_queue = -0.3*(1 - 30/100) = -0.3*0.7 = -0.21  (vs -0.71 for MARKET)
     w = RewardWeights()
     r = step_reward(
         w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
@@ -72,7 +75,7 @@ def test_step_reward_replace_cancel_penalty_skips_beta():
         canceled_via_market=False, canceled_via_replace=True,
         queue_ahead_at_cancel=30.0, queue_at_level=100.0,
     )
-    assert r == pytest.approx(-0.09)
+    assert r == pytest.approx(-0.21)
 
 
 def test_step_reward_replace_is_strictly_cheaper_than_market():
@@ -80,7 +83,11 @@ def test_step_reward_replace_is_strictly_cheaper_than_market():
     CANCEL_AND_REPLACE must cost strictly less than a MARKET cancel, so that
     MARKET no longer economically dominates it (only MARKET guarantees a
     fill, so equal pricing made REPLACE a strictly worse action -- the
-    structural cause of 0% REPLACE usage at every coefficient tested)."""
+    structural cause of 0% REPLACE usage at every coefficient tested).
+    Direction-invariant under EXPERIMENTAL 4: the queue-weighted term appears
+    identically in both branches, so it cancels out of the difference --
+    only the flat -beta (MARKET-only) term determines the gap, unchanged by
+    which way the queue-weighted term points."""
     w = RewardWeights()
     common = dict(
         side=1, fills=[], arrival_price=100.0, mid_price=100.0,
@@ -98,12 +105,16 @@ def test_step_reward_replace_is_strictly_cheaper_than_market():
     assert r_replace - r_market == pytest.approx(w.beta)
 
 
-def test_step_reward_replace_outside_visible_book_costs_nothing():
-    """When a price sits outside the visible top-20 book, _place_limit()
-    initializes q_ahead = 0.0, so queue_ratio = 0 and a CANCEL_AND_REPLACE
-    costs EXACTLY zero. The policy picks the price offset, so it can reach
-    this regime deliberately -- any future placement-staleness reward term
-    would need to account for this zero-cost regime explicitly."""
+def test_step_reward_replace_off_book_now_costs_full_gamma():
+    """EXPERIMENTAL 4 (module docstring) inverts this case from the old
+    test_step_reward_replace_outside_visible_book_costs_nothing. When a price
+    sits outside the visible top-20 book, _place_limit() initializes
+    q_ahead = 0.0 -- under the corrected direction that is indistinguishable
+    from genuinely being at the front of a real, earned queue, so it now
+    costs the FULL -gamma (the maximum this term can charge), not zero. This
+    is the off-book side of the residual loophole discussed in
+    RewardWeights.eta_replace: off-book is no longer a free ride, it is the
+    single most expensive price to spam-replace at."""
     w = RewardWeights()
     r = step_reward(
         w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
@@ -111,7 +122,42 @@ def test_step_reward_replace_outside_visible_book_costs_nothing():
         canceled_via_market=False, canceled_via_replace=True,
         queue_ahead_at_cancel=0.0, queue_at_level=10.0,
     )
-    assert r == pytest.approx(0.0)
+    assert r == pytest.approx(-0.3)
+
+
+def test_step_reward_replace_near_front_costs_close_to_gamma():
+    """EXPERIMENTAL 4: a genuinely near-front order (only a small residual
+    queue_ahead relative to queue_at_level) costs close to, but not exactly,
+    the maximum -gamma -- distinguishing "almost fully earned priority" from
+    the off-book case above, which hits the ceiling exactly."""
+    # queue_ahead=2, queue_at_level=100 -> ratio=0.02, 1-ratio=0.98
+    # r_queue = -0.3*0.98 = -0.294
+    w = RewardWeights()
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_via_market=False, canceled_via_replace=True,
+        queue_ahead_at_cancel=2.0, queue_at_level=100.0,
+    )
+    assert r == pytest.approx(-0.294)
+
+
+def test_step_reward_replace_fresh_deep_level_costs_close_to_zero():
+    """EXPERIMENTAL 4: a fresh order behind a deep level -- own resting size
+    is a small fraction of the level's total depth -- costs close to zero,
+    correctly: this order has barely waited and discards almost no earned
+    priority by being replaced. The mirror image of the near-front case
+    above."""
+    # queue_ahead=98, queue_at_level=100 -> ratio=0.98, 1-ratio=0.02
+    # r_queue = -0.3*0.02 = -0.006
+    w = RewardWeights()
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_via_market=False, canceled_via_replace=True,
+        queue_ahead_at_cancel=98.0, queue_at_level=100.0,
+    )
+    assert r == pytest.approx(-0.006)
 
 
 def test_step_reward_staleness_isolated():
@@ -139,6 +185,50 @@ def test_step_reward_staleness_zero_when_not_resting():
         canceled_via_market=False, canceled_via_replace=False,
         queue_ahead_at_cancel=None, queue_at_level=None,
         resting=False, ticks_since_own_fill_norm=1.0,
+    )
+    assert r == pytest.approx(0.0)
+
+
+def test_step_reward_placement_staleness_isolated():
+    # resting=True, ticks_since_placement_norm=0.4, eta_replace=0.1
+    # r_placement_stale = -0.1*0.4 = -0.04; no fills/cancel/dt/zeta -> everything
+    # else is 0 (zeta defaults to 0.06 but ticks_since_own_fill_norm defaults to 0.0
+    # here, so r_stale is also 0)
+    w = RewardWeights(eta_replace=0.1)
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_via_market=False, canceled_via_replace=False,
+        queue_ahead_at_cancel=None, queue_at_level=None,
+        resting=True, ticks_since_placement_norm=0.4,
+    )
+    assert r == pytest.approx(-0.04)
+
+
+def test_step_reward_placement_staleness_zero_when_not_resting():
+    # resting=False -> r_placement_stale must be exactly 0 regardless of
+    # ticks_since_placement_norm.
+    w = RewardWeights(eta_replace=0.1)
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_via_market=False, canceled_via_replace=False,
+        queue_ahead_at_cancel=None, queue_at_level=None,
+        resting=False, ticks_since_placement_norm=1.0,
+    )
+    assert r == pytest.approx(0.0)
+
+
+def test_step_reward_placement_staleness_defaults_to_inert():
+    # eta_replace defaults to 0.0 -- passing a nonzero ticks_since_placement_norm
+    # without overriding eta_replace must not change the reward at all.
+    w = RewardWeights()
+    r = step_reward(
+        w, side=1, fills=[], arrival_price=100.0, mid_price=100.0,
+        qty_remaining=10.0, qty_total=10.0, dt=0.0, l1_risk_score=0.0,
+        canceled_via_market=False, canceled_via_replace=False,
+        queue_ahead_at_cancel=None, queue_at_level=None,
+        resting=True, ticks_since_placement_norm=1.0,
     )
     assert r == pytest.approx(0.0)
 
