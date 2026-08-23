@@ -92,7 +92,63 @@ above (neither implemented yet, both are "decided, not built"). No training laun
 until both the checkpoint question resolves and, ideally, (b) exists.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-23 16:30 HKT
+Last updated: 2026-08-23 18:15 HKT
+State: L3 RESEARCH PHASE CLOSED. Frozen and handed off for L1->L2->L3
+integration -- full detail in docs/reports/l3_frozen_handoff.md (new,
+standalone, written for a reader with no session context), committed 5d0d243.
+
+Frozen checkpoint: Arm A's final (the TWAP-baseline A/B test's control,
+1M steps warm-started from v1's step-2M stand-in). Permanent backup at
+models/l3_frozen_backup/ (l3_executioner_v1_frozen.zip sha256 a5443e2a...,
+l3_vecnormalize_frozen.pkl sha256 b459e177...), committed 3a4a283, checksum
+-verified identical to source after copy. Pairing confirmed via identical
+mtime (nanosecond-exact) and the training log's own final-save line naming
+both paths as one save operation, not assumed from directory listing. Before
+designating, checked whether a better candidate existed rather than assuming:
+a 500k-step in-training snapshot that scored 0.686 IS at n=50 was evaluated
+fresh at n=500 (a cheap eval, not a training run) and came in at 1.025 --
+not significantly different from Arm A's own 0.994 (p=0.82/0.78) and not
+better. Arm A's final remains the best point estimate among everything this
+project evaluated at proper n.
+
+Reason for closing: 8 in-training checkpoints across the last (budget
+-extension) run show a plateau, not a trend -- best point at 500k steps in,
+never bettered across the remaining 1.5M. Three consecutive reward
+interventions since Arm A (r_queue direction inversion, TWAP-baseline
+variance-reduction reward, the budget extension itself) all returned null
+or significantly negative results. No further L3 reward iteration or
+training is planned unless something in L1/L2 integration specifically
+forces it.
+
+Performance, stated plainly per the handoff doc: the frozen checkpoint TIES
+TWAP (p=0.534/0.653), it does not beat it -- and nothing evaluated this
+session does. The real win is the fill-ratio arc (0.2015 pre-retrain ->
+0.919 for this checkpoint -> 0.9998 for the not-recommended budget
+extension), attributable to earlier physics/matching-engine fixes, not any
+of this session's reward-shaping work.
+
+Integration verification (code-reading, not new code -- L2 owns the wrapper
+side, so any mismatch would be reported as a blocker rather than fixed here):
+observation space (42-dim, index-exact against L2's mapping table), action
+space (MultiDiscrete([4,11,5])), and VecNormalize params (norm_obs=True,
+clip_obs=5.0) all confirmed matching by reading src/envs/lob_execution_env.py,
+src/envs/wrappers.py, and src/train/train_l3.py directly. L2's live-attribute
+path (l2_target_slice_ratio_override/l2_urgency -> obs idx 15/16) confirmed
+working. L1's path (l1_risk_score/l1_confidence -> obs idx 17/18, and
+l1_risk_score into step_reward's inventory term) is correctly wired in L3's
+own code but NOT currently driven by L2's wrapper -- not a bug (matches L1's
+still-paused real-Ollama status) but a real gap: L1 integration into L2 needs
+wiring, not just verification, before L1's signal reaches L3 in practice.
+NO BLOCKERS found for loading this checkpoint into L2 as-is.
+
+L3 is available for integration. src/envs/lob_execution_env.py still carries
+an uncommitted, functionally-inert (eta_replace=0.0 makes it contribute
+exactly 0 regardless) staleness-round addition from earlier this session --
+left as-is, not committed as part of this freeze since it does not affect
+any reported result's reproducibility.
+
+PRIOR ENTRY BELOW, for context on the budget-extension result and the
+r_queue-inversion correction that precedes it:
 State: Arm A budget-extension run COMPLETE -- null result, committed 9320268.
 Full detail in docs/reports/l3_armA_budget_extension.md. Continued Arm A's own
 checkpoint (not v1, not canonical) for 2M more steps, same (inverted, see
