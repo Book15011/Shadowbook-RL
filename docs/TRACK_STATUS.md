@@ -92,7 +92,32 @@ above (neither implemented yet, both are "decided, not built"). No training laun
 until both the checkpoint question resolves and, ideally, (b) exists.
 
 ## L3 / Env-Physics
-Last updated: 2026-08-22 23:50 HKT
+Last updated: 2026-08-23 16:30 HKT
+State: Arm A budget-extension run COMPLETE -- null result, committed 9320268.
+Full detail in docs/reports/l3_armA_budget_extension.md. Continued Arm A's own
+checkpoint (not v1, not canonical) for 2M more steps, same (inverted, see
+correction below) reward config Arm A itself used, to test whether more budget
+pushes past Arm A's TWAP-parity into a genuine edge. It does not: n=500 gives
+IS_total_bps mean=1.237 (vs Arm A's 0.994, TWAP's 0.889), nominally significantly
+worse than TWAP alone (p=0.034/0.044) -- but the decisive test, the direct paired
+comparison against Arm A itself, is NOT significant (t p=0.092, Wilcoxon p=0.230,
+Cohen's d_z=0.076), and 97% of the nominal difference comes from just 10/500
+episodes (median diff ~0.0002bps, essentially zero for the typical episode). No
+reliable evidence more budget helps or hurts. Training trajectory (8 in-training
+n=50 firings across the 2M steps) shows no convergence -- volatile throughout,
+best point came early (500k steps in) and was never bettered, worst point (1.25M
+steps) briefly crossed worse than TWAP before partially recovering. fill_ratio did
+climb further (0.919->0.9998, essentially eliminating unfilled orders) and
+outcome variance dropped further (std 3.570->2.039) -- same pattern as Arm B's
+variance reduction in the TWAP-baseline test, again not translating to a mean
+edge. Explicitly does NOT test whether Arm A's own result was seed luck -- this
+is a longer trajectory of the same seed, not an independent replication;
+reproducibility with a different seed remains untested and is the natural next
+step if this direction is pursued further (not run this round).
+
+PRIOR ENTRY BELOW, unchanged -- the r_queue inversion correction still stands and
+applies to this run too (see the reward-config note in the new report for how this
+run's launch handled it):
 State: CORRECTION to the entry below, discovered while prepping a follow-up
 run (reward.py inversion now committed 4d81a96, see that commit message for
 the full reconstruction): both arms of the TWAP-baseline A/B test actually
