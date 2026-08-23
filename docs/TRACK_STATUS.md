@@ -5,6 +5,97 @@ Each session owns and updates only its own section -- merge on conflict,
 never overwrite another track's section.
 
 ## L1 -- Macro Analyst
+Last updated: 2026-08-24 00:07 HKT
+State: REAL (UNMOCKED) LLM PATH VALIDATED THIS ROUND -- full detail in
+docs/reports/l1_real_llm_validation.md. Two real bugs found and fixed, one infra,
+one code: (1) Ollama model-visibility (systemd service user ollama's own
+~/.ollama/models was empty; the pulled 8.4GB qwen2.5:14b sat under
+/home/ubuntu/.ollama instead, from before the ExecStart fix landed) -- fixed by
+moving the blob store into the service's own default location (same filesystem,
+instant mv, zero duplicate disk usage) and chown -- infra only, not a repo commit,
+same precedent as the earlier ExecStart fix. (2) L1MacroAnalyst.maybe_refresh()
+itself silently misrouted every real call through this host's http_proxy/
+https_proxy env vars (ProxyError, indistinguishable from a real Ollama outage
+under the existing except clause) -- fixed in code (proxies={} override),
+committed 98e6cc1 with a regression test, 8/8 L1 tests still pass.
+
+Both fixes verified with real calls, not service status alone: curl api/tags
+lists the model; curl api/generate returns a real completion; VRAM measured
+(15,033 MiB loaded+generating / 9,107 MiB idle-loaded / 24,564 MiB total).
+
+Step 2 (5 real, unmocked maybe_refresh() calls, real build_l1_feature_summary()
+input, 5 different real market dates spanning 2024-2026): 0/5 raw responses were
+schema-conformant against MacroRiskContext -- the model returns syntactically
+valid JSON (format:json only guarantees that much) but invents its own field
+names every time, never the required timestamp_ms/regime/risk_score/confidence/
+urgency_multiplier keys. Root-caused, not just observed: SYSTEM_PROMPT never
+actually states the required schema/keys anywhere in the text sent to the model
+-- this points at a PROMPT-DESIGN gap, not primarily a 14B-capability one.
+Separately, and reported as the genuinely positive half of the same result: the
+fail-closed mechanism was 5/5 reliable under this real, repeated failure --
+correct neutral fallback every time, no crash, no garbage propagated. Real call
+timing: 4.49-4.54s (mean 4.505s, tight variance), warm model, real prompt size.
+
+Step 3 (14B vs 32B): recommend staying on 14B, NOT pulling 32B yet -- current
+measured headroom is real (~9.3GB free with 14B loaded+generating, L2/L3 both
+confirmed idle at measurement time) but the stronger reason is that 32B is
+unlikely to fix Step 2's own finding (the schema is never shown to either model
+size) and would commit ~20-21GB of shared 4090 VRAM on a weak bet. Recommended
+next step instead: fix SYSTEM_PROMPT to actually state the required keys, retest
+against the already-available 14B at zero additional cost, before spending
+anything on a 32B pull. Not done this round -- a prompt/content judgment call,
+flagged for direction rather than made unilaterally.
+
+Step 4 (full 3-tier stack re-run, real L1 live, real val-split data, real frozen
+L3 + L2 smoke checkpoints): runs correctly end to end -- 1249 ticks, L1 fires
+exactly at 0/600/1200 (same cadence as stubbed), L2 fires 25x (same count as the
+prior correctness run), truncates with finite IS_total_bps=5.53 and fill_ratio
+in [0,1]. idx 17/18 did NOT visibly change at boundaries this run -- all 3 real
+firings hit the identical neutral fallback, consistent with Step 2's 0/5 result,
+reported plainly rather than reframed. Per-tick cost: 3.81ms (stubbed, prior
+round) -> 14.60ms (real L1, this round), ~3.8x over this short episode --
+matches a direct amortization calculation (3 calls x ~4.5s = ~13.5s added,
+accounts for the gap almost exactly) rather than an unexplained regression.
+Confirms the task's own suspicion directly: at 4.5s/call vs a ~2.29s wall-clock
+budget between L1 firings (600 ticks at the stubbed 262 ticks/sec), a
+SYNCHRONOUS real LLM call is a genuine new bottleneck. The fix is architectural,
+already spec-sanctioned (Section 1.2: run L1 from a background thread, tick loop
+reads self._cache only) and independent of model choice -- a bigger model would
+likely make synchronous blocking WORSE, not better. Not built this round --
+flagged as the concrete next step alongside the prompt fix above.
+
+Not added to the committed pytest suite: the Step 4 live-L1 run, since it needs
+a real running Ollama service -- would break the hermeticity every other test in
+this file preserves by mocking requests.post. Run as a one-off validation
+script; results captured in the report doc instead.
+
+Files this round: src/agents/l1_macro_analyst.py, tests/test_l1_macro_analyst.py
+(proxy fix + regression test, 98e6cc1). docs/reports/l1_real_llm_validation.md
+(e7f8851). orchestrator_graph.py/test_orchestrator_graph.py unchanged this round
+(Step 4 was a validation script, not new test code, per the hermeticity note
+above). Ollama blob-store move: infra only, documented above and in the report,
+not a repo commit.
+
+Blocking/open questions: (a) NEW -- SYSTEM_PROMPT needs the actual required
+schema/keys stated explicitly before real L1 output can ever be usable, at
+either model size; this is now the primary blocker on real L1 signal quality,
+ahead of the 14B/32B question. (b) NEW -- L1's synchronous call in
+orchestrator_graph.run_episode() needs to move to a background thread/process
+per the spec's own design, before a live L1 stops being a throughput bottleneck
+in any real integration run. (c) 14B vs 32B: recommend 14B for now (Step 3), but
+this is a recommendation, not a decision made here -- open for confirmation.
+
+Next planned step: two independent options, neither gated on the other -- (a)
+fix SYSTEM_PROMPT to state the required schema explicitly and re-run Step 2's
+same 5-case robustness check against 14B; (b) build the background-thread/async
+wiring for L1 in orchestrator_graph.py so a live LLM call never blocks the tick
+loop. Recommend (a) first, since it is what actually determines whether real L1
+signal is usable at all -- (b) matters only once (a) is producing real,
+non-fallback values worth not blocking on.
+
+PRIOR ENTRY BELOW, for context on the full orchestrator build:
+
+## L1 -- Macro Analyst
 Last updated: 2026-08-23 20:40 HKT
 State: FULL L1->L2->L3 ORCHESTRATOR BUILT AND CORRECTNESS-VERIFIED this round --
 full detail in docs/reports/l1l2l3_integration_correctness.md, committed 941aa0e
