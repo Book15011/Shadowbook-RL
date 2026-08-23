@@ -162,3 +162,23 @@ def test_maybe_refresh_throttles_within_interval_then_refreshes_after(monkeypatc
     ctx3 = agent.maybe_refresh({"obi_1": 0.2})
     assert len(calls) == 2, "should re-call once refresh_interval_s has elapsed"
     assert ctx3 is not ctx1
+
+
+def test_maybe_refresh_bypasses_environment_proxy(monkeypatch):
+    # Regression test for a real bug found running this against a real Ollama service:
+    # requests.post() defaults to honoring HTTP(S)_PROXY env vars, which silently
+    # misroutes every localhost call through an unrelated external proxy in an
+    # environment where those are set (this host's ubuntu-user shell), producing a
+    # ProxyError indistinguishable from a real Ollama outage. maybe_refresh() must pass
+    # proxies={"http": None, "https": None} explicitly on every call.
+    captured_kwargs = {}
+
+    def _fake_post(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeResponse({"response": json.dumps(VALID_PAYLOAD)})
+
+    monkeypatch.setattr("src.agents.l1_macro_analyst.requests.post", _fake_post)
+    agent = L1MacroAnalyst(refresh_interval_s=45)
+    agent.maybe_refresh({"obi_1": 0.2})
+
+    assert captured_kwargs.get("proxies") == {"http": None, "https": None}

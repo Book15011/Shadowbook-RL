@@ -19,6 +19,13 @@ self._cache on a coarser tick cadence (Section 4.3's L1_EVERY_N_TICKS).
 
 No real Ollama call happens anywhere in this module's own test suite
 (tests/test_l1_macro_analyst.py) -- requests.post is mocked throughout.
+
+self.host is assumed always-local (default http://localhost:11434) --
+maybe_refresh() explicitly bypasses any environment-configured HTTP(S)
+proxy for this reason (see the proxies= kwarg on the requests.post() call
+below); a proxied local call is never correct here and was confirmed to
+silently fail closed on every real call in an environment where
+http_proxy/https_proxy are set, before this fix.
 """
 from __future__ import annotations
 
@@ -82,6 +89,15 @@ class L1MacroAnalyst:
                     "options": {"temperature": 0.1, "num_ctx": 2048},
                 },
                 timeout=self.timeout_s,
+                # self.host is always local (default http://localhost:11434) --
+                # bypass any HTTP(S)_PROXY the environment sets for external egress.
+                # Confirmed directly: this host's ubuntu-user shell exports
+                # http_proxy/https_proxy pointed at an unrelated external proxy;
+                # without this override, requests silently misroutes every call
+                # through it and gets a ProxyError, indistinguishable from a real
+                # Ollama outage under the except clause below without checking the
+                # exception message -- a real bug, not a defensive no-op.
+                proxies={"http": None, "https": None},
             )
             payload = json.loads(resp.json()["response"])
             self._cache = MacroRiskContext(**payload)
