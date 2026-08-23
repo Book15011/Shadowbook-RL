@@ -5,7 +5,75 @@ Each session owns and updates only its own section -- merge on conflict,
 never overwrite another track's section.
 
 ## L1 -- Macro Analyst
-Last updated: 2026-08-21 23:18 HKT
+Last updated: 2026-08-23 20:40 HKT
+State: FULL L1->L2->L3 ORCHESTRATOR BUILT AND CORRECTNESS-VERIFIED this round --
+full detail in docs/reports/l1l2l3_integration_correctness.md, committed 941aa0e
+(orchestrator code+tests: 55e9b09). This is a correctness result, not a
+performance/training one -- no training run, no long run.
+
+Step 0 prerequisites, checked directly rather than trusted from this section's own
+prior (partly stale) entries: (a) src/data/l1_features.py works -- verified live
+against real data/raw_l1 at an in-range timestamp, real non-None numeric output,
+feeds L1MacroAnalyst.maybe_refresh() cleanly. (b)/(c) real Ollama is BLOCKED by a
+genuine infra bug, not just the open 14B/32B decision: the systemd service runs as
+system user `ollama` (home /usr/share/ollama), whose own .ollama/models/{blobs,
+manifests} are completely empty -- the 8.4GB qwen2.5:14b-instruct-q4_K_M pull
+actually sits under /home/ubuntu/.ollama instead, invisible to the running service.
+Confirmed live: a real generate call returns {"error":"model ... not found"}. Not
+fixed this round (out of scope -- infra repair, not the correctness harness), but
+now a precisely diagnosed, not just "still open," finding for whoever picks it up
+(needs either OLLAMA_MODELS pointed at the right path, or a re-pull as the ollama
+user). (d) L2's throughput measurement DID land (commit 20ce3b6, this section's own
+prior entry was stale on this) -- ~4.15 L2-decisions/sec single-env, ~5.5 days
+extrapolated for a real 2M-step run, verdict already "not practical," parallelize
+across envs recommended, not yet built.
+
+Step 1 (L1 wiring gap L3's handoff flagged): closed with NO change needed inside
+wrappers.py -- FrozenL3Wrapper exposes the raw env via gym.Wrapper's own public
+.env attribute, the same pattern the wrapper itself already uses internally for
+idx 15/16, so macro_tick(l3_wrapper.env, ...) reaches l1_risk_score/l1_confidence
+cleanly, unchanged function.
+
+Steps 2-3 (orchestrator_graph.py extended to the full graph + correctness test):
+executioner_node/env_step_node are folded into FrozenL3Wrapper.step() rather than
+reimplemented at the orchestrator level (would duplicate L2's own already-tested
+LSTM-threading/normalization logic with real divergence risk) -- treated as an
+invariant proven by reading the source, then independently verified empirically.
+New integration test loads the REAL frozen L3 checkpoint + L2's real smoke-test SAC
+checkpoint, runs a short bounded synthetic episode (1250 ticks), and asserts: L1
+fires exactly at ticks 0/600/1200 with 3 distinct mocked values, L2 fires in an
+exact 50-tick arithmetic sequence, L3/env_step fires every tick (1250 real, gapless
+env.step() calls, verified via a non-invasive monkeypatch recorder -- no edit to
+lob_execution_env.py/wrappers.py), idx 15/16 and 17/18 each hold constant between
+their own cadence boundaries and change only at them, the frozen checkpoint's
+checksum matches the handoff doc's recorded value verified live, episode truncates
+correctly with a sane implementation_shortfall. All assertions pass. Found and
+documented (not silently worked around) a real, benign off-by-one: LOBExecutionEnv.
+step()'s end-of-ticks-buffer clamp fires on exactly the horizon-truncating tick,
+making info["ticks_elapsed"] under-report by 1 on that one final call only. Full
+suite: 132 passed, same 4 pre-existing unrelated failures as every check this
+session.
+
+Step 4 (throughput + feasibility verdict): measured, real data, pure inference (no
+training): 3.81ms/tick, 262 ticks/sec, 5.24 implied L2-decisions/sec, single env.
+Combined with L2's own 4.15 dec/sec (real training, no L1) -- not apples-to-apples
+(mine=inference-only+L1-stubbed, theirs=training+backprop+no-L1) but both land in
+the same ~4-5/sec band, pointing at the SAME bottleneck L2 already found
+(env.reset()/step() I/O, not gradient updates, not L1). Plain verdict: three-tier
+training remains impractical at today's single-env throughput -- this confirms,
+not changes, L2's own prior conclusion, now with L1 included. Full stack DOES run
+end-to-end correctly (L1 stubbed at the LLM boundary only, everything else real) --
+validated as a correctness harness, not a training-ready pipeline. Parallelizing
+across envs (L2's own recommendation) remains the open path to making training
+practical; L1's real-Ollama gap is a second, independent blocker on top of it for
+anything beyond a stubbed-L1 correctness check.
+
+Files this round: src/agents/orchestrator_graph.py, tests/test_orchestrator_graph.py
+(both committed 55e9b09). docs/reports/l1l2l3_integration_correctness.md (941aa0e).
+Did NOT touch src/agents/l1_macro_analyst.py, src/data/l1_features.py (unchanged,
+already committed prior rounds), or any L2/L3-owned file.
+
+PRIOR ENTRY BELOW, for context on l1_features.py's own build and CLAUDE.md:
 State: L1MacroAnalyst + orchestrator_graph.macro_tick() (committed bb47856, as before)
 and the Ollama systemd fix (infra only, not a repo commit, as before) are unchanged this
 round. NEW this round: src/data/l1_features.py (build_l1_feature_summary()) is built,
