@@ -711,10 +711,20 @@ def main() -> None:
         raise ValueError("--resume-from and --resume-vecnormalize must be given together")
 
     run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    args.run_name = run_name  # resolved value, not the raw None default -- see the config dump below
     args.data_dir = args.data_dir or (NUMERIC_DATA_DIR if args.use_numeric_format else PARQUET_DATA_DIR)
 
     run_label = "SMOKE TEST" if args.smoke_test else "TRAINING RUN"
     print(f"=== L2 SAC {run_label} (run_name={run_name}) ===")
+    # Full resolved config, every arg after defaults/auto-resolution -- printed once, in
+    # full, so the log file alone (not the launch command someone may not have kept) is
+    # the record of exactly what ran. The scattered prints below this cover a few values
+    # with extra context (sha256, date ranges) this dump doesn't have room to explain;
+    # this dump exists so nothing is missing from the log even if none of those fire.
+    print("--- resolved config ---")
+    for key in sorted(vars(args)):
+        print(f"  {key}={getattr(args, key)}")
+    print("------------------------")
     print(
         f"data format: {'numeric (.npzst)' if args.use_numeric_format else 'parquet/JSON'} "
         f"-- data_dir={args.data_dir}"
