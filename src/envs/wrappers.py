@@ -4,8 +4,8 @@ FINAL SPEC section) for the full design rationale this implements: the observati
 index-mapping table (2a/2e), the TWAP-schedule-deviation scalar (2b), the previous-action
 toggle (2c), and the participation-rate-multiplier action-space transform.
 
-Two corrections discovered during implementation, not in the design doc as originally
-written (see that doc's own implementation-note addendum for the first):
+Four corrections discovered during implementation, not in the design doc as originally
+written (see that doc's own implementation-note addendum for the first two):
 
 1. schedule_deviation's TWAP baseline is NOT read via
    `env._compute_l2_target_slice_ratio()` as the design doc originally described --
@@ -23,6 +23,31 @@ written (see that doc's own implementation-note addendum for the first):
    deliberately excludes action history and flags its own findings as untested for
    off-policy methods. Kept as a toggle (a legitimate ablation), not presented as
    precedent-backed.
+3. The frozen L3 policy's own inner predict() calls were hardcoded `deterministic=False`
+   unconditionally, with no way for a caller to get deterministic frozen-L3 behavior --
+   caught by tests/test_train_l2.py's own eval-callback determinism test (identical seed
+   + identical L2 action produced the same terminal fill_ratio/IS but a DIFFERENT
+   per-tick reward trajectory, because L3's own actions were still being sampled
+   stochastically underneath regardless of what "deterministic" meant to the outer
+   caller). This directly undermined the whole point of a paired, reproducible eval
+   comparison -- an eval callback calling `predict(..., deterministic=True)` for its OWN
+   L2 action still got a non-reproducible frozen L3 policy underneath it. Fixed by adding
+   an `l3_deterministic` constructor parameter (default `False`, preserving prior
+   training-time behavior) that `FrozenL3Wrapper.step()` now actually passes through to
+   `self.l3_model.predict()`; eval call sites should construct with
+   `l3_deterministic=True`.
+4. `l2_target_slice_ratio_override`/`l2_urgency` were left holding whatever the PREVIOUS
+   episode's last step() set them to across a reused instance (real for every episode
+   after the first, in both training and eval) -- LOBExecutionEnv.reset() never touches
+   either attribute, so env.reset()'s own first _build_obs() call (which is exactly what
+   gets fed to the frozen L3 policy) would silently read stale, prior-episode state
+   instead of a fresh default. Also caught by the same determinism test as correction 3
+   (fixing correction 3 alone was not enough -- fill_ratio/IS matched but total_reward
+   still didn't, because the L3 action sequence itself still differed run to run). Fixed
+   by resetting both to their neutral defaults (None, 0.5) at the START of reset(),
+   before calling env.reset() -- see reset()'s own comment for why this matters for both
+   training (a real cross-episode leak) and eval (undermines paired-seed
+   reproducibility specifically).
 """
 from __future__ import annotations
 
@@ -135,11 +160,25 @@ class FrozenL3Wrapper(gym.Wrapper):
         l3_vecnormalize_path: str,
         ticks_per_l2_decision: int = 50,
         l2_include_prev_action: bool = False,
+        l3_deterministic: bool = False,
     ) -> None:
         super().__init__(env)
         self.l3_model = l3_model
         self.n_ticks = ticks_per_l2_decision
         self.l2_include_prev_action = l2_include_prev_action
+        # Controls the FROZEN L3 policy's own inner predict() calls -- separate from
+        # whatever determinism the caller (e.g. SAC training vs. an eval callback) uses
+        # for its OWN action selection. False (stochastic sampling) by default, matching
+        # L3's own training-time convention and this wrapper's original behavior.
+        # Real bug this parameter fixes, caught by tests/test_train_l2.py's own
+        # determinism test (identical seed + identical L2 action still produced a
+        # different per-tick reward trajectory, though the same terminal fill_ratio/IS,
+        # because the frozen L3 policy was ALWAYS sampled stochastically inside step()
+        # regardless of what "deterministic" meant to the caller): an eval callback
+        # driving L2 with deterministic=True still got a non-reproducible frozen L3
+        # policy underneath it, undermining the whole point of a paired, repeatable eval
+        # comparison. Eval call sites should pass l3_deterministic=True.
+        self.l3_deterministic = l3_deterministic
 
         # Load the frozen checkpoint's saved observation-normalization stats -- the
         # checkpoint was trained under VecNormalize(norm_obs=True, clip_obs=5.0)
@@ -165,6 +204,25 @@ class FrozenL3Wrapper(gym.Wrapper):
         self._l3_episode_start: bool = True
 
     def reset(self, **kwargs):
+        # Reset the env's own l2_target_slice_ratio_override/l2_urgency BEFORE calling
+        # env.reset() -- LOBExecutionEnv.reset() does not touch either attribute (only
+        # __init__ and the wrapper's own step() ever set them), so on a reused instance
+        # (every real episode after the first, in both training and eval) they would
+        # otherwise still hold whatever the PREVIOUS episode's last step() left them at.
+        # Since env.reset()'s own _build_obs() call reads them immediately (idx 15/16 of
+        # the raw obs, which IS what gets fed to the frozen L3 policy), that leftover
+        # state would leak into the very first tick of the new episode -- silently, not
+        # an error, but breaking two real things: (1) each episode no longer starts from
+        # the neutral state a fresh instance would give, a real cross-episode data leak
+        # during training; (2) ValISEvalCallback's reused eval env would make episode N's
+        # first observation depend on whatever L2 action ended episode N-1, which differs
+        # firing-to-firing as L2 trains -- undermining the paired-seed reproducibility the
+        # whole eval design depends on. Caught by tests/test_train_l2.py's determinism
+        # test (identical seed + identical action still gave a different total_reward,
+        # despite identical fill_ratio/IS -- the L3 action sequence itself differed
+        # because its first observation differed).
+        self.env.l2_target_slice_ratio_override = None
+        self.env.l2_urgency = 0.5
         obs, info = self.env.reset(**kwargs)
         self._l3_obs = obs
         self._last_info = info
@@ -221,7 +279,7 @@ class FrozenL3Wrapper(gym.Wrapper):
                 norm_obs,
                 state=self._l3_lstm_state,
                 episode_start=np.array([self._l3_episode_start]),
-                deterministic=False,
+                deterministic=self.l3_deterministic,
             )
             self._l3_episode_start = False
             l3_obs, r, terminated, truncated, info = self.env.step(l3_action)

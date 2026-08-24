@@ -32,8 +32,12 @@ on a final frozen checkpoint (see "What's blocking" below). When it does, only
 - **`src/train/train_l2.py`** -- SAC wiring against `FrozenL3Wrapper`. CLI requires
   `--l3-checkpoint`/`--l3-vecnormalize`/`--total-timesteps` explicitly (no defaults, so a real
   run can't be launched by omission). No reward-override flags -- see "Reward function" below.
-- **`tests/test_wrappers.py`** -- 19 fast hand-computed-fixture tests (no GPU) + 1 gated
-  integration smoke test against the real current checkpoint.
+- **`tests/test_wrappers.py`** -- 21 fast hand-computed-fixture tests (no GPU) + 1 gated
+  integration smoke test against the real current checkpoint (2 added this round -- see Task
+  2 below).
+- **`src/train/train_l2.py::ValISEvalCallback`** (Task 2, this round) -- held-out periodic
+  evaluation vs. a TWAP-passthrough baseline, wired in behind `--eval`/`--no-eval` (default
+  ON). See the Task 2 section below for defaults and two real bugs it caught.
 - **Smoke test** (2026-08-20, `git log` `87d7ba7`): 200 `total_timesteps`, ran cleanly
   end-to-end, no shape/interface errors between the wrapper and SAC. Validated **wiring**,
   not policy quality -- see "Checkpoint identity" below for why this holds regardless of
@@ -196,7 +200,8 @@ accumulated buffer data would be wasteful -- so: before the real budget, not bef
 design work.
 
 **(b) A held-out eval callback analogous to L3's `ValISEvalCallback`.**
-**Recommend building one. Unlike (a), this DOES block a real full-budget run.**
+**Recommended, and now BUILT -- see the Task 2 section below for the implementation,
+two real bugs it caught, and its own tests.**
 
 Reasoning: without any periodic evaluation, there is no way to tell *during* a long run
 whether L2 is learning anything useful, diverging, or performing no better than a trivial
@@ -299,6 +304,72 @@ callback as blocking, not optional, for launching at this rate.
   of how fast the *frozen L3 policy* completes orders, not something L2's own design
   controls -- noted as context for the `reset()` finding, not something to "fix" here.
 
+### Task 2 (2026-08-21, this round): held-out eval callback -- built
+
+`ValISEvalCallback` in `src/train/train_l2.py`, modeled directly on `train_l3.py`'s own
+class of the same name (read first, per instruction) -- same held-out-`val`-split,
+paired-seed, real-`compute_implementation_shortfall()`-via-
+`info["implementation_shortfall"]` conventions. Baseline is "TWAP passthrough" (L2 always
+outputs `participation_rate_multiplier=1.0`/`urgency=0.5` -- zero L2 steering, letting the
+frozen L3 policy execute on-schedule alone), the L2-analog of L3's `TWAPPolicy` baseline.
+Wired into `train_l2.py` behind `--eval`/`--no-eval` (`argparse.BooleanOptionalAction`,
+**default ON** -- a long run should not fly blind by default, matching this round's
+Throughput finding above).
+
+**Defaults, sized against the measured throughput, not copied from L3's own n=50:**
+`--eval-freq 10_000` (~40 minutes between firings at the measured ~4.15 decisions/sec),
+`--n-eval-episodes 10` (~4.3s/episode -- one `reset()` at ~2.0s plus ~18 decisions at the
+measured ~0.129s non-reset cost -- so ~43s/firing, under 2% overhead at the chosen
+`--eval-freq`). L3's `n=50` was sized for statistical-significance testing; L2's `n=10` is
+deliberately not aiming for that -- the goal here is "catch an obviously broken run
+within about an hour," a cheaper, different bar. Full arithmetic in each flag's own
+`--help` text, not just this doc.
+
+**Two real bugs found via this callback's own tests, fixed in `wrappers.py` (now 4
+corrections total there, see its module docstring):**
+1. `FrozenL3Wrapper.step()` hardcoded the frozen L3 policy's own inner `predict()` calls
+   to `deterministic=False` unconditionally -- meaning even a caller requesting
+   deterministic L2 evaluation still got a *stochastic* frozen L3 policy underneath it,
+   silently undermining the entire premise of a paired, reproducible eval comparison (two
+   firings with identical seeds could get genuinely different L3 behavior). Fixed by
+   adding an `l3_deterministic` constructor parameter (default `False`, preserving prior
+   training-time behavior); `ValISEvalCallback` constructs its own eval env with
+   `l3_deterministic=True`.
+2. Fixing (1) alone did not make eval reproducible. `env.l2_target_slice_ratio_override`/
+   `env.l2_urgency` are plain attributes `LOBExecutionEnv.reset()` never touches -- only
+   `__init__` and the wrapper's own `step()` ever set them -- so on any reused instance
+   (every episode after the first, in both training *and* eval, since the same env
+   instance is reused across many episodes) they were left holding whatever the
+   *previous* episode's last `step()` set them to. Since `env.reset()`'s own first
+   `_build_obs()` call reads them immediately (raw obs idx 15/16, part of what's fed to
+   the frozen L3 policy), this leaked stale, prior-episode state into every new episode's
+   very first tick -- a real cross-episode data leak during training, and specifically
+   fatal to eval's paired-seed reproducibility (episode N's first observation would
+   depend on whatever L2 action ended episode N-1, which differs firing-to-firing as L2
+   trains, adding pure noise unrelated to genuine policy improvement). Fixed by resetting
+   both to their neutral defaults (`None`, `0.5`) at the *start* of `FrozenL3Wrapper.reset()`,
+   before calling the underlying `env.reset()`.
+
+Both caught by `tests/test_train_l2.py`'s own `_run_episode` determinism test (identical
+seed + identical fixed action produced identical terminal `fill_ratio`/`IS_total_bps` but a
+*different* `total_reward` -- the aggregate outcome coincidentally matched while the
+underlying per-tick trajectory didn't, which is exactly the kind of thing a "did it run"
+smoke test would have missed). Each has its own dedicated regression test in
+`tests/test_wrappers.py` too, not just the integration-level catch in `test_train_l2.py`.
+
+One more bug, unrelated to reproducibility, also caught this round: a literal `%` character
+in `--n-eval-episodes`'s help text broke `argparse`'s own `%`-style string expansion,
+crashing `--help` (and any invocation reaching the error-formatting path) with a
+`TypeError`. Fixed by escaping it (`%%`); verified `--help` now exits 0.
+
+Tests: 12 new (2 in `tests/test_wrappers.py` for the two bugs above, 10 in the new
+`tests/test_train_l2.py` for `ValISEvalCallback`/env-construction helpers) -- all
+hand-computed-fixture or determinism-assertion style, no GPU, no real checkpoint, matching
+`tests/test_wrappers.py`'s own established pattern. Full suite (`test_wrappers.py` +
+`test_train_l2.py`, excluding the gated integration smoke test): 31/31 passing.
+
+**Not built, out of scope for this round:** Decision (a) above (VecNormalize on L2's own
+obs/reward) is still only decided, not implemented -- unaffected by this round's work.
 
 ### What's currently blocking
 
@@ -306,14 +377,14 @@ callback as blocking, not optional, for launching at this rate.
 frozen L3 checkpoint -- when that result lands, the only things that need to change on L2's
 side are `--l3-checkpoint` and `--l3-vecnormalize`; everything else (observation space,
 action-space transform, hyperparameters, wrapper mechanics) is independent of which
-checkpoint wins. (2) **Throughput, newly confirmed this round (see above) -- a real run at
-the current single-env design is impractical (~5.5 days), not just slow.** Parallelizing
-(the primary recommendation above) is not yet built. Recommend treating both as blocking a
-*real* launch: even once the A/B result lands, launching at ~5.5 days/run without
-parallelization would be a real cost, not a formality. The two decisions from the prior
-round ((a) VecNormalize, (b) eval callback -- (b) now built, see below) remain recommended
-before a real run specifically; none of the four items here block further design or
-CPU-only wiring work, and can be built in parallel with waiting on the A/B result.
+checkpoint wins. (2) **Throughput -- a real run at the current single-env design is
+impractical (~5.5 days), not just slow.** Parallelizing (the primary recommendation above)
+is not yet built. Recommend treating both as blocking a *real* launch: even once the A/B
+result lands, launching at ~5.5 days/run without parallelization would be a real cost, not
+a formality. Decision (a) (VecNormalize on L2's own obs/reward) remains recommended before
+a real run specifically, not blocking; decision (b) (eval callback) is now built (Task 2
+above) -- neither blocks further design or CPU-only wiring work, and (a) can still be built
+in parallel with waiting on the A/B result.
 
 ---
 

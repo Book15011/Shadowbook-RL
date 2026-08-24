@@ -365,6 +365,61 @@ def test_lstm_episode_start_resets_true_on_new_episode(tmp_path, monkeypatch):
     assert wrapper._l3_lstm_state is not None or True  # state exists post-step (non-None after any predict call)
 
 
+def test_l3_deterministic_flag_controls_inner_predict_determinism(tmp_path, monkeypatch):
+    # Regression test for a real bug: the frozen L3 policy's own inner predict() calls
+    # were hardcoded deterministic=False regardless of caller intent, discovered via
+    # tests/test_train_l2.py's own eval-callback determinism test. l3_deterministic
+    # (default False, preserving prior training-time behavior) must actually reach
+    # l3_model.predict()'s own deterministic= argument.
+    env = _build_env(tmp_path)
+    model = _build_tiny_recurrent_ppo(env)
+    vecnorm_path = _default_vecnormalize_path(tmp_path, env)
+
+    deterministic_flags_seen = []
+    original_predict = model.predict
+
+    def spy_predict(observation, state=None, episode_start=None, deterministic=False):
+        deterministic_flags_seen.append(deterministic)
+        return original_predict(observation, state=state, episode_start=episode_start, deterministic=deterministic)
+
+    monkeypatch.setattr(model, "predict", spy_predict)
+
+    wrapper_default = FrozenL3Wrapper(env, model, vecnorm_path, ticks_per_l2_decision=2)
+    wrapper_default.reset(seed=0)
+    wrapper_default.step(np.array([1.0, 0.5], dtype=np.float32))
+    assert deterministic_flags_seen == [False, False]
+
+    deterministic_flags_seen.clear()
+    wrapper_det = FrozenL3Wrapper(env, model, vecnorm_path, ticks_per_l2_decision=2, l3_deterministic=True)
+    wrapper_det.reset(seed=0)
+    wrapper_det.step(np.array([1.0, 0.5], dtype=np.float32))
+    assert deterministic_flags_seen == [True, True]
+
+
+def test_reset_clears_l2_target_slice_ratio_override_and_urgency(tmp_path):
+    # Regression test for a real bug: on a reused instance (every episode after the
+    # first, in both training and eval), env.l2_target_slice_ratio_override/l2_urgency
+    # were left holding the PREVIOUS episode's last step()-set values, since
+    # LOBExecutionEnv.reset() never touches either attribute -- silently leaking stale
+    # state into the new episode's very first observation (idx 15/16 of the raw obs fed
+    # to the frozen L3 policy). Also caught via tests/test_train_l2.py's determinism
+    # test: fixing l3_deterministic alone wasn't enough, because this leak meant the two
+    # runs' first L3 observations genuinely differed.
+    env = _build_env(tmp_path, horizon_ticks=20)
+    model = _build_tiny_recurrent_ppo(env)
+    vecnorm_path = _default_vecnormalize_path(tmp_path, env)
+    wrapper = FrozenL3Wrapper(env, model, vecnorm_path, ticks_per_l2_decision=4)
+
+    wrapper.reset(seed=0)
+    wrapper.step(np.array([1.5, 0.9], dtype=np.float32))  # leaves both attributes non-default
+    assert env.l2_target_slice_ratio_override is not None
+    assert env.l2_urgency == pytest.approx(0.9)
+
+    wrapper.reset(seed=1)  # new episode, same instance -- must NOT see the leftover values above
+    assert env.l2_target_slice_ratio_override is None
+    assert env.l2_urgency == pytest.approx(0.5)
+
+
 # --------------------------------------------------------------------------------------
 # Integration smoke test -- real checkpoint. Gated behind a fresh GPU/RAM check; run
 # manually, not part of the default fast suite (see skip condition below). The target

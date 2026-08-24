@@ -204,51 +204,61 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
-Last updated: 2026-08-21 22:42 HKT
-State: Consolidation round -- no new features, no training. DONE: FrozenL3Wrapper
-(src/envs/wrappers.py), train_l2.py, tests/test_wrappers.py (20/20 passing) are all built,
-committed locally, and smoke-tested (200-step mechanics-only run, no shape/interface
-errors between the wrapper and SAC). Design doc (docs/reports/
-phase4_l2_reconciliation_and_plan.md) reorganized this round -- a "CURRENT STATE" section
-now sits at the top and reads standalone, with the full decision trail (including reasoning
-later corrected or superseded) preserved below it rather than interleaved.
-Checkpoint-citation correction (thanks to L3's own proactive note on this section, folded
-in here): the smoke test's earlier reported sha256 973b2883... was genuinely live-computed
-and accurate at the time (20:49 HKT that day) -- it went stale ~2 hours later when a
-separate L3-track probe run's own final save overwrote models/l3_executioner_v1.zip
-(confirmed via file mtime and TRACK_STATUS's own incident writeup). Re-verified directly
-this round: the canonical path now holds sha256 27afa91e... (L3's numerically-verified
-step-2,000,000 stand-in). Corrected everywhere this track owns it (design doc, this
-section); nothing in wrappers.py/train_l2.py/test_wrappers.py needed correction since none
-of them ever hardcoded a checksum -- all checked, all compute/reference by path, not by
-hash. The smoke test's own validity is unaffected: it tested wiring, not policy quality.
-Two items flagged last round as deliberately deferred are now decided (not implemented):
-(a) VecNormalize on L2's OWN observation/reward space (distinct from the frozen L3 stats
-already applied to L3's inputs) -- recommend adding before a real run, does not block
-further work; L2's 41-dim obs mixes window-averaged features (lower variance) with
-instantaneous ones (full variance) plus a genuinely non-stationary new scalar
-(schedule_deviation), arguably a stronger case for adaptive normalization than L3's own
-already-homogeneous vector. (b) A held-out eval callback analogous to L3's
-ValISEvalCallback -- recommend building one, and unlike (a) this DOES block a real run: the
-wrapper's mechanism is structurally expensive per SAC step (a gradient update on every
-single L2 decision, each costing up to 50 real L3-predict+env.step calls, single env, no
-parallelism), so a real 2,000,000-step run could plausibly take multiple days of wall-clock
-time with zero visibility into whether it's working without one. Full reasoning for both in
-the design doc's CURRENT STATE section.
-Files owned/in-progress: none uncommitted. src/envs/wrappers.py, src/train/train_l2.py,
-tests/test_wrappers.py all committed (1603c61, 87d7ba7). docs/reports/
-phase4_l2_reconciliation_and_plan.md reorganized and committed this round.
-Blocking/open questions: L3's matched A/B training runs, which will determine the final
-frozen L3 checkpoint -- this is now the ONLY thing blocking a real L2 training launch. When
-the A/B result lands, only --l3-checkpoint/--l3-vecnormalize need to change on L2's side;
-everything else (observation space, action-space transform, hyperparameters, wrapper
-mechanics) is independent of which specific checkpoint wins. Separately, not blocking: (a)
-and (b) above are recommended before a REAL full-budget run specifically, not before the
-A/B result lands -- could be built in parallel with waiting, if useful.
-Next planned step: awaiting the L3 A/B result. Candidate parallel work if useful before
-then: build the VecNormalize wrapping and/or the simplified held-out eval callback decided
-above (neither implemented yet, both are "decided, not built"). No training launch planned
-until both the checkpoint question resolves and, ideally, (b) exists.
+Last updated: 2026-08-24 08:05 HKT
+State: Two CPU-only follow-ups while blocked on L3's A/B runs, both complete. TASK 1
+(throughput measurement, no new run -- extracted from the existing smoke test's own
+artifacts: checkpoint mtimes, TensorBoard log, console output): steady-state rate ~4.15
+decisions/sec single-env; a real 2,000,000-step run extrapolates to ~5.5 days. Headline
+finding: ~47% of wall-clock is env.reset() overhead, not the 50-tick inner loop -- L2
+episodes end short (~18 decisions, not 60) because the frozen L3 policy completes orders
+early, so reset() (cited from L3's own ~2027ms measurement) is paid disproportionately
+often per unit of L2 training. Plain answer: not practical at this throughput. Primary
+recommendation (not built): parallelize envs (SubprocVecEnv, mirroring L3's own n_envs=8),
+addresses both halves at once, plausibly under a day -- flagged real constraint: L2's own
+parallel envs would contend for GPU with L3's concurrent work.
+TASK 2 (held-out eval callback, built): ValISEvalCallback in train_l2.py, modeled on
+train_l3.py's own class (read first) -- same held-out-val-split/paired-seed/real-IS-metric
+conventions, TWAP-passthrough baseline (zero L2 steering). Wired in behind --eval/--no-eval
+(default ON). Defaults sized against Task 1's measured rate, not L3's n=50: --eval-freq
+10,000 (~40min between firings), --n-eval-episodes 10 (~43s/firing, <2% overhead) -- L3's
+n=50 was sized for statistical significance, L2's n=10 for "catch an obviously broken run
+within about an hour" instead, a cheaper, different bar.
+Two real bugs found via this callback's own tests, fixed in wrappers.py (now 4 corrections
+there total, see its module docstring): (1) FrozenL3Wrapper.step() hardcoded the frozen L3
+policy's OWN inner predict() calls to deterministic=False unconditionally -- even a caller
+requesting deterministic L2 eval still got a stochastic frozen L3 underneath it, silently
+breaking paired-eval reproducibility. Fixed via a new l3_deterministic constructor param
+(default False, preserves training behavior; eval constructs with True). (2) Fixing (1)
+alone wasn't enough: env.l2_target_slice_ratio_override/l2_urgency are never reset by
+LOBExecutionEnv.reset() (only __init__ and the wrapper's own step() touch them), so a
+reused instance (every episode after the first, in training AND eval) leaked the PREVIOUS
+episode's leftover L2 state into the new episode's very first L3 observation -- a real
+cross-episode data leak, and specifically fatal to eval's paired-seed guarantee. Fixed by
+resetting both to neutral defaults at the start of FrozenL3Wrapper.reset(), before calling
+env.reset(). Both caught by the SAME determinism test (identical seed+action produced
+identical terminal fill_ratio/IS but different total_reward -- the aggregate coincidentally
+matched while the per-tick trajectory didn't). Each also has its own dedicated regression
+test in test_wrappers.py, not just the integration-level catch. Third, unrelated bug also
+caught: a literal % in --n-eval-episodes' help text broke argparse's own string expansion,
+crashing --help with a TypeError -- fixed (escaped as %%), verified --help exits 0.
+Tests: 12 new (2 in test_wrappers.py for the two reproducibility bugs, 10 in new
+tests/test_train_l2.py for ValISEvalCallback/env-construction helpers), all hand-computed-
+fixture or determinism-assertion style, no GPU, no real checkpoint. Full suite
+(test_wrappers.py + test_train_l2.py, excluding the gated integration smoke test): 31/31
+passing. Design doc reorganized further -- Task 1/Task 2 findings folded into CURRENT
+STATE, decision (b) marked built, decision (a) (VecNormalize on L2's own obs/reward) still
+only decided, not implemented.
+Files owned/in-progress: none uncommitted as of this update -- src/envs/wrappers.py,
+src/train/train_l2.py, tests/test_wrappers.py, tests/test_train_l2.py (new),
+docs/reports/phase4_l2_reconciliation_and_plan.md all committed this round (see git log
+for exact hashes).
+Blocking/open questions: two things, not one -- (1) L3's matched A/B runs (checkpoint
+choice, unaffected by this round), (2) throughput -- a real run at the current single-env
+design is impractical (~5.5 days), not just slow, and parallelization is not yet built.
+Recommend treating both as blocking a REAL launch, even once (1) resolves. Decision (a)
+(VecNormalize) remains recommended before a real run, not blocking further work.
+Next planned step: awaiting direction on parallelization (design/build) and the L3 A/B
+result. No training launch planned until both land.
 
 ## L3 / Env-Physics
 Last updated: 2026-08-23 18:15 HKT
