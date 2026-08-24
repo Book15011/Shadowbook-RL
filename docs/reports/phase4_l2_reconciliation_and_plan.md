@@ -926,6 +926,188 @@ evidence behind it, since this round's own equivalence check (10 fixed seeds, by
 before/after) is itself a seed-reproducibility proof, on top of the parallelization
 benchmark's low CoV from last round.
 
+### env.reset() I/O round (2026-08-24, round 2) -- reading less: mostly a wall, one small real win
+
+Same hard boundaries as last round (`lob_execution_env.py` editing in-scope, `reward.py`/
+`train_l3.py`/L1's files untouched). This round attacks `_load_day`'s ~1400-1560ms/miss
+cost directly, now that last round's vectorization exhausted the compute-bound side of
+`reset()` and confirmed caching is a dead end at real (405-day) scale.
+
+#### Task 1 -- reading less per reset: investigated three angles, two are dead ends
+
+**Parquet file layout, checked directly, not assumed:** `pyarrow.parquet.ParquetFile(path).metadata`
+shows **every day file is stored as a single row group** (863,997 rows, 1 row group,
+104.7MB on disk). This one fact rules out the two most promising-looking angles before any
+implementation:
+
+1. **Row-group pushdown: a hard dead end.** Parquet's standard read API (both pandas'
+   `read_parquet` and `pyarrow.parquet.read_table`) can only skip *entire row groups* it
+   doesn't need -- there is no API-level way to decode a sub-range of rows *within* a row
+   group without decoding the whole group. With exactly one row group per file, "read only
+   the window" is not achievable through the standard API regardless of how reset()'s own
+   flow is restructured.
+2. **Predicate/page-index pushdown: tested directly, confirmed not just assumed.**
+   `pyarrow.parquet.read_table(path, filters=[("ts", ">=", lo), ("ts", "<", hi)])` for a
+   ~3,600-row window was timed against a full read: **the filtered read was SLOWER (0.84x)
+   than the full read**, not faster -- it decoded the entire file, then filtered in memory.
+   A direct column-index metadata check confirms why: `"not supported in parquet-cpp"` --
+   this pyarrow build doesn't expose the page-index machinery that could, in principle,
+   allow sub-row-group skipping. No real skipping is happening; filtering only adds
+   overhead here.
+
+Given both, **the CRITICAL ordering constraint the task flagged turned out not to bind**:
+since there is no way to read fewer rows than the whole file regardless of how `reset()` is
+restructured, there was no need to defer the day-load past the RNG draw, and `n_rows` still
+comes from `len(day_df)` exactly as before -- unchanged, zero risk to the draw sequence.
+
+3. **Column pruning: real, but small.** Confirmed via grep that `symbol`/`update_id`/`seq`
+   (3 of the file's 9 columns) are never referenced anywhere in `lob_execution_env.py`.
+   Measured the split directly: the 5 needed numeric/ts columns decode in **~48ms**; `bids`+
+   `asks` (JSON-string order-book levels) alone account for **~1,500-1,570ms -- ~97% of
+   total decode cost**. Pruning the 3 unused columns therefore removes a cost that was
+   already negligible next to `bids`/`asks`: measured **0-4% faster across 5 real days,
+   including one day that came in slightly (4.1%) SLOWER** -- essentially noise-level, not
+   a meaningful lever on its own. **Implemented anyway**: free, zero behavior risk (row
+   count is unaffected by column selection), verified byte-identical (see Task 3's
+   equivalence gate below) -- reported honestly as a small, not a load-bearing, win.
+
+   Also checked in passing: pyarrow's decode is **already multi-threaded by default**
+   (explicitly disabling threads made reads 15-20% SLOWER, not faster) -- there is no
+   unclaimed thread-parallelism lever here either, and this has been true throughout every
+   prior round's benchmarks, unaffected by this round's own thread-capping (which governs
+   torch/BLAS, not pyarrow's separate internal thread pool).
+
+**Dtype downcasting: not applicable to the actual bottleneck, not implemented.** The
+columns that could be downcast (`best_bid`/`best_ask`/`mid_price`/`spread`, currently
+`double`) are already part of the ~48ms-negligible numeric-column cost -- downcasting them
+would not move total reset() time even if it were safe. The real cost, `bids`/`asks`, is
+stored as JSON strings, not a numeric column at the parquet level -- there is nothing to
+downcast there without a full storage-format rewrite (see below). Not tested against the
+equivalence gate since there is no plausible upside to weigh against the risk.
+
+**What would actually move `_load_day`'s cost, and why it's out of scope:** the real lever
+is the storage format itself -- `bids`/`asks` as JSON strings requires materializing ~1.7M
+Python string objects per file just to decode, before any parsing even happens. A
+fixed-width numeric encoding (e.g. flat float32 arrays instead of JSON) would plausibly cut
+this dramatically -- but that means rewriting `scripts/collect_l2_bybit.py` and regenerating
+all 405+ day files, a shared-data-pipeline change with broad blast radius well beyond this
+round's `lob_execution_env.py`-only scope. Flagged, not pursued. **Stated plainly, per
+instruction: parquet reads are irreducibly expensive for this access pattern, given the
+current storage format -- this is a real wall, not a gap closed by more engineering effort
+within this round's scope.**
+
+#### Task 2 -- lazy TickView construction: evaluated, not implemented
+
+Flagged last round as higher-payoff/higher-risk, deferred pending a look at whether Task 1
+would leave room for it to matter. It does not, by a wide margin. With `_precompute_feature_series`
+already vectorized to ~19ms (last round) and `_build_ticks` at ~160-170ms (real scale),
+the theoretical ceiling for laziness is bounded by the portion of the ~3,600-tick built
+window that a typical episode never visits before terminating early (~18 of up to 60
+possible decisions, per the established measurement) -- **roughly 58% of the horizon
+portion, but NOT the ~600-tick buffer (needed unconditionally for the first decision's
+rolling-window features)**. That bounds the realistic saving at roughly **~100ms out of a
+~1,570ms real-scale reset() -- about 6%**, translating to roughly 2-3% of total decision-
+loop wall-clock once `L3.predict()`/`env.step()`/`SAC.train()`'s own shares are counted in.
+**Recommendation: do not implement.** A refactor that changes *when* computation happens
+(not just *how*, as last round's vectorization did) carries materially more risk of a
+subtle equivalence break, for a ceiling this small, in the round explicitly framed as the
+last one before training. Last round's win already captured the large, low-risk part of
+this area; what's left here isn't worth the risk this round.
+
+#### Task 3 -- measured, and the direction question answered carefully
+
+**Seed-equivalence gate (same method as last round, reused exactly, including the
+unseeded cache-hit path):** 10 fixed real seeds, `env.reset()`/`env.step()` traces
+(observations at every tick, rewards, terminal IS) captured before and after the
+column-pruning edit, compared via exact `np.array_equal` -- **PASS, byte-identical across
+all 10 seeds and both reset paths.** Full existing suite: 158/162 (same 4 pre-existing,
+unrelated failures as every round). Nothing diverged; nothing reverted.
+
+**Narrow-pool controlled benchmark, re-run unmodified** (same seed=42, same fixed 10-day
+pool, same 480 steps/trial, same 3 trials):
+
+| n_envs | last round (vectorization only) | this round (+ column pruning) | change |
+|---|---|---|---|
+| 1 | 6.224 dec/s | 6.791 dec/s | +9.1% |
+| 8 | 12.163 dec/s | **12.575 dec/s** | +3.4% |
+
+A real, small, reproducible further gain (CoV stayed 0.8-1.6%, not noise) -- consistent in
+size with the column-pruning measurement itself (0-4% per read), not overstated.
+
+**Realistic-cache-rate direction: leans toward the real gain being LARGER than this
+narrow-pool number shows, for a knowable reason, but the effect stays small in absolute
+terms.** Column pruning only pays off on a cache MISS (a hit just returns the
+already-pruned cached frame without re-reading) -- and misses happen far more often at
+real scale (97.6% of resets, vs. 51.2% in this benchmark's narrow pool, per last round's
+Task 1 hit-rate measurement). So the same per-miss saving applies on a larger fraction of
+resets in real training than it does here. **Direction: real gain > narrow-pool-measured
+gain.** But this doesn't change the bottom line much, because the thing being amplified is
+itself small (0-4% per read) -- amplifying a small number by a higher application-rate
+still leaves a small number.
+
+**A direct attempt to measure this at real scale was made and is reported, but flagged as
+unreliable, not used as the headline number:** running the same benchmark methodology over
+the real 405-day pool (instead of estimating) gave a single-trial n_envs=1 rate of
+7.521 dec/s -- nominally FASTER than the narrow pool's 6.791, the opposite of the expected
+direction. This is a real, demonstrated confound, not a contradiction of the reasoning
+above: the 405-day pool's much larger file count changes `self.np_random.integers(0,
+len(self._files))`'s entire draw sequence relative to the 10-day pool, even at the same
+seed -- so the two pools sample a genuinely different, uncontrolled sequence of
+episode lengths, and a full end-to-end throughput measurement conflates that
+confound with the cache-rate effect this task actually asked about. This is exactly the
+seed/date_range confound this project already learned to control for two rounds ago (the
+original 3.38-vs-8.53 dec/sec disagreement) -- reusing the SAME seed across repeated
+trials on the SAME pool controls for it, but comparing ACROSS pools of very different
+sizes at a fixed seed does not. The clean, trustworthy source for the cache-rate effect
+specifically is Task 1's own reset()-level profiling (n=40 resets/scenario, isolates
+`_load_day` directly): real-pool reset() cost (1,573ms) vs. narrow-pool blended reset()
+cost (921ms) -- confirms the expected direction cleanly, at the reset()-component level,
+without the episode-length confound a full-loop measurement introduces.
+
+**Re-extrapolated 2,000,000-step wall-clock, from the narrow-pool controlled rate
+directly** (consistent with every prior round's methodology):
+
+| n_envs | 2 rounds ago | last round (vectorization) | this round (+ pruning) |
+|---|---|---|---|
+| 8 | 2.38 days | 1.90 days | **1.84 days** |
+
+**Verdict, using the same stated buckets: still MARGINAL, not workable, not "needs
+rethinking."** A further small, real improvement (1.90 -> 1.84 days), not a qualitative
+change from last round's finding. Per this round's own instruction, the decision to
+proceed to training either way is already made -- this is reported as the honest final
+number for that decision, not as a gate on it.
+
+#### Task 4 -- summary of what passed, what didn't, what wasn't attempted
+
+**Implemented, passed the equivalence gate:** column pruning in `_load_day` (drop
+`symbol`/`update_id`/`seq`, confirmed unused anywhere in the file) -- small (0-4% per
+read) but real, zero behavior risk, byte-identical verified.
+
+**Investigated and rejected, with reasons, not attempted as code changes:**
+- Row-group pushdown -- impossible given this file layout (1 row group/file, confirmed via
+  metadata, not assumed).
+- Predicate/page-index pushdown -- tested directly; empirically SLOWER (0.84x) than a full
+  read, and the underlying page-index feature isn't supported by this pyarrow build. A
+  real, measured wall, not a theoretical one.
+- Dtype downcasting -- not applicable to the actual bottleneck (`bids`/`asks` are strings,
+  not a numeric column to downcast; the numeric columns that could be downcast are already
+  ~48ms, negligible). Not tested against the equivalence gate since there was no plausible
+  speed upside to weigh the equivalence risk against.
+- Lazy TickView construction (Task 2) -- evaluated with this round's profile in hand;
+  ceiling is now only ~6% of reset() (~2-3% of total wall-clock) given last round's
+  vectorization already captured the larger, safer win in this area. Not worth the
+  refactor risk this round, explicitly the last optimization round before training.
+
+**The honest bottom line, stated as the task invited:** parquet reads are irreducibly
+expensive for this access pattern, given the current JSON-string storage format for
+`bids`/`asks` (~97% of decode cost, confirmed by direct measurement) -- the only path to a
+materially cheaper read is a data-pipeline rewrite (fixed-width numeric encoding,
+regenerating all 405+ files), well outside this round's scope. **Across both optimization
+rounds combined: 9.729 -> 12.575 dec/s at n_envs=8 (+29.3%), 2.38 -> 1.84 days for a
+2,000,000-step run.** Real, worth having, verified safe at every step -- and, per this
+round's own framing, not something more engineering effort inside this approach was going
+to close further. Proceeding to training as planned.
+
 ### What's currently blocking
 
 **Checkpoint identity is RESOLVED** (2026-08-24): `docs/reports/l3_frozen_handoff.md`
@@ -934,25 +1116,24 @@ designates the frozen checkpoint (`models/l3_frozen_backup/l3_executioner_v1_fro
 result pending. `train_l2.py` needs no code changes to use it. Honest note carried over
 from that doc: this checkpoint ties TWAP, does not beat it.
 
-**Throughput verdict moved from NO to MARGINAL this round (2026-08-24), via a real,
-measured env.reset() optimization, not further parallelization.** The prior round's
-controlled benchmark found parallelizing envs alone insufficient (2.38 days at n_envs=8,
-outside the workable/marginal range). This round profiled reset() itself (Task 1 above),
-found ~77% of its own compute-bound sub-cost was an unvectorized Python loop, vectorized
-it with no behavior change (verified byte-identical, Task 3 above), and re-measured: a
-reproducible 25% throughput gain at n_envs=8, moving the 2,000,000-step extrapolation to
-**1.90 days -- inside the stated marginal band, not outside it.** This is not a clean
-"yes" (still not under the ~1 day workable bar) and the same representativeness caveats
-from before still apply, now with a concrete number behind them (this benchmark's 10-day
-pool sees a 48.8% day-cache hit rate; the real 405-day pool sees 2.4% -- Task 1's own
-finding) -- both caveats still lean toward the true number being worse than 1.90 days,
-not better. **Stated plainly: genuinely closer to practical than last round, not yet
-clearly practical.** Next steps (proceed at n_envs=8 accepting marginal economics, pursue
-the flagged-but-not-implemented lazy-tick-construction lever for a further gain, a smaller
-training budget, or accepting the current economics for a shorter run) remain a design
-decision for whoever owns the go/no-go, not resolved here. Decision (a) (VecNormalize on
-L2's own obs/reward) remains recommended before any real run, not blocking; decision (b)
-(eval callback) is built (Task 2, prior round).
+**Throughput optimization is CLOSED as of this round (2026-08-24, round 2 of 2) --
+proceeding to training regardless of the outcome, per instruction.** Two rounds:
+vectorizing reset()'s compute-bound cost (round 1: 9.729 -> 12.163 dec/s at n_envs=8) and
+reading less per reset (round 2, this one: column pruning, 12.163 -> 12.575 dec/s -- the
+larger I/O angles, row-group and predicate pushdown, are confirmed dead ends given this
+data's single-row-group storage layout, not just unexplored). Combined:
+**9.729 -> 12.575 dec/s (+29.3%), 2.38 -> 1.84 days for a 2,000,000-step run at n_envs=8.**
+Verdict unchanged from round 1's bucket: MARGINAL, not clearly workable, not "needs
+rethinking" -- round 2 moved the number further into that same band, not out of it. The
+representativeness caveat stands (this benchmark's narrow date pool likely still flatters
+the true number somewhat), but is now a smaller consideration given the underlying
+optimization itself has run its course. **Decision, per this round's explicit instruction:
+proceed to training at n_envs=8 regardless of this being "marginal" rather than "clearly
+workable"** -- further throughput engineering on this approach is not expected to close
+the remaining gap (see round 2's "irreducibly expensive" finding for `_load_day`'s I/O,
+and the small remaining ceiling found for lazy TickView construction). Decision (a)
+(VecNormalize on L2's own obs/reward) remains recommended before the real run, not
+blocking; decision (b) (eval callback) is built (Task 2, first parallelization round).
 
 ---
 

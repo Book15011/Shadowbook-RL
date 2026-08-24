@@ -283,6 +283,68 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-24 16:10 HKT
+State: env.reset() I/O round (round 2 of 2 on this cost, last one before training per
+instruction). Attacked _load_day's ~1400-1560ms/miss cost directly. Checked parquet file
+layout first, not assumed: every day file is ONE row group (863,997 rows, 104.7MB) --
+this rules out row-group pushdown entirely (no API-level way to decode a sub-range within
+a single row group). Tested predicate/page-index pushdown directly: a ts-range filter for
+a ~3,600-row window was SLOWER (0.84x) than a full read, not faster -- confirmed via
+metadata that this pyarrow build doesn't support page indexes. Both angles are real,
+measured dead ends, not unexplored.
+Column pruning (symbol/update_id/seq, confirmed unused via grep) was the one real lever:
+measured the split directly -- 5 needed numeric/ts columns decode in ~48ms, bids+asks
+(JSON-string book levels) alone are ~97% of decode cost (~1500-1570ms). Pruning the unused
+columns therefore only saved 0-4% across 5 real days (one day came in slightly slower) --
+small, but free and zero-risk, so implemented anyway. Dtype downcasting: not applicable to
+the actual bottleneck (bids/asks are strings, not a numeric column to downcast; the
+columns that could be downcast are already the negligible ~48ms slice) -- not implemented,
+no plausible upside to weigh against the equivalence risk.
+Lazy TickView construction (flagged last round, evaluated not implemented this round):
+with last round's vectorization already gutting _precompute_feature_series, the remaining
+ceiling here is bounded at ~6% of reset() (the unused-horizon portion only -- the buffer
+portion is needed unconditionally). Not worth the refactor risk in the round explicitly
+framed as the last one before training.
+Verified seed-equivalence (same 10-fixed-seed method as last round, reused exactly,
+including the unseeded cache-hit path): byte-identical (np.array_equal) before/after the
+column-pruning edit. Full suite: 158/162 passing, same 4 pre-existing unrelated failures.
+Re-ran the controlled n_envs benchmark unmodified: n_envs=8 12.163 -> 12.575 dec/sec
+(+3.4%). 2,000,000-step extrapolation: 1.90 -> 1.84 days. Verdict unchanged from last
+round's bucket: MARGINAL (same band, not "workable," not "needs rethinking"). Attempted a
+direct realistic-cache-rate measurement (full 405-day pool instead of estimating) and it
+is reported but explicitly flagged unreliable: a single-trial reading came in FASTER than
+the narrow pool, the wrong direction -- traced to a real confound (the much larger file
+pool changes the RNG draw sequence entirely at the same seed, so episode-length varies
+between pools for reasons unrelated to cache rate, the same class of confound this project
+already learned to control for two rounds ago). The trustworthy source for the cache-rate
+direction is the reset()-level profiling itself (n=40/scenario): real-pool reset() cost
+(1573ms) vs. narrow-pool blended (921ms) confirms the expected direction cleanly, without
+that confound.
+Bottom line, stated plainly per instruction: parquet reads are irreducibly expensive for
+this access pattern given the current JSON-string storage format for bids/asks -- a real
+wall, not a gap closed by more engineering within this round's scope. Combined across both
+optimization rounds: 9.729 -> 12.575 dec/s (+29.3%) at n_envs=8, 2.38 -> 1.84 days for
+2,000,000 steps. Per instruction, proceeding to training regardless of the marginal
+verdict -- this is the last optimization round.
+Full detail: docs/reports/phase4_l2_reconciliation_and_plan.md's new "env.reset() I/O
+round" section.
+Files: src/envs/lob_execution_env.py (edited further, column pruning only -- same
+in-scope basis as last round). scripts/measure_column_pruning.py,
+scripts/measure_column_split.py, scripts/measure_predicate_pushdown.py,
+scripts/benchmark_realistic_pool.py (new, throwaway investigation/measurement code).
+Committed this round as one commit (edit + scripts + doc updates).
+Files owned/in-progress: none uncommitted as of this update.
+Blocking/open questions: throughput engineering on this approach is now closed, both
+rounds' findings converge on the same MARGINAL verdict. Open for whoever owns training
+launch: proceed at n_envs=8 (recommended, best measured), decide on decision (a)
+(VecNormalize on L2's own obs/reward, still recommended not blocking) before launch.
+Next planned step: per instruction, move to the real training launch -- awaiting explicit
+go-ahead for that separate decision (a full training run remains outside this round's own
+scope, which was measurement/optimization only).
+
+PRIOR ENTRY BELOW, for context on the first reset() optimization round (vectorization)
+this round built on:
+
 Last updated: 2026-08-24 12:40 HKT
 State: env.reset() optimization round -- Task 0 first (docs/reports/v1_master_state.md,
 committed on its own, a full cross-track "as of now" snapshot frozen before any code

@@ -416,11 +416,24 @@ class LOBExecutionEnv(gym.Env):
     # probe" for the full arithmetic and why this was raised from 3.
     _MAX_CACHED_DAYS = 5
 
+    # Columns _build_ticks/_precompute_feature_series/reset() actually touch --
+    # confirmed via grep, not assumed (symbol/update_id/seq are never referenced
+    # anywhere in this file). Column pruning at read time (2026-08-24, this
+    # round's I/O investigation): measured ~0-4% real gain across 5 real days,
+    # not the large win it might look like on paper -- cProfile + a direct
+    # column-split measurement showed bids/asks (JSON-string levels) alone are
+    # ~97% of _load_day's real decode cost, so pruning the OTHER (cheap, ~48ms
+    # total) columns barely moves the total. Kept anyway: free, zero behavior
+    # risk (n_rows is unaffected -- row count, not column selection -- so the
+    # RNG draw sequence for file_idx/start is untouched), verified
+    # byte-identical (see tests/test_reset_vectorization_equivalence.py).
+    _NEEDED_DAY_COLUMNS = ["ts", "best_bid", "best_ask", "mid_price", "spread", "bids", "asks"]
+
     def _load_day(self, path: Path) -> pd.DataFrame:
         if path not in self._day_cache:
             if len(self._day_cache) >= self._MAX_CACHED_DAYS:
                 self._day_cache.pop(next(iter(self._day_cache)))
-            self._day_cache[path] = pd.read_parquet(path)
+            self._day_cache[path] = pd.read_parquet(path, columns=self._NEEDED_DAY_COLUMNS)
         return self._day_cache[path]
 
     def _load_funding_history(self, funding_dir: Path) -> pd.DataFrame:
