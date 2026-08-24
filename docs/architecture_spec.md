@@ -828,7 +828,7 @@ class ExecState(TypedDict):
     done: bool
 
 L1_EVERY_N_TICKS = 600   # ~60s at 100ms ticks
-L2_EVERY_N_TICKS = 10    # ~1s at 100ms ticks
+L2_EVERY_N_TICKS = 50    #  I just change here
 
 def macro_node(state: ExecState, l1_agent) -> ExecState:
     if state["tick"] % L1_EVERY_N_TICKS == 0:

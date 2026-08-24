@@ -190,6 +190,36 @@ def test_ticks_since_own_fill_norm_tracks_last_fill(tmp_path):
     assert obs[14] == pytest.approx(6.0 / 100.0)
 
 
+# ---- Part A: _ticks_since_placement_norm (reward-internal, not in obs) ----
+
+def test_ticks_since_placement_norm_tracks_new_placement(tmp_path):
+    """Reward-internal only (not an obs index) -- read via the private
+    method directly, matching this new signal own scope: unlike
+    ticks_since_own_fill_norm, a constant-book fixture (no fill ever
+    happens) is exactly what this test wants, since the point is to track
+    placement recency, not fill recency."""
+    data_dir = tmp_path / "BTCUSDT"
+    data_dir.mkdir()
+    _write_constant_day(data_dir / "l2-BTCUSDT-2024-01-01.parquet", 400, 100.0, 1e8, 100.5, 1e8)
+
+    env = LOBExecutionEnv(data_dir=data_dir, horizon_ticks=100, lookback_ticks=2)
+    obs, info = env.reset(seed=1)
+    assert env._ticks_since_placement_norm() == pytest.approx(1.0)  # nothing resting yet
+
+    obs, r, term, trunc, info = env.step(np.array([ORDER_TYPE_LIMIT, 5, 0]))
+    assert env._ticks_since_placement_norm() == pytest.approx(1.0 / 300.0)
+
+    for _ in range(5):
+        obs, r, term, trunc, info = env.step(np.array([ORDER_TYPE_HOLD, 5, 0]))
+    assert env._ticks_since_placement_norm() == pytest.approx(6.0 / 300.0)
+
+    # CANCEL_AND_REPLACE resets this clock even though no fill ever happened --
+    # the exact gap ticks_since_own_fill_norm cannot cover (it only resets on
+    # a real fill, never on a replace).
+    obs, r, term, trunc, info = env.step(np.array([ORDER_TYPE_CANCEL_REPLACE, 5, 0]))
+    assert env._ticks_since_placement_norm() == pytest.approx(1.0 / 300.0)
+
+
 # ---- idx 39: funding_rate_z ----
 
 def test_funding_rate_z_hand_computed(tmp_path):

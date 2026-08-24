@@ -38,9 +38,9 @@ exist, the save is redirected to a run-tagged path instead
 passed explicitly. --run-name also namespaces this run's periodic
 CheckpointCallback files, so two runs' intermediate checkpoints can no longer
 silently collide either (confirmed this had already happened once, silently,
-before this fix: a later probe's own periodic checkpoints overwrote an
-earlier, unrelated run's identically-named ones). See
-resolve_final_save_paths() below for the exact logic, and
+before this fix: the direction-inversion probe's own 250k/500k-step periodic
+checkpoints overwrote v1's identically-named ones from its earlier, unrelated
+run). See resolve_final_save_paths() below for the exact logic, and
 tests/test_train_l3.py for its test coverage.
 """
 from __future__ import annotations
@@ -294,6 +294,35 @@ def main() -> None:
         "own default.",
     )
     parser.add_argument(
+        "--reward-eta-replace", type=float, default=None,
+        help="Override RewardWeights.eta_replace (the placement-anchored staleness "
+        "coefficient -- see docs/reports/phase3_l3_baseline_milestone.md Part A) for "
+        "this run only. Combine with --reward-zeta 0.0 to isolate this new term own "
+        "effect, per this project established practice of changing one variable at "
+        "a time. Unset keeps RewardWeights()'s own default (0.0, inert).",
+    )
+    parser.add_argument(
+        "--subtract-twap-baseline", action="store_true",
+        help="Enable RewardWeights.subtract_twap_baseline -- variance reduction, "
+        "NOT an objective change (see reward.py module docstring EXPERIMENTAL 5 "
+        "and docs/reports/l3_twap_baseline_reward.md). Off by default, matching "
+        "RewardWeights()'s own default of False.",
+    )
+    parser.add_argument(
+        "--warm-start-weights", type=str, default=None,
+        help="Path to a model checkpoint .zip to initialize weights from, WITHOUT "
+        "resuming the run it came from -- distinct from --resume-from/"
+        "--resume-vecnormalize, which pair together and continue the original run's "
+        "step counter and VecNormalize stats. This loads ONLY the policy weights; "
+        "VecNormalize is built fresh (accumulating stats from this run's step zero, "
+        "not reused from the source checkpoint's run), and the step counter resets "
+        "to 0 (reset_num_timesteps=True, same as a from-scratch run) so "
+        "--total-timesteps is an absolute count on a fresh 0-based axis, directly "
+        "comparable to a from-scratch run at matched step counts. Mutually exclusive "
+        "with --resume-from. See docs/reports/phase3_l3_baseline_milestone.md, "
+        "'Physics fix + init-strategy probe'.",
+    )
+    parser.add_argument(
         "--run-name", type=str, default=None,
         help="Tag for this run's checkpoint filenames, used (a) as the fallback "
         "final-save name if models/l3_executioner_v1.zip already exists and "
@@ -314,6 +343,8 @@ def main() -> None:
     args = parser.parse_args()
     if bool(args.resume_from) != bool(args.resume_vecnormalize):
         raise ValueError("--resume-from and --resume-vecnormalize must be given together")
+    if args.warm_start_weights and args.resume_from:
+        raise ValueError("--warm-start-weights and --resume-from are mutually exclusive")
     run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     with open(args.config) as f:
@@ -340,9 +371,16 @@ def main() -> None:
     print(f"train date_range: {train_date_range} ({len(train_dates)} real days)")
     print(f"val   date_range: {val_date_range} ({len(val_dates)} real days)")
 
-    reward_weights = RewardWeights(zeta=args.reward_zeta) if args.reward_zeta is not None else None
+    reward_overrides = {}
     if args.reward_zeta is not None:
-        print(f"reward_weights override: zeta={args.reward_zeta} (all other weights at RewardWeights() defaults)")
+        reward_overrides["zeta"] = args.reward_zeta
+    if args.reward_eta_replace is not None:
+        reward_overrides["eta_replace"] = args.reward_eta_replace
+    if args.subtract_twap_baseline:
+        reward_overrides["subtract_twap_baseline"] = True
+    reward_weights = RewardWeights(**reward_overrides) if reward_overrides else None
+    if reward_overrides:
+        print(f"reward_weights override: {reward_overrides} (all other weights at RewardWeights() defaults)")
 
     vec_env = SubprocVecEnv([
         make_env(train_date_range, env_cfg["horizon_ticks"], env_cfg["lookback_ticks"], reward_weights)
@@ -371,6 +409,23 @@ def main() -> None:
         # env-specific piece of it.
         model.set_random_seed(model.seed)
         print(f"resumed from {args.resume_from}: loaded num_timesteps={model.num_timesteps}")
+    elif args.warm_start_weights:
+        model = RecurrentPPO.load(args.warm_start_weights, device=ppo_cfg["device"])
+        model.set_env(vec_env)
+        # Same reseeding rationale as the --resume-from branch above (.load()
+        # constructs with env=None, so the seed-the-env step inside
+        # set_random_seed() never ran until set_env() gave it a real env).
+        model.set_random_seed(model.seed)
+        # Unlike --resume-from, model.num_timesteps here still holds the SOURCE
+        # checkpoint's original count (e.g. ~20M) -- reset_num_timesteps=True below
+        # (via `not args.resume_from`, which is True here since this is a distinct
+        # flag) resets it to 0 at the start of .learn(), so --total-timesteps counts
+        # fresh steps on a 0-based axis, matched against a from-scratch run.
+        print(
+            f"warm-started WEIGHTS ONLY from {args.warm_start_weights} "
+            f"(source checkpoint's num_timesteps={model.num_timesteps}, discarded -- "
+            "VecNormalize is fresh, step counter resets to 0 at learn() start)"
+        )
     else:
         model = RecurrentPPO(
             ppo_cfg["policy"], vec_env,
