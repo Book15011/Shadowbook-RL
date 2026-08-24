@@ -19,8 +19,15 @@ from stable_baselines3 import SAC
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+from src.data.l2_numeric_format import write_day
 from src.envs.lob_execution_env import LOBExecutionEnv
-from src.train.train_l2 import ValISEvalCallback, make_l2_env, make_l2_wrapped_env
+from src.train.train_l2 import (
+    ValISEvalCallback,
+    _resolve_gradient_steps,
+    make_l2_env,
+    make_l2_wrapped_env,
+    resolve_l2_final_save_paths,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -45,6 +52,31 @@ def _write_synthetic_day(path, n_rows: int, base_price: float, ts_start: int) ->
         for i in range(n_rows)
     ]
     pd.DataFrame(rows).to_parquet(path, index=False)
+
+
+def _write_synthetic_numeric_day(path, n_rows: int, base_price: float, ts_start: int) -> None:
+    # Same values as _write_synthetic_day above, arrays instead of per-row JSON --
+    # 2 levels/side (not 20) to exactly mirror that fixture's own level count. The
+    # 20-level shape is a real-data integrity check the CONVERSION script enforces
+    # (scripts/convert_l2_to_numeric_parallel.py), not something write_day/read_day or
+    # LOBExecutionEnv's numeric read path themselves require -- both treat bid_prices/
+    # bid_sizes/ask_prices/ask_sizes generically by whatever shape is given.
+    best_bid = base_price - 0.05
+    best_ask = base_price + 0.05
+    write_day(
+        {
+            "ts": np.arange(ts_start, ts_start + n_rows, dtype=np.int64),
+            "best_bid": np.full(n_rows, best_bid, dtype=np.float64),
+            "best_ask": np.full(n_rows, best_ask, dtype=np.float64),
+            "mid_price": np.full(n_rows, base_price, dtype=np.float64),
+            "spread": np.full(n_rows, best_ask - best_bid, dtype=np.float64),
+            "bid_prices": np.tile([best_bid, best_bid - 0.1], (n_rows, 1)),
+            "bid_sizes": np.tile([10.0, 5.0], (n_rows, 1)),
+            "ask_prices": np.tile([best_ask, best_ask + 0.1], (n_rows, 1)),
+            "ask_sizes": np.tile([10.0, 5.0], (n_rows, 1)),
+        },
+        path,
+    )
 
 
 def _build_env(tmp_path, horizon_ticks: int = 20, lookback_ticks: int = 2) -> LOBExecutionEnv:
@@ -108,6 +140,33 @@ def test_make_l2_wrapped_env_is_not_monitor_wrapped(tmp_path):
     vecnorm_path = _write_fake_vecnormalize(tmp_path, env)
     wrapped = make_l2_wrapped_env(_date_range(tmp_path), 20, 2, model, vecnorm_path, 4, False, data_dir=_data_dir(tmp_path))
     assert not isinstance(wrapped, Monitor)
+    obs, info = wrapped.reset(seed=0)
+    assert obs.shape == (41,)
+
+
+def test_make_l2_wrapped_env_use_numeric_format_reads_npzst(tmp_path):
+    # use_numeric_format is a new, trailing, defaulted kwarg this round (vectorization --
+    # see train_l2.py's module docstring) -- confirms it actually threads through to
+    # LOBExecutionEnv rather than being silently ignored, and that the numeric-format
+    # read path produces the same obs shape as the parquet path above.
+    data_dir = tmp_path / "BTCUSDT_numeric"
+    data_dir.mkdir(exist_ok=True)
+    _write_synthetic_numeric_day(
+        data_dir / "l2-BTCUSDT-2024-01-01.npzst", n_rows=200, base_price=100.0, ts_start=1_000_000,
+    )
+    # The frozen-L3 stand-in and its VecNormalize are built against a PARQUET env
+    # (_build_env) purely as a source of a matching observation_space -- L3's own obs
+    # space is format-independent (it reads whatever LOBExecutionEnv hands it), so this
+    # does not need to be the numeric env itself.
+    l3_env = _build_env(tmp_path)
+    model = _build_tiny_recurrent_ppo(l3_env)
+    vecnorm_path = _write_fake_vecnormalize(tmp_path, l3_env)
+
+    wrapped = make_l2_wrapped_env(
+        ("2024-01-01", "2024-01-01"), 20, 2, model, vecnorm_path, 4, False,
+        data_dir=str(data_dir), use_numeric_format=True,
+    )
+    assert wrapped.env.use_numeric_format is True
     obs, info = wrapped.reset(seed=0)
     assert obs.shape == (41,)
 
@@ -219,12 +278,62 @@ def test_get_vec_normalize_env_is_none_when_l2_obs_not_normalized(tmp_path):
     # always the None path. This test exists so that decision's implementation status is
     # pinned by a test, not just a doc claim -- it should start failing (and be updated,
     # not silently left) the day someone adds VecNormalize around the L2 training env.
+    # Still true after this round's vectorization work -- out of that round's own stated
+    # scope (see train_l2.py's module docstring).
     env = _build_env(tmp_path)
     l3_model = _build_tiny_recurrent_ppo(env)
     vecnorm_path = _write_fake_vecnormalize(tmp_path, env)
     train_env = make_l2_env(_date_range(tmp_path), 20, 2, l3_model, vecnorm_path, 4, False, data_dir=_data_dir(tmp_path))
     sac_model = SAC("MlpPolicy", train_env, buffer_size=100, batch_size=8, device="cpu", verbose=0)
     assert sac_model.get_vec_normalize_env() is None
+
+
+# --------------------------------------------------------------------------------------
+# _resolve_gradient_steps -- pure function, no env/model needed. See its own docstring
+# in train_l2.py for the SB3-source-confirmed mechanics this corrects for.
+# --------------------------------------------------------------------------------------
+
+def test_resolve_gradient_steps_defaults_to_n_envs():
+    assert _resolve_gradient_steps(n_envs=4, override=None) == 4
+    assert _resolve_gradient_steps(n_envs=1, override=None) == 1
+    assert _resolve_gradient_steps(n_envs=8, override=None) == 8
+
+
+def test_resolve_gradient_steps_explicit_override_wins():
+    assert _resolve_gradient_steps(n_envs=8, override=1) == 1
+    assert _resolve_gradient_steps(n_envs=1, override=16) == 16
+
+
+# --------------------------------------------------------------------------------------
+# resolve_l2_final_save_paths -- same guard/rationale as train_l3.py's
+# resolve_final_save_paths (see tests/test_train_l3.py), adapted for L2's single-path
+# (no VecNormalize) save.
+# --------------------------------------------------------------------------------------
+
+def test_resolve_l2_final_save_paths_fresh_dir_uses_canonical(tmp_path):
+    model_stem = resolve_l2_final_save_paths(
+        run_name="20260101_000000", overwrite_canonical=False, models_dir=tmp_path,
+    )
+    assert model_stem == str(tmp_path / "l2_strategist_v1")
+
+
+def test_resolve_l2_final_save_paths_existing_canonical_redirects(tmp_path):
+    (tmp_path / "l2_strategist_v1.zip").write_bytes(b"existing checkpoint")
+    model_stem = resolve_l2_final_save_paths(
+        run_name="probe_20260101", overwrite_canonical=False, models_dir=tmp_path,
+    )
+    assert model_stem == str(tmp_path / "l2_strategist_v1_probe_20260101")
+    # And nothing was actually touched -- resolve_l2_final_save_paths only decides, it
+    # does not write.
+    assert (tmp_path / "l2_strategist_v1.zip").read_bytes() == b"existing checkpoint"
+
+
+def test_resolve_l2_final_save_paths_overwrite_canonical_flag_forces_canonical(tmp_path):
+    (tmp_path / "l2_strategist_v1.zip").write_bytes(b"existing checkpoint")
+    model_stem = resolve_l2_final_save_paths(
+        run_name="20260101_000000", overwrite_canonical=True, models_dir=tmp_path,
+    )
+    assert model_stem == str(tmp_path / "l2_strategist_v1")
 
 
 # --------------------------------------------------------------------------------------
@@ -255,3 +364,39 @@ def test_cli_no_eval_flag_disables_it():
         "--total-timesteps", "1", "--no-eval",
     ])
     assert args.eval is False
+
+
+def test_cli_n_envs_and_seed_defaults():
+    # n_envs=4 (not 8) is a deliberate memory-safety choice, not an arbitrary default --
+    # see --n-envs's own CLI help in train_l2.py for the RSS/OOM-history rationale.
+    # seed=42 did not exist on this script at all before this round.
+    from src.train.train_l2 import build_parser
+
+    args = build_parser().parse_args([
+        "--l3-checkpoint", "unused.zip", "--l3-vecnormalize", "unused.pkl",
+        "--total-timesteps", "1",
+    ])
+    assert args.n_envs == 4
+    assert args.seed == 42
+    assert args.gradient_steps is None
+    assert args.use_numeric_format is True
+
+
+def test_cli_resume_replay_buffer_requires_resume_from():
+    # main()'s own validation (not argparse's) -- build_parser() alone doesn't enforce
+    # this cross-flag dependency, matching train_l3.py's own --resume-from/
+    # --resume-vecnormalize pairing check style (a plain ValueError in main(), not
+    # something argparse's mutually_exclusive_group covers, since one flag is required
+    # only conditionally on the other being present, not mutually exclusive).
+    from src.train.train_l2 import build_parser
+
+    args = build_parser().parse_args([
+        "--l3-checkpoint", "unused.zip", "--l3-vecnormalize", "unused.pkl",
+        "--total-timesteps", "1", "--resume-replay-buffer", "unused_buffer.pkl",
+    ])
+    assert args.resume_from is None
+    assert args.resume_replay_buffer == "unused_buffer.pkl"
+    # main() itself raises on this combination -- checked directly in the shakedown/
+    # integration round rather than re-invoking main()'s full argv/GPU/data-file path
+    # here; this test only pins that the CLI still parses the (invalid) combination
+    # through to main() rather than argparse silently rejecting or coercing it.
