@@ -300,6 +300,72 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-25 02:10 HKT
+State: n=500 evaluation harness built alongside the live training run
+(l2v1_20260825, ~2.6% through 2,000,000 steps at last check, healthy -- fps~19,
+n_updates climbing, no errors) -- built now specifically so evaluation can start the
+moment training finishes rather than beginning a build after a ~24h wait. Zero
+interference with the live run: no GPU, no real data, no benchmarks, tiny synthetic
+fixtures only, verified via ps/free -h and the training log before and after every
+step this round.
+
+While confirming the live run's health, found and fixed a real risk: src/envs/lob_execution_env.py
+(use_numeric_format support) and src/data/l2_numeric_format.py were STILL sitting
+uncommitted in the working tree -- the live run has depended on this exact
+on-disk code since 01:14 (HEAD had zero use_numeric_format support before this),
+a fragile state for a 24h run to depend on. Committed both as-is (no edits, no
+behavior change -- pure protective commit) alongside the numeric-format permanent
+regression test.
+
+scripts/eval_l2_n500.py: reuses L3's own established n=500 methodology rather than
+designing fresh (per instruction) -- same EVAL_SEED_BASE=5,000,000 paired-seed
+convention and load_split("val") population as scripts/replace_value_probe.py, same
+paired t-test + Wilcoxon signed-rank reporting, extended with Cohen's d_z effect
+size on every comparison (this project has been misled before by significance
+without magnitude -- the budget-extension result's own d_z=0.076 is the concrete
+precedent). Three arms, paired across the same seed list: (1) the trained L2 SAC
+policy + its own paired VecNormalize steering frozen L3 through FrozenL3Wrapper,
+(2) TWAP-passthrough (L2 outputs [1.0, 0.5] every decision, frozen L3 unsteered --
+ported directly from train_l2.py's own ValISEvalCallback, the same baseline the
+in-training callback already tracks), (3) pure TWAP (phase2a_sanity_suite.py's
+TWAPPolicy, unmodified, on the base env) -- directly poolable with the existing
+table's TWAP row (0.889), not just comparable in spirit. Pre-registered success bar
+stated in the harness's own output, before any real result exists: L2 must beat
+TWAP-passthrough with BOTH tests agreeing (p<0.05 each), ideally also beat TWAP
+itself. --n defaults to 500, configurable. CLI takes explicit
+--l2-checkpoint/--l2-vecnormalize/--l3-checkpoint/--l3-vecnormalize, no defaults,
+same discipline as train_l2.py.
+
+Verified mechanics two ways, both synthetic/tiny/CPU-only: (1) 4 pytest tests
+(tests/test_eval_l2_n500.py) covering both wrapped-env arms' episode loop, the
+paired-report statistics (Cohen's d_z checked against a hand computation), and
+end-to-end arm-running + comparison; (2) a direct CLI-level smoke run (real
+argparse, real SAC.load/VecNormalize.load/RecurrentPPO.load from actual saved
+files, not just the internal functions) against tiny untrained checkpoints,
+n=2 -- confirmed the full path runs end-to-end and the pre-registered-bar check
+correctly reports NO/NO for an untrained policy (no reason it should beat
+anything). Real n=500 evaluation explicitly NOT run this round, per instruction.
+
+Files: scripts/eval_l2_n500.py, tests/test_eval_l2_n500.py (new, committed).
+src/envs/lob_execution_env.py, src/data/l2_numeric_format.py,
+tests/test_numeric_format_equivalence.py (protective commit of already-in-use,
+already-verified content, no edits). Uncommitted, harmless: several throwaway
+storage-format prototype scripts from the prior round (scripts/convert_one_day*.py,
+scripts/test_zstd_raw.py, scripts/check_level_counts.py,
+scripts/compare_formats_equivalence.py, scripts/convert_l2_to_numeric.py) --
+superseded by the already-committed scripts/convert_l2_to_numeric_parallel.py,
+left in place rather than deleted since cleanup wasn't requested and touching
+files unnecessarily during a live run isn't worth it for zero-risk clutter.
+
+Blocking/open questions: none for this task -- harness is ready and waiting.
+Next planned step: once l2v1_20260825 completes (or is deliberately stopped),
+point scripts/eval_l2_n500.py at the real checkpoint
+(models/l2_strategist_v1.zip + models/l2_vecnormalize.pkl, or the run-tagged
+variants if --run-name-based paths were used) and the real frozen L3
+checkpoint, run at n=500, report the real numbers against the pre-registered bar.
+
+PRIOR ENTRY BELOW, for context on the training launch itself:
+
 Last updated: 2026-08-25 01:20 HKT
 State: REAL 2,000,000-STEP TRAINING RUN LAUNCHED AND IN PROGRESS. run_name=l2v1_20260825,
 launched ~2026-08-25 01:14 HKT under nohup (survives SSH disconnect), log at
