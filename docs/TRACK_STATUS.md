@@ -5,6 +5,85 @@ Each session owns and updates only its own section -- merge on conflict,
 never overwrite another track's section.
 
 ## L1 -- Macro Analyst
+Last updated: 2026-08-24 08:29 HKT
+State: ALL THREE ROUND TASKS DONE -- prompt fixed and re-validated, background
+threading built and unit-tested, live threaded re-run confirms it works. Full
+detail in docs/reports/l1_async_threading_validation.md (Tasks 2/3) and the
+Task 1 commit message / docs/reports/l1_real_llm_validation.md (Task 1, prior
+round's own follow-up finding this round closed out).
+
+Task 1 (538d6ae): SYSTEM_PROMPT now states every field/range explicitly, and
+maybe_refresh() now sends Ollama's structured-output format=<real
+MacroRiskContext.model_json_schema()> instead of the bare string "json" --
+confirmed live to fix the actual failure mode (invented field names), and
+confirmed live to NOT enforce numeric ranges (an out-of-range value slipped
+through even under schema-constrained decoding), so the prompt's explicit
+ranges and pydantic's own validation both remain genuinely necessary, not
+redundant. Re-validated on 10 real calls (5 dates x 2 reps, for a
+determinism check too): 10/10 schema-conformant, all values in range, mean
+latency dropped 4.505s -> 1.598s. 2 new regression tests.
+
+Task 2 (586b881): AsyncL1Refresher built per architecture_spec.md Section
+1.2's own design (background thread, hot path never waits). Staleness
+policy is explicit -- skip a new refresh if one is already in flight, never
+queue, bounded by L1MacroAnalyst's own timeout_s. Fail-closed survives
+threading by construction (cache is set to exactly what maybe_refresh()
+itself returns, no second freshness flag to desync). run_episode_async()
+always joins in a finally block -- no thread survives past return, even on
+an exception. 10 new tests, including a direct non-blocking timing test (20
+tick calls total <0.1s while a mocked 0.3s call is in flight) and a
+full-stack async integration test with real checkpoints. Full suite: 141
+passed, same 4 pre-existing unrelated failures as always.
+
+Task 3 (6d9290c, live validation script, not committed as a pytest test --
+needs a live Ollama service, would break every other test's hermeticity in
+that file): idx 17/18 confirmed to change ASYNCHRONOUSLY -- (0.0,0.0) ->
+(0.0,0.75) at tick 250, 250 ticks after the tick-0 trigger, once the real
+threaded call actually completed, not at the boundary tick itself (the
+correct framing now that L1 is non-blocking, vs. the old "changes exactly
+at tick 600" framing from the synchronous round). Per-tick cost: 3.81ms
+(stubbed) -> ~5.5-6.3ms (threaded, this round, 3 runs) -> 14.60ms
+(synchronous, prior round) -- threading recovers roughly 60-70% of the gap,
+not 100%; real residual lock/thread-scheduling overhead remains and is
+reported as a range, not oversold as full parity. One honest, unreproduced
+anomaly disclosed in the report: the first live run showed
+last_refresh_completed_tick set correctly but its paired on_l1_tick
+callback never fired -- not reproduced across 2 immediate reruns or the 6
+passing deterministic regression tests covering the same logic; flagged
+open, not silently dropped.
+
+Files this round: src/agents/l1_macro_analyst.py, tests/test_l1_macro_analyst.py
+(Task 1, 538d6ae). src/agents/orchestrator_graph.py,
+tests/test_orchestrator_graph.py (Task 2, 586b881).
+docs/reports/l1_async_threading_validation.md (Task 3, 6d9290c). Nothing
+uncommitted on this track.
+
+Blocking/open questions: (a) RESOLVED this round -- SYSTEM_PROMPT schema gap
+fixed, 10/10 conformant now. (b) RESOLVED this round -- background-thread
+wiring built, tested, live-validated. (c) NEW, minor -- the unreproduced
+on_l1_tick anomaly above; worth a second look if it recurs, not blocking.
+(d) NEW -- residual ~1.5-2x per-tick overhead vs. stubbed baseline (lock/
+scheduling cost); real but likely not worth chasing given the much larger
+win already banked. 14B vs 32B: still recommend 14B (prior round's Step 3
+reasoning), now on stronger footing since 14B's conformance problem is
+resolved -- no remaining argument for 32B was found this round either.
+
+Next planned step: no hard blocker remains on this track's own critical
+path. Candidate next work, none urgent: (i) wire build_l1_feature_summary()
+to use the env's actual current sim timestamp per L1 firing (this round's
+validation scripts reused one fixed as_of_ms across all firings, a
+simplification carried over from the prior round, not a production
+behavior) so risk_score/confidence genuinely track evolving real market
+conditions across an episode, not just a single frozen snapshot repeated.
+(ii) investigate the residual threading overhead in (d) if it turns out to
+matter for a real training-scale run. (iii) coordinate with L2/L3 on
+whether/when a real L1-in-the-loop training run is wanted at all, now that
+the plumbing is real end to end.
+
+PRIOR ENTRY BELOW, for context on the Ollama/proxy infra fixes and Step 0-4
+real-call validation:
+
+## L1 -- Macro Analyst
 Last updated: 2026-08-24 00:07 HKT
 State: REAL (UNMOCKED) LLM PATH VALIDATED THIS ROUND -- full detail in
 docs/reports/l1_real_llm_validation.md. Two real bugs found and fixed, one infra,
