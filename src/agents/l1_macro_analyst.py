@@ -17,15 +17,38 @@ real orchestrator, not inline on the tick loop -- see
 src/agents/orchestrator_graph.py for the minimal wiring that reads
 self._cache on a coarser tick cadence (Section 4.3's L1_EVERY_N_TICKS).
 
-No real Ollama call happens anywhere in this module's own test suite
-(tests/test_l1_macro_analyst.py) -- requests.post is mocked throughout.
-
 self.host is assumed always-local (default http://localhost:11434) --
 maybe_refresh() explicitly bypasses any environment-configured HTTP(S)
 proxy for this reason (see the proxies= kwarg on the requests.post() call
 below); a proxied local call is never correct here and was confirmed to
 silently fail closed on every real call in an environment where
 http_proxy/https_proxy are set, before this fix.
+
+STRUCTURED OUTPUT (added after docs/reports/l1_real_llm_validation.md found
+0/5 real calls schema-conformant with plain format="json"): the "format"
+field sent to Ollama is now the real MacroRiskContext.model_json_schema()
+object, not the bare string "json". Confirmed directly, not assumed, that
+this Ollama install (0.32.8) supports passing a JSON Schema object here and
+that it materially changes behavior -- a live test against the exact same
+model/prompt content that previously invented its own field names (risk_
+level, market_risk_score, etc., see the validation report) instead returned
+every one of the six real field names, correctly typed, on the first try
+once format= carried the real schema. This is grammar/structure-level
+enforcement (required keys present, correct JSON types), confirmed BY THE
+SAME TEST to NOT extend to numeric range constraints -- that same call
+returned risk_score=2, outside the documented [-1,1] range, which the
+schema's own minimum/maximum keywords did not prevent. So: structured
+output is used because it demonstrably fixes the field-name problem (Step
+2's actual failure mode), SYSTEM_PROMPT below now also states every valid
+range in prose as a second, independent line of defense (a model is more
+likely to respect a range it's told about in the instructions than one
+implied only by a JSON Schema keyword the decoder may not enforce), and
+MacroRiskContext's own pydantic Field(ge=/le=) validation remains the
+authoritative gate either way -- confirmed non-redundant by this same test,
+not kept out of caution alone.
+
+No real Ollama call happens anywhere in this module's own test suite
+(tests/test_l1_macro_analyst.py) -- requests.post is mocked throughout.
 """
 from __future__ import annotations
 
@@ -45,10 +68,29 @@ class MacroRiskContext(BaseModel):
     rationale: str = ""
 
 
+# Sent as Ollama's format= parameter (structured output, not plain format="json") --
+# single source of truth is MacroRiskContext itself, so the schema Ollama enforces can
+# never drift from the schema pydantic validates against afterward.
+_MACRO_RISK_CONTEXT_SCHEMA = MacroRiskContext.model_json_schema()
+
+
 SYSTEM_PROMPT = """You are a market-risk classifier for a BTCUSDT perpetual futures execution system.
-You receive rolling numeric features (order-book imbalance, realized volatility, funding rate, recent
-trade flow) and optional recent headline text. Output ONLY a JSON object matching the required schema.
-Do not include markdown fences, commentary, or any text outside the JSON object."""
+You receive rolling numeric features (returns, realized volatility, funding rate, open interest,
+taker trade flow) as a JSON object. Output ONLY a JSON object with EXACTLY these six fields, no
+others, no markdown fences, no commentary:
+
+- timestamp_ms (integer): echo back the input's as_of_ms value unchanged.
+- regime (string): exactly one of "risk_on", "risk_off", "neutral", "high_volatility".
+- risk_score (number): between -1.0 and 1.0 inclusive. Negative favors patience/passivity,
+  positive favors urgency. NEVER output a value outside [-1.0, 1.0].
+- confidence (number): between 0.0 and 1.0 inclusive, how confident you are in this read.
+  NEVER output a value outside [0.0, 1.0].
+- urgency_multiplier (number): between 0.5 and 2.0 inclusive, a direct multiplier on execution
+  pace (1.0 = no adjustment). NEVER output a value outside [0.5, 2.0].
+- rationale (string): one brief sentence explaining the read.
+
+Every numeric field must respect its stated range exactly -- this is a hard constraint, not a
+suggestion."""
 
 
 class L1MacroAnalyst:
@@ -84,7 +126,7 @@ class L1MacroAnalyst:
                     "model": self.model,
                     "system": SYSTEM_PROMPT,
                     "prompt": json.dumps(feature_summary),
-                    "format": "json",
+                    "format": _MACRO_RISK_CONTEXT_SCHEMA,
                     "stream": False,
                     "options": {"temperature": 0.1, "num_ctx": 2048},
                 },
