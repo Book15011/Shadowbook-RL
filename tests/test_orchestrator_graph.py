@@ -9,6 +9,8 @@ and fast -- no dependency on the real Bybit archive.
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -16,7 +18,12 @@ import pytest
 import requests
 
 from src.agents.l1_macro_analyst import L1MacroAnalyst
-from src.agents.orchestrator_graph import L1_EVERY_N_TICKS, macro_tick
+from src.agents.orchestrator_graph import (
+    AsyncL1Refresher,
+    L1_EVERY_N_TICKS,
+    macro_tick,
+    macro_tick_async,
+)
 from src.envs.lob_execution_env import LOBExecutionEnv
 
 VALID_PAYLOAD = {
@@ -397,3 +404,232 @@ def test_full_stack_integration_short_bounded_episode(tmp_path, monkeypatch):
     is_result = result["info"]["implementation_shortfall"]
     assert np.isfinite(is_result.is_total_bps), f"IS_total_bps must be finite, got {is_result.is_total_bps}"
     assert 0.0 <= is_result.fill_ratio <= 1.0, f"fill_ratio out of [0,1]: {is_result.fill_ratio}"
+
+
+# --- AsyncL1Refresher: non-blocking L1 wiring (architecture_spec.md Section 1.2's
+# "background thread" requirement, not implemented until this round). requests.post
+# mocked throughout -- no real Ollama call in this file's own suite, same convention
+# as every other test above.
+
+def _slow_fake_post_factory(delay_s: float, response_field=None, raise_exc=None):
+    """A mocked requests.post that sleeps for delay_s before returning (or raising)
+    -- simulates a real, slow LLM call for testing non-blocking behavior without
+    actually waiting on a real network round-trip in the test suite."""
+    def _slow_fake_post(*args, **kwargs):
+        time.sleep(delay_s)
+        if raise_exc is not None:
+            raise raise_exc
+        return _FakeResponse({"response": response_field})
+    return _slow_fake_post
+
+
+def test_async_refresher_skips_concurrent_refresh_while_in_flight(monkeypatch):
+    call_count = []
+    release_event = threading.Event()
+
+    def _blocking_fake_post(*args, **kwargs):
+        call_count.append(1)
+        release_event.wait(timeout=5)
+        return _FakeResponse({"response": json.dumps(VALID_PAYLOAD)})
+
+    monkeypatch.setattr("src.agents.l1_macro_analyst.requests.post", _blocking_fake_post)
+    agent = L1MacroAnalyst(refresh_interval_s=0.0)
+    refresher = AsyncL1Refresher(agent)
+
+    started1 = refresher.maybe_refresh_async(tick=0, feature_summary_fn=lambda t: {"a": 1})
+    assert started1 is True
+    assert refresher.in_flight is True
+
+    # A second cadence boundary arrives while the first call is still blocked on
+    # release_event -- must be SKIPPED per the documented staleness policy, not
+    # queued and not run concurrently.
+    started2 = refresher.maybe_refresh_async(tick=600, feature_summary_fn=lambda t: {"a": 2})
+    assert started2 is False
+    assert len(call_count) == 1, "exactly one real call should ever be in flight at a time"
+
+    release_event.set()
+    refresher.join()
+
+    assert refresher.in_flight is False
+    assert refresher.cache.regime == "risk_off"  # VALID_PAYLOAD's value
+    assert refresher.last_refresh_completed_tick == 0
+
+
+def test_async_refresher_cache_updates_after_completion(monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.l1_macro_analyst.requests.post",
+        _slow_fake_post_factory(0.05, response_field=json.dumps(VALID_PAYLOAD)),
+    )
+    agent = L1MacroAnalyst(refresh_interval_s=0.0)
+    refresher = AsyncL1Refresher(agent)
+
+    before = refresher.cache
+    assert before.rationale == "fallback: no LLM signal yet"
+
+    refresher.maybe_refresh_async(tick=0, feature_summary_fn=lambda t: {"a": 1})
+    assert refresher.cache is before, "cache must not change until the background call actually completes"
+
+    refresher.join()
+    after = refresher.cache
+    assert after.regime == "risk_off"
+    assert after.risk_score == pytest.approx(0.6)
+    assert refresher.last_refresh_completed_tick == 0
+
+
+def test_async_refresher_fail_closed_survives_threading(monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.l1_macro_analyst.requests.post",
+        _slow_fake_post_factory(0.05, raise_exc=requests.exceptions.Timeout("simulated slow timeout")),
+    )
+    agent = L1MacroAnalyst(refresh_interval_s=0.0)
+    refresher = AsyncL1Refresher(agent)
+
+    refresher.maybe_refresh_async(tick=0, feature_summary_fn=lambda t: {"a": 1})
+    refresher.join()
+
+    assert refresher.in_flight is False
+    ctx = refresher.cache
+    assert ctx.regime == "neutral"
+    assert ctx.rationale == "fallback: no LLM signal yet", (
+        "a failed background call must fail closed to the agent's own neutral default, "
+        "not leave a stale/corrupt value silently masquerading as fresh"
+    )
+
+
+def test_async_refresher_join_leaves_no_running_thread(monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.l1_macro_analyst.requests.post",
+        _fake_post_returning(json.dumps(VALID_PAYLOAD)),
+    )
+    agent = L1MacroAnalyst(refresh_interval_s=0.0)
+    refresher = AsyncL1Refresher(agent)
+    refresher.maybe_refresh_async(tick=0, feature_summary_fn=lambda t: {"a": 1})
+    refresher.join()
+    assert refresher._thread.is_alive() is False
+
+
+def test_macro_tick_async_never_blocks_while_call_in_flight(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.agents.l1_macro_analyst.requests.post",
+        _slow_fake_post_factory(0.3, response_field=json.dumps(VALID_PAYLOAD)),
+    )
+    env = _make_env(tmp_path)
+    agent = L1MacroAnalyst(refresh_interval_s=0.0)
+    refresher = AsyncL1Refresher(agent)
+
+    macro_tick_async(env, refresher, tick=0, feature_summary_fn=lambda t: {"a": 1})
+    assert refresher.in_flight is True
+
+    # 20 off-cadence ticks while the 0.3s mocked call is still in flight -- each must
+    # be near-instant, proving per-tick cost does NOT degrade just because a real LLM
+    # call is running in the background. A synchronous call would have blocked all 20
+    # of these behind the same 0.3s (or worse, 20x0.3s if each tick tried its own call).
+    per_tick_times = []
+    for t in range(1, 21):
+        t0 = time.monotonic()
+        macro_tick_async(env, refresher, tick=t, feature_summary_fn=lambda tt: {"a": tt})
+        per_tick_times.append(time.monotonic() - t0)
+
+    assert refresher.in_flight is True, "the background call (0.3s) should still be running"
+    assert max(per_tick_times) < 0.05, f"a tick call blocked for {max(per_tick_times):.3f}s while L1 was in flight"
+    assert sum(per_tick_times) < 0.1, f"20 tick calls took {sum(per_tick_times):.3f}s total while L1 was in flight"
+
+    refresher.join()
+    assert refresher.cache.regime == "risk_off"
+
+    # env only updates on the NEXT macro_tick_async call after the cache changes --
+    # it is not pushed automatically the instant the background thread finishes.
+    macro_tick_async(env, refresher, tick=21, feature_summary_fn=lambda tt: {"a": tt})
+    assert env.l1_risk_score == pytest.approx(0.6)
+
+
+def test_full_stack_async_integration_idx_17_18_change_and_threads_clean_up(tmp_path, monkeypatch):
+    # Mirrors test_full_stack_integration_short_bounded_episode above (same real
+    # checkpoints, same synthetic data shape, same 3-distinct-values mock), but with
+    # run_episode_async()/AsyncL1Refresher in place of run_episode()/L1MacroAnalyst.
+    # Focused on what is NEW/at-risk with threading -- idx 17/18 change ASYNC (not at
+    # an exact tick), and no thread survives the episode -- not re-proving L2/L3
+    # cadence facts already established by the sync test above.
+    import threading as _threading
+
+    import torch
+    from sb3_contrib import RecurrentPPO
+    from stable_baselines3 import SAC
+
+    from src.agents.orchestrator_graph import L2_EVERY_N_TICKS, run_episode_async
+    from src.envs.wrappers import FrozenL3Wrapper
+
+    threads_before = _threading.active_count()
+
+    horizon_ticks = 1250
+    data_dir = tmp_path / "BTCUSDT"
+    data_dir.mkdir()
+    _write_synthetic_day(data_dir / "l2-BTCUSDT-2024-01-01.parquet", n_rows=3000)
+    env = LOBExecutionEnv(
+        data_dir=data_dir, horizon_ticks=horizon_ticks, lookback_ticks=10,
+        funding_rate_dir=tmp_path / "does_not_exist",
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    l3_model = RecurrentPPO.load(FROZEN_L3_CHECKPOINT, device=device)
+    l2_model = SAC.load(L2_SMOKE_CHECKPOINT, device=device)
+    l3_wrapper = FrozenL3Wrapper(env, l3_model, FROZEN_L3_VECNORM, ticks_per_l2_decision=L2_EVERY_N_TICKS)
+
+    l1_calls: list = []
+    monkeypatch.setattr(
+        "src.agents.l1_macro_analyst.requests.post",
+        _fake_post_distinct_values(l1_calls),
+    )
+    agent = L1MacroAnalyst(refresh_interval_s=0.0)
+    refresher = AsyncL1Refresher(agent)
+
+    l1_fires: list[tuple[int, float, float]] = []
+
+    def _on_l1(tick, context):
+        l1_fires.append((tick, context.risk_score, context.confidence))
+
+    t0 = time.monotonic()
+    result = run_episode_async(
+        l3_wrapper, l2_model, refresher,
+        feature_summary_fn=lambda tick: {"stub": True, "tick": tick},
+        seed=1,
+        on_l1_tick=_on_l1,
+    )
+    episode_elapsed = time.monotonic() - t0
+
+    assert result["truncated"] or result["terminated"]
+    is_result = result["info"]["implementation_shortfall"]
+    assert np.isfinite(is_result.is_total_bps)
+    assert 0.0 <= is_result.fill_ratio <= 1.0
+
+    # 3 L1 requests should have been made (cadence boundaries at ticks 0/600/1200,
+    # none skipped -- these mocked calls return near-instantly, so no overlap into
+    # the next boundary is expected here).
+    assert len(l1_calls) == 3, f"expected 3 real (mocked) L1 calls, got {len(l1_calls)}"
+
+    # idx 17/18 changed to each of the 3 distinct mocked values SOMEWHERE in the
+    # episode -- async means "somewhere after the triggering boundary", not
+    # necessarily at tick 0/600/1200 exactly like the sync test asserts.
+    assert len(l1_fires) == 3, f"expected 3 completion events, got {l1_fires}"
+    fired_values = [(round(risk, 4), round(conf, 4)) for _, risk, conf in l1_fires]
+    expected_values = [(round(rs, 4), round(cf, 4)) for rs, cf in l1_calls]
+    assert fired_values == expected_values, (
+        f"the 3 completions should carry the 3 distinct mocked values in order, "
+        f"got {fired_values} vs expected {expected_values}"
+    )
+    # completions must fire in non-decreasing tick order and land on real, in-range
+    # ticks of the episode.
+    fire_ticks = [t for t, _, _ in l1_fires]
+    assert fire_ticks == sorted(fire_ticks)
+    assert all(0 <= t <= result["tick"] for t in fire_ticks)
+
+    # Thread lifecycle: run_episode_async()'s own finally-block join() must leave no
+    # thread alive, and must not have leaked any new persistent thread into the
+    # process (active_count back to what it was before this test's episode ran).
+    assert refresher._thread.is_alive() is False
+    assert _threading.active_count() == threads_before, (
+        f"thread count changed from {threads_before} to {_threading.active_count()} "
+        f"-- a background thread was leaked past run_episode_async()'s own return"
+    )
+
+    print(f"async episode wall-clock: {episode_elapsed:.3f}s ({result['tick']} ticks, mocked near-instant L1)")
