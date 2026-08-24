@@ -5,6 +5,23 @@ Each session owns and updates only its own section -- merge on conflict,
 never overwrite another track's section.
 
 ## L1 -- Macro Analyst
+Last updated: 2026-08-25 09:15 HKT
+NOTE: a duplicate session picked up the "fix Ollama + validate real L1 end to
+end" prompt (sent to two sessions by mistake, per the user -- not a process
+failure, nothing lost) and independently reconstructed most of this same
+round's work (Ollama fix diagnosis, real-call testing incl. a clean 25/25
+schema-conformant batch, VRAM/throughput measurements, a real-L1 integration
+re-run) before checking this file and finding it already done, more
+thoroughly, below. That session's batch ran AFTER the prompt fix (538d6ae)
+had already landed, which is exactly why it never saw the 0/10 conformance
+failure that is the actual finding -- caught only because it checked
+TRACK_STATUS.md before writing anything up, rather than reporting a fresh
+25/25 as if it were new information. Stood down without committing,
+spot-checking, or re-reporting, per instruction. Recorded here so any
+overlapping timestamps or artifact naming found later make sense. The
+account below is unaffected and remains the authoritative one.
+
+## L1 -- Macro Analyst
 Last updated: 2026-08-24 08:29 HKT
 State: ALL THREE ROUND TASKS DONE -- prompt fixed and re-validated, background
 threading built and unit-tested, live threaded re-run confirms it works. Full
