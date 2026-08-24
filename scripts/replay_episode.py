@@ -18,10 +18,38 @@ IS_total_bps numbers are directly comparable, not just similar in spirit.
 
 CLI takes explicit --l2-checkpoint/--l2-vecnormalize/--l3-checkpoint/
 --l3-vecnormalize/--seed -- no defaults, same discipline as train_l2.py/eval_l2_n500.py.
+--data-dir auto-resolves to the numeric or original archive based on --use-numeric-format
+(same convention as train_l2.py's own NUMERIC_DATA_DIR/PARQUET_DATA_DIR) unless overridden.
+
+--frozen-l3-only: skips --l2-checkpoint/--l2-vecnormalize entirely and drives the episode
+with the constant TWAP-passthrough action [1.0, 0.5] instead -- frozen L3, completely
+unsteered. Exists specifically as a correctness check on THIS TOOL, not on L2: L3's own
+n=500 evaluation already measured its action-type distribution (HOLD 47.6% / LIMIT 52.0%
+/ MARKET 0.02% / REPLACE 0.36%) -- a --frozen-l3-only replay's printed action-type
+breakdown should land close to those numbers (one episode vs. n=500, so exact match isn't
+expected, but a wildly different shape -- e.g. mostly MARKET orders -- would mean this
+visualizer has a bug, not that frozen L3 changed).
+
+reconstruct_child_orders()'s only flagged limitation (a crossing placement that partially
+fills and rests the remainder on the same tick) is RESOLVED, not open: read directly from
+_place_limit()'s source -- the `crossed` branch's `return fills` is unconditional (fires
+whether walk_market_fill() fully or only partially fills the crossing size), so the
+resting-order code below it never executes when crossed=True. That function's own comment
+confirms it: "Prices that cross the opposing side never reach here." The scenario this
+limitation described cannot happen -- 5 tests already covered the reachable cases; a 6th
+(added this round) confirms a partial crossing fill is handled correctly too (marked
+filled with the partial amount, never left looking like it is still resting).
 
 Run (synthetic data, mechanics only):
   PYTHONPATH=. .venv/bin/python scripts/replay_episode.py --help
-Run (real, only after training completes):
+Run (real, frozen-L3-only sanity check -- do this FIRST, before any L2 checkpoint exists
+or is trusted, per the reasoning above):
+  PYTHONPATH=. .venv/bin/python scripts/replay_episode.py \\
+    --frozen-l3-only \\
+    --l3-checkpoint models/l3_frozen_backup/l3_executioner_v1_frozen.zip \\
+    --l3-vecnormalize models/l3_frozen_backup/l3_vecnormalize_frozen.pkl \\
+    --seed 5000000 --use-numeric-format --output replay_frozen_l3_seed5000000.png
+Run (real, full L2 policy, only after training completes):
   PYTHONPATH=. .venv/bin/python scripts/replay_episode.py \\
     --l2-checkpoint models/l2_strategist_v1.zip --l2-vecnormalize models/l2_vecnormalize.pkl \\
     --l3-checkpoint models/l3_frozen_backup/l3_executioner_v1_frozen.zip \\
@@ -57,19 +85,42 @@ LOOKBACK_TICKS = 10
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Visualize one L2 episode for a trading audience.")
-    parser.add_argument("--l2-checkpoint", type=str, required=True)
-    parser.add_argument("--l2-vecnormalize", type=str, required=True)
+    parser.add_argument(
+        "--l2-checkpoint", type=str, default=None,
+        help="Required unless --frozen-l3-only (then must be omitted).",
+    )
+    parser.add_argument(
+        "--l2-vecnormalize", type=str, default=None,
+        help="Required unless --frozen-l3-only (then must be omitted).",
+    )
     parser.add_argument("--l3-checkpoint", type=str, required=True)
     parser.add_argument("--l3-vecnormalize", type=str, required=True)
     parser.add_argument("--seed", type=int, required=True, help="Episode seed -- no default, pick one deliberately.")
+    parser.add_argument(
+        "--frozen-l3-only", action="store_true",
+        help="Drive the episode with the constant TWAP-passthrough action [1.0, 0.5] instead "
+        "of an L2 policy -- frozen L3, completely unsteered. --l2-checkpoint/--l2-vecnormalize "
+        "must be omitted when this is set. A correctness check on THIS TOOL: compare the "
+        "printed action-type breakdown against L3's own n=500 numbers (HOLD 47.6% / LIMIT "
+        "52.0% / MARKET 0.02% / REPLACE 0.36%).",
+    )
     parser.add_argument("--ticks-per-l2-decision", type=int, default=50)
     parser.add_argument("--l2-include-prev-action", action="store_true")
     parser.add_argument("--n-slices", type=int, default=10, help="TWAP comparison baseline's own slice count.")
-    parser.add_argument("--data-dir", type=str, default="data/raw_l2_bybit/BTCUSDT")
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="Defaults to the numeric or original archive based on --use-numeric-format "
+        "(same convention as train_l2.py's own NUMERIC_DATA_DIR/PARQUET_DATA_DIR) -- set "
+        "explicitly only to point at something else (e.g. synthetic test data).",
+    )
     parser.add_argument("--use-numeric-format", action="store_true")
     parser.add_argument("--device", default="cpu", choices=["cuda", "cpu"])
     parser.add_argument("--output", type=str, default=None, help="PNG path; default replay_seed<seed>.png")
     return parser
+
+
+NUMERIC_DATA_DIR = "data/raw_l2_bybit_numeric/BTCUSDT"
+PARQUET_DATA_DIR = "data/raw_l2_bybit/BTCUSDT"
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +204,13 @@ def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildO
     ORDER_TYPE_MARKET action), so a LIMIT/CANCEL_AND_REPLACE placement can show a
     non-maker fill on its OWN placement tick -- that is an immediate crossing fill,
     not a later maker fill, and is attributed to the order accordingly rather than
-    left looking "still open." Not handled: a crossing placement that fills only
-    PART of the order and rests the remainder on the same tick -- not observed in
-    the one episode this was verified against, flagged as a known limitation rather
-    than silently assumed away."""
+    left looking "still open." A partial crossing fill (walk_market_fill() runs out
+    of visible depth) is handled the same way, marked filled with whatever quantity
+    did fill -- confirmed from _place_limit()'s own source that this is the ONLY
+    outcome possible: the crossed branch's `return fills` is unconditional, so the
+    resting-order code is structurally unreachable when crossed=True. A crossing
+    placement never rests any remainder, partial or otherwise -- that scenario is
+    not just unobserved, it cannot happen."""
     orders: list[ChildOrder] = []
     open_order: ChildOrder | None = None
 
@@ -207,6 +261,10 @@ def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildO
 # Run the two episodes.
 # ---------------------------------------------------------------------------
 
+_TWAP_PASSTHROUGH_ACTION = np.array([1.0, 0.5], dtype=np.float32)  # same as train_l2.py's
+                                                                     # ValISEvalCallback
+
+
 def run_l2_episode(args, val_date_range: tuple[str, str]) -> dict[str, Any]:
     l3_model = RecurrentPPO.load(args.l3_checkpoint, device="cpu")
     wrapped_env = make_l2_wrapped_env(
@@ -216,16 +274,22 @@ def run_l2_episode(args, val_date_range: tuple[str, str]) -> dict[str, Any]:
     )
     capture = install_capture(wrapped_env)
 
-    l2_model = SAC.load(args.l2_checkpoint, device=args.device)
-    l2_vec_normalize = VecNormalize.load(args.l2_vecnormalize, DummyVecEnv([lambda: wrapped_env]))
-    l2_vec_normalize.training = False
+    if args.frozen_l3_only:
+        action_fn = lambda obs: _TWAP_PASSTHROUGH_ACTION
+    else:
+        l2_model = SAC.load(args.l2_checkpoint, device=args.device)
+        l2_vec_normalize = VecNormalize.load(args.l2_vecnormalize, DummyVecEnv([lambda: wrapped_env]))
+        l2_vec_normalize.training = False
+
+        def action_fn(obs):
+            obs_for_policy = l2_vec_normalize.normalize_obs(obs[None, :])
+            action, _ = l2_model.predict(obs_for_policy, deterministic=True)
+            return action[0]
 
     obs, info = wrapped_env.reset(seed=args.seed)
     max_decisions = HORIZON_TICKS // args.ticks_per_l2_decision + 1
     for _ in range(max_decisions):
-        obs_for_policy = l2_vec_normalize.normalize_obs(obs[None, :])
-        action, _ = l2_model.predict(obs_for_policy, deterministic=True)
-        obs, r, term, trunc, info = wrapped_env.step(action[0])
+        obs, r, term, trunc, info = wrapped_env.step(action_fn(obs))
         if term or trunc:
             break
 
@@ -278,8 +342,9 @@ def build_figure(l2_result: dict, twap_result: dict, output_path: str) -> None:
     rel_ticks = [t - t0 for t in ticks]
 
     fig, axes = plt.subplots(3, 1, figsize=(13, 11), sharex=True, height_ratios=[2.2, 1.3, 1.0])
+    mode_label = "frozen L3 (unsteered, no L2 policy)" if l2_result.get("frozen_l3_only") else "L2 policy"
     fig.suptitle(
-        f"L2 episode replay -- seed={l2_result.get('seed', '?')} -- {_side_label(side)} "
+        f"Episode replay -- {mode_label} -- seed={l2_result.get('seed', '?')} -- {_side_label(side)} "
         f"{qty_total:.3f} units, arrival price {arrival_price:.1f}",
         fontsize=13, fontweight="bold",
     )
@@ -355,11 +420,12 @@ def build_figure(l2_result: dict, twap_result: dict, output_path: str) -> None:
     exec_str = f"{is_result.is_exec_bps:+.2f}bps" if is_result.is_exec_bps is not None else "n/a (no fills)"
     verdict = "BEAT" if is_result.is_total_bps < twap_is.is_total_bps else "LOST TO"
     verdict_gap = abs(is_result.is_total_bps - twap_is.is_total_bps)
+    arm_label = "Frozen L3 (unsteered)" if l2_result.get("frozen_l3_only") else "L2 policy"
     summary_lines = [
-        f"L2 policy:  fill_ratio={is_result.fill_ratio:.1%}   IS_total={is_result.is_total_bps:+.2f}bps",
+        f"{arm_label}:  fill_ratio={is_result.fill_ratio:.1%}   IS_total={is_result.is_total_bps:+.2f}bps",
         f"  (execution={exec_str}, opportunity={is_result.is_opp_bps:+.2f}bps, fees={is_result.fees_bps:+.2f}bps)",
         f"TWAP, same window/seed:  fill_ratio={twap_is.fill_ratio:.1%}   IS_total={twap_is.is_total_bps:+.2f}bps",
-        f"L2 {verdict} TWAP by {verdict_gap:.2f}bps on this single episode "
+        f"{arm_label} {verdict} TWAP by {verdict_gap:.2f}bps on this single episode "
         f"(not a significance test -- see scripts/eval_l2_n500.py).",
     ]
     fig.text(0.5, 0.01, "\n".join(summary_lines), ha="center", va="bottom", fontsize=8, family="monospace",
@@ -370,27 +436,69 @@ def build_figure(l2_result: dict, twap_result: dict, output_path: str) -> None:
     plt.close(fig)
 
 
+# L3's own n=500 action-type distribution (docs/TRACK_STATUS.md / L3's evaluation
+# report) -- the reference a --frozen-l3-only replay's printed breakdown should land
+# close to. One episode vs. n=500: not an exact-match bar, a shape check.
+_L3_N500_ACTION_DISTRIBUTION = {"HOLD": 0.476, "LIMIT": 0.520, "MARKET": 0.0002, "REPLACE": 0.0036}
+
+
+def _action_type_distribution(tick_records: list[dict]) -> dict[str, float]:
+    from src.envs.lob_execution_env import ORDER_TYPE_HOLD
+    counts = {"HOLD": 0, "LIMIT": 0, "MARKET": 0, "REPLACE": 0}
+    label_by_type = {
+        ORDER_TYPE_HOLD: "HOLD", ORDER_TYPE_LIMIT: "LIMIT",
+        ORDER_TYPE_MARKET: "MARKET", ORDER_TYPE_CANCEL_REPLACE: "REPLACE",
+    }
+    for rec in tick_records:
+        counts[label_by_type[rec["order_type"]]] += 1
+    n = len(tick_records)
+    return {k: v / n for k, v in counts.items()} if n else counts
+
+
 def main() -> None:
     args = build_parser().parse_args()
+    if args.frozen_l3_only:
+        if args.l2_checkpoint or args.l2_vecnormalize:
+            raise SystemExit("--frozen-l3-only and --l2-checkpoint/--l2-vecnormalize are mutually exclusive.")
+    else:
+        if not args.l2_checkpoint or not args.l2_vecnormalize:
+            raise SystemExit("--l2-checkpoint and --l2-vecnormalize are both required unless --frozen-l3-only.")
+    if args.data_dir is None:
+        args.data_dir = NUMERIC_DATA_DIR if args.use_numeric_format else PARQUET_DATA_DIR
+
     output_path = args.output or f"replay_seed{args.seed}.png"
 
     val_dates = load_split("val")
     val_date_range = (val_dates[0].isoformat(), val_dates[-1].isoformat())
     print(f"val date_range: {val_date_range} ({len(val_dates)} real days)")
+    print(f"data_dir: {args.data_dir}")
     print(f"seed={args.seed}")
+    print(f"mode: {'frozen L3 only (TWAP-passthrough action)' if args.frozen_l3_only else 'L2 policy'}")
 
     l2_result = run_l2_episode(args, val_date_range)
     l2_result["seed"] = args.seed
+    l2_result["frozen_l3_only"] = args.frozen_l3_only
     twap_result = run_twap_baseline(args, val_date_range)
 
     is_r = l2_result["is_result"]
     twap_is = twap_result["is_result"]
-    print(f"\nL2 policy:    fill_ratio={is_r.fill_ratio:.3f}  IS_total_bps={is_r.is_total_bps:+.4f}")
+    arm_label = "Frozen L3 (unsteered)" if args.frozen_l3_only else "L2 policy"
+    print(f"\n{arm_label}: fill_ratio={is_r.fill_ratio:.3f}  IS_total_bps={is_r.is_total_bps:+.4f}")
     print(f"TWAP (same window/seed): fill_ratio={twap_is.fill_ratio:.3f}  IS_total_bps={twap_is.is_total_bps:+.4f}")
     print(f"Child orders reconstructed: {len(l2_result['child_orders'])} "
           f"({sum(1 for o in l2_result['child_orders'] if o.kind == 'resting')} resting, "
           f"{sum(1 for o in l2_result['child_orders'] if o.kind == 'market')} market)")
     print(f"L2 decisions: {len(l2_result['l2_decision_records'])}")
+
+    dist = _action_type_distribution(l2_result["tick_records"])
+    print(f"\nAction-type distribution, this episode ({len(l2_result['tick_records'])} ticks):")
+    for label in ("HOLD", "LIMIT", "MARKET", "REPLACE"):
+        ref = _L3_N500_ACTION_DISTRIBUTION[label]
+        print(f"  {label:8s} {dist.get(label, 0.0):6.1%}   (L3's own n=500: {ref:6.1%})")
+    if args.frozen_l3_only:
+        print("  ^ sanity check: this episode's shape should land reasonably close to the")
+        print("    n=500 reference above -- a big divergence (e.g. mostly MARKET here) means")
+        print("    this visualizer has a bug, not that frozen L3's behavior changed.")
 
     build_figure(l2_result, twap_result, output_path)
     print(f"\nWrote {output_path}")

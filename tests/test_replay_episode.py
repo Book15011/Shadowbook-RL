@@ -73,3 +73,23 @@ def test_placement_price_matches_place_limit_formula_sell_side():
     records = [_tick(0, ORDER_TYPE_LIMIT, offset=3, best_bid=100.0, best_ask=100.2)]
     orders = reconstruct_child_orders(records, side=-1)
     assert orders[0].placement_price == 99.9  # 100.2 - 3*0.1
+
+
+def test_partial_crossing_fill_marked_filled_not_left_open():
+    # _place_limit()'s `crossed` branch returns unconditionally after
+    # walk_market_fill() -- confirmed from source, not assumed -- so a crossing
+    # placement that only PARTIALLY fills (visible book ran out of depth) still
+    # never rests a remainder. Two non-maker fills on the placement's own tick
+    # (walk_market_fill() can span multiple price levels) -- both must be
+    # attributed, and the order must read "filled", not "still open".
+    records = [_tick(0, ORDER_TYPE_LIMIT, offset=5, fills=[
+        {"price": 100.2, "qty": 2.0, "is_maker": False},
+        {"price": 100.3, "qty": 1.0, "is_maker": False},
+    ])]
+    orders = reconstruct_child_orders(records, side=1)
+    assert len(orders) == 1
+    o = orders[0]
+    assert o.kind == "market"
+    assert o.outcome == "filled"
+    assert o.fill_qtys == [2.0, 1.0]
+    assert o.fill_prices == [100.2, 100.3]
