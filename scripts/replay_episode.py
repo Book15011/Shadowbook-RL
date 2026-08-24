@@ -157,6 +157,7 @@ def install_capture(wrapped_env: FrozenL3Wrapper) -> EpisodeCapture:
             "canceled_via_market": info["canceled_via_market"],
             "canceled_via_replace": info["canceled_via_replace"],
             "qty_remaining": info["qty_remaining"],
+            "resting_own_remaining": info["resting_own_remaining"],
         })
         return obs, r, term, trunc, info
 
@@ -197,62 +198,96 @@ class ChildOrder:
 
 def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildOrder]:
     """Walks the tick-level capture and regroups it into discrete child-order
-    lifetimes (placement -> outcome), matching _place_limit()'s own real pricing
-    (tick.best_bid/ask +/- offset*TICK_SIZE, verified against that function's source,
-    not guessed). One case handled explicitly: _place_limit() routes a price that
-    crosses the opposing side through walk_market_fill() (same mechanism as an
-    ORDER_TYPE_MARKET action), so a LIMIT/CANCEL_AND_REPLACE placement can show a
-    non-maker fill on its OWN placement tick -- that is an immediate crossing fill,
-    not a later maker fill, and is attributed to the order accordingly rather than
-    left looking "still open." A partial crossing fill (walk_market_fill() runs out
-    of visible depth) is handled the same way, marked filled with whatever quantity
-    did fill -- confirmed from _place_limit()'s own source that this is the ONLY
-    outcome possible: the crossed branch's `return fills` is unconditional, so the
-    resting-order code is structurally unreachable when crossed=True. A crossing
-    placement never rests any remainder, partial or otherwise -- that scenario is
-    not just unobserved, it cannot happen."""
+    lifetimes (placement -> outcome), mirroring the real env's own resting-order
+    state machine (LOBExecutionEnv.step(), in that exact order: evolve the
+    existing resting order against market activity, apply an explicit cancel,
+    THEN decide whether the tick's action places something new) instead of
+    inferring placements from raw action types alone.
+
+    Real bug this replaced, found by comparing a real episode's reconstructed
+    order count (1,693 orders from 3,000 ticks, ~56% of which were LIMIT/
+    CANCEL_AND_REPLACE actions) against how rarely resting orders should
+    actually turn over: the previous version created a new ChildOrder for
+    EVERY recorded LIMIT/CANCEL_AND_REPLACE tick, regardless of whether the
+    real env's self._resting was already occupied. But step()'s own dispatch
+    (`elif order_type in (LIMIT, CANCEL_REPLACE): if self._resting is None and
+    self.qty_remaining > 0: ...`) makes a LIMIT action issued while an order is
+    ALREADY resting a silent no-op there -- not a new placement, and not a
+    replace. The old code both fabricated phantom placements and mislabeled
+    still-resting orders "replaced" every time L3 kept emitting LIMIT while
+    already resting (which this session's own action-distribution checks show
+    is common: L3 was never trained to prefer HOLD once resting). Fixed by
+    shadowing self._resting.own_qty_remaining directly from the env's own
+    info["resting_own_remaining"] (ground truth, captured every tick -- not
+    re-derived from size_frac/qty_remaining): maker fills deplete it first
+    (a same-tick fresh placement can never receive a same-tick maker fill --
+    _place_limit()'s non-crossing branch only ever creates a QueueState, no
+    fill), an explicit cancel (canceled_via_market/canceled_via_replace)
+    clears it, and only THEN does a LIMIT/CANCEL_AND_REPLACE tick get treated
+    as a genuine new placement -- exactly matching step()'s own precondition.
+
+    Crossing placements: _place_limit()'s `crossed` branch returns
+    unconditionally after walk_market_fill(), so a crossing LIMIT/CANCEL_AND_
+    REPLACE never rests any remainder, partial or otherwise -- confirmed from
+    that function's own source, not assumed. Handled here as an immediate
+    non-maker fill on the placement's own tick, relabeled kind="market"."""
     orders: list[ChildOrder] = []
     open_order: ChildOrder | None = None
+    resting_remaining: float | None = None  # shadows self._resting.own_qty_remaining
 
     for rec in tick_records:
-        if rec["order_type"] in (ORDER_TYPE_LIMIT, ORDER_TYPE_CANCEL_REPLACE):
-            if open_order is not None and open_order.outcome == "open_at_episode_end":
-                open_order.outcome = "replaced"
-            touch = rec["best_bid"] if side == 1 else rec["best_ask"]
-            price = round(touch + rec["offset"] * TICK_SIZE, 1) if side == 1 else round(touch - rec["offset"] * TICK_SIZE, 1)
-            open_order = ChildOrder(
-                kind="resting", placement_tick=rec["tick_idx"], placement_price=price,
-                offset_from_touch=rec["offset"], outcome="open_at_episode_end",
-            )
-            orders.append(open_order)
-            # Crossed-price immediate fill: same-tick non-maker fill means this
-            # "placement" never actually rested -- it executed immediately, like a
-            # market order.
+        # 1. Evolve: a maker fill this tick can only belong to an order that
+        # was ALREADY resting entering this tick (see docstring) -- so if
+        # nothing was resting, there is nothing to evolve.
+        if resting_remaining is not None:
             for f in rec["fills"]:
-                if not f.get("is_maker"):
+                if f.get("is_maker"):
                     open_order.fill_ticks.append(rec["tick_idx"])
                     open_order.fill_qtys.append(f["qty"])
                     open_order.fill_prices.append(f["price"])
-                    open_order.outcome = "filled"
-                    open_order.kind = "market"
-            continue
+                    resting_remaining = max(0.0, resting_remaining - f["qty"])
+            if resting_remaining is not None and resting_remaining <= 1e-9:
+                open_order.outcome = "filled"
+                resting_remaining = None
 
-        if rec["order_type"] == ORDER_TYPE_MARKET:
+        # 2. Explicit cancel -- matches step()'s own MARKET/CANCEL_AND_REPLACE
+        # teardown branches, which both run before the placement check.
+        if rec["canceled_via_market"] or rec["canceled_via_replace"]:
+            if resting_remaining is not None and open_order is not None and open_order.outcome == "open_at_episode_end":
+                open_order.outcome = "replaced"
+            resting_remaining = None
+
+        # 3. Apply the action.
+        if rec["order_type"] in (ORDER_TYPE_LIMIT, ORDER_TYPE_CANCEL_REPLACE):
+            if resting_remaining is None:
+                touch = rec["best_bid"] if side == 1 else rec["best_ask"]
+                price = round(touch + rec["offset"] * TICK_SIZE, 1) if side == 1 else round(touch - rec["offset"] * TICK_SIZE, 1)
+                open_order = ChildOrder(
+                    kind="resting", placement_tick=rec["tick_idx"], placement_price=price,
+                    offset_from_touch=rec["offset"], outcome="open_at_episode_end",
+                )
+                orders.append(open_order)
+                resting_remaining = rec["resting_own_remaining"]
+                # Crossed-price immediate fill: same-tick non-maker fill means this
+                # "placement" never actually rested -- it executed immediately, like a
+                # market order.
+                for f in rec["fills"]:
+                    if not f.get("is_maker"):
+                        open_order.fill_ticks.append(rec["tick_idx"])
+                        open_order.fill_qtys.append(f["qty"])
+                        open_order.fill_prices.append(f["price"])
+                        open_order.outcome = "filled"
+                        open_order.kind = "market"
+                        resting_remaining = None
+            # else: already resting -- a real no-op in the env, not a new order.
+
+        elif rec["order_type"] == ORDER_TYPE_MARKET:
             for f in rec["fills"]:
                 orders.append(ChildOrder(
                     kind="market", placement_tick=rec["tick_idx"], placement_price=f["price"],
                     offset_from_touch=0, outcome="filled",
                     fill_ticks=[rec["tick_idx"]], fill_qtys=[f["qty"]], fill_prices=[f["price"]],
                 ))
-            continue
-
-        if open_order is not None:
-            for f in rec["fills"]:
-                if f.get("is_maker"):
-                    open_order.fill_ticks.append(rec["tick_idx"])
-                    open_order.fill_qtys.append(f["qty"])
-                    open_order.fill_prices.append(f["price"])
-                    open_order.outcome = "filled"
 
     return orders
 

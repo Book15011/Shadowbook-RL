@@ -13,19 +13,21 @@ from scripts.replay_episode import reconstruct_child_orders
 from src.envs.lob_execution_env import ORDER_TYPE_CANCEL_REPLACE, ORDER_TYPE_HOLD, ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET
 
 
-def _tick(tick_idx, order_type, offset=0, best_bid=100.0, best_ask=100.2, fills=None):
+def _tick(tick_idx, order_type, offset=0, best_bid=100.0, best_ask=100.2, fills=None,
+          canceled_via_market=False, canceled_via_replace=False, resting_own_remaining=None):
     return {
         "tick_idx": tick_idx, "ts": tick_idx, "mid_price": (best_bid + best_ask) / 2,
         "best_bid": best_bid, "best_ask": best_ask, "order_type": order_type, "offset": offset,
-        "size_frac": 1.0, "fills": fills or [], "canceled_via_market": False,
-        "canceled_via_replace": False, "qty_remaining": 0.0,
+        "size_frac": 1.0, "fills": fills or [], "canceled_via_market": canceled_via_market,
+        "canceled_via_replace": canceled_via_replace, "qty_remaining": 0.0,
+        "resting_own_remaining": resting_own_remaining,
     }
 
 
 def test_resting_order_later_maker_fill():
     records = [
-        _tick(0, ORDER_TYPE_LIMIT, offset=-2),
-        _tick(1, ORDER_TYPE_HOLD),
+        _tick(0, ORDER_TYPE_LIMIT, offset=-2, resting_own_remaining=3.0),
+        _tick(1, ORDER_TYPE_HOLD, resting_own_remaining=3.0),
         _tick(2, ORDER_TYPE_HOLD, fills=[{"price": 99.8, "qty": 3.0, "is_maker": True}]),
     ]
     orders = reconstruct_child_orders(records, side=1)
@@ -51,8 +53,9 @@ def test_crossed_placement_fills_immediately_not_left_open():
 
 def test_replaced_before_filling():
     records = [
-        _tick(0, ORDER_TYPE_LIMIT, offset=-2),
-        _tick(5, ORDER_TYPE_CANCEL_REPLACE, offset=-1),  # replaces the first, still open at end
+        _tick(0, ORDER_TYPE_LIMIT, offset=-2, resting_own_remaining=5.0),
+        _tick(5, ORDER_TYPE_CANCEL_REPLACE, offset=-1, canceled_via_replace=True,
+              resting_own_remaining=2.0),  # replaces the first, still open at end
     ]
     orders = reconstruct_child_orders(records, side=1)
     assert len(orders) == 2
@@ -93,3 +96,25 @@ def test_partial_crossing_fill_marked_filled_not_left_open():
     assert o.outcome == "filled"
     assert o.fill_qtys == [2.0, 1.0]
     assert o.fill_prices == [100.2, 100.3]
+
+
+def test_limit_action_while_resting_is_a_no_op_not_a_new_order():
+    # step()'s own dispatch only places a new order when self._resting is None
+    # (`elif order_type in (LIMIT, CANCEL_REPLACE): if self._resting is None...`)
+    # -- a LIMIT action recorded while an order is ALREADY resting is a real
+    # no-op there, not a fresh placement and not a replace. This is exactly the
+    # pattern a real episode showed (L3 repeatedly emitting LIMIT while resting,
+    # never HOLD): the old reconstruction created a new ChildOrder per LIMIT
+    # tick regardless, inflating a real episode's order count to ~1-per-LIMIT-
+    # tick (1,692 orders from 3,000 ticks) and mislabeling the still-resting
+    # order "replaced" the moment the next LIMIT tick came in.
+    records = [
+        _tick(0, ORDER_TYPE_LIMIT, offset=-2, resting_own_remaining=5.0),
+        _tick(1, ORDER_TYPE_LIMIT, offset=-2, resting_own_remaining=5.0),  # no-op: still resting
+        _tick(2, ORDER_TYPE_HOLD, fills=[{"price": 99.8, "qty": 5.0, "is_maker": True}]),
+    ]
+    orders = reconstruct_child_orders(records, side=1)
+    assert len(orders) == 1  # not 2 -- tick 1's LIMIT never became a real order
+    o = orders[0]
+    assert o.outcome == "filled"  # not "replaced"
+    assert o.fill_ticks == [2] and o.fill_qtys == [5.0]
