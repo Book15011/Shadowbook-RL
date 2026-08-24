@@ -4,6 +4,8 @@ __pycache__/
 logs/
 models/*.pkl
 models/*.zip
+models/**/*.pkl
+models/**/*.zip
 models/l3_checkpoints/
 data/raw*
 .pytest_cache/
