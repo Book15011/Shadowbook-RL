@@ -283,61 +283,69 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
-Last updated: 2026-08-24 08:05 HKT
-State: Two CPU-only follow-ups while blocked on L3's A/B runs, both complete. TASK 1
-(throughput measurement, no new run -- extracted from the existing smoke test's own
-artifacts: checkpoint mtimes, TensorBoard log, console output): steady-state rate ~4.15
-decisions/sec single-env; a real 2,000,000-step run extrapolates to ~5.5 days. Headline
-finding: ~47% of wall-clock is env.reset() overhead, not the 50-tick inner loop -- L2
-episodes end short (~18 decisions, not 60) because the frozen L3 policy completes orders
-early, so reset() (cited from L3's own ~2027ms measurement) is paid disproportionately
-often per unit of L2 training. Plain answer: not practical at this throughput. Primary
-recommendation (not built): parallelize envs (SubprocVecEnv, mirroring L3's own n_envs=8),
-addresses both halves at once, plausibly under a day -- flagged real constraint: L2's own
-parallel envs would contend for GPU with L3's concurrent work.
-TASK 2 (held-out eval callback, built): ValISEvalCallback in train_l2.py, modeled on
-train_l3.py's own class (read first) -- same held-out-val-split/paired-seed/real-IS-metric
-conventions, TWAP-passthrough baseline (zero L2 steering). Wired in behind --eval/--no-eval
-(default ON). Defaults sized against Task 1's measured rate, not L3's n=50: --eval-freq
-10,000 (~40min between firings), --n-eval-episodes 10 (~43s/firing, <2% overhead) -- L3's
-n=50 was sized for statistical significance, L2's n=10 for "catch an obviously broken run
-within about an hour" instead, a cheaper, different bar.
-Two real bugs found via this callback's own tests, fixed in wrappers.py (now 4 corrections
-there total, see its module docstring): (1) FrozenL3Wrapper.step() hardcoded the frozen L3
-policy's OWN inner predict() calls to deterministic=False unconditionally -- even a caller
-requesting deterministic L2 eval still got a stochastic frozen L3 underneath it, silently
-breaking paired-eval reproducibility. Fixed via a new l3_deterministic constructor param
-(default False, preserves training behavior; eval constructs with True). (2) Fixing (1)
-alone wasn't enough: env.l2_target_slice_ratio_override/l2_urgency are never reset by
-LOBExecutionEnv.reset() (only __init__ and the wrapper's own step() touch them), so a
-reused instance (every episode after the first, in training AND eval) leaked the PREVIOUS
-episode's leftover L2 state into the new episode's very first L3 observation -- a real
-cross-episode data leak, and specifically fatal to eval's paired-seed guarantee. Fixed by
-resetting both to neutral defaults at the start of FrozenL3Wrapper.reset(), before calling
-env.reset(). Both caught by the SAME determinism test (identical seed+action produced
-identical terminal fill_ratio/IS but different total_reward -- the aggregate coincidentally
-matched while the per-tick trajectory didn't). Each also has its own dedicated regression
-test in test_wrappers.py, not just the integration-level catch. Third, unrelated bug also
-caught: a literal % in --n-eval-episodes' help text broke argparse's own string expansion,
-crashing --help with a TypeError -- fixed (escaped as %%), verified --help exits 0.
-Tests: 12 new (2 in test_wrappers.py for the two reproducibility bugs, 10 in new
-tests/test_train_l2.py for ValISEvalCallback/env-construction helpers), all hand-computed-
-fixture or determinism-assertion style, no GPU, no real checkpoint. Full suite
-(test_wrappers.py + test_train_l2.py, excluding the gated integration smoke test): 31/31
-passing. Design doc reorganized further -- Task 1/Task 2 findings folded into CURRENT
-STATE, decision (b) marked built, decision (a) (VecNormalize on L2's own obs/reward) still
-only decided, not implemented.
-Files owned/in-progress: none uncommitted as of this update -- src/envs/wrappers.py,
-src/train/train_l2.py, tests/test_wrappers.py, tests/test_train_l2.py (new),
-docs/reports/phase4_l2_reconciliation_and_plan.md all committed this round (see git log
-for exact hashes).
-Blocking/open questions: two things, not one -- (1) L3's matched A/B runs (checkpoint
-choice, unaffected by this round), (2) throughput -- a real run at the current single-env
-design is impractical (~5.5 days), not just slow, and parallelization is not yet built.
-Recommend treating both as blocking a REAL launch, even once (1) resolves. Decision (a)
-(VecNormalize) remains recommended before a real run, not blocking further work.
-Next planned step: awaiting direction on parallelization (design/build) and the L3 A/B
-result. No training launch planned until both land.
+Last updated: 2026-08-24 08:29 HKT
+State: Checkpoint identity RESOLVED -- docs/reports/l3_frozen_handoff.md designates the
+frozen checkpoint (models/l3_frozen_backup/l3_executioner_v1_frozen.zip, sha256-verified),
+L3 research closed, no code changes needed on L2's side to use it. This round was design +
+measurement only for the throughput problem (no full implementation), per instruction.
+STEP 1 (profiling, real checkpoint + real data, no reasoning-only estimate): 120 real L2
+decisions, single env, GPU L3 inference -- env.reset() 51.0% (7 calls, ~2084ms each),
+L3.predict() 35.5% (5735 calls, 1.77ms each), env.step() 6.1%, SAC.train() 5.9%. Confirms
+I/O (reset), not gradient updates, is the bottleneck -- refines it: predict() is a real
+secondary cost too. Also measured, not assumed: L3 model's real per-process VRAM footprint
+via nvidia-smi is 454MB (not the ~3MB torch's own allocator reports -- CUDA context
+overhead dominates for a model this small); CPU predict() is FASTER than GPU for this
+specific tiny model (0.89-0.94ms vs 1.72ms/call, consistent with and without thread
+capping) -- the model is small enough that GPU kernel-launch/sync overhead exceeds actual
+compute.
+STEP 2: Option B (batched central inference) ruled out -- capped at addressing only the
+35.5% predict() share (the larger 51% reset() share is untouched by construction) for the
+highest implementation risk of the three (per-worker LSTM state management across a
+batched call -- the harder version of a bug class this track's own tests already caught
+twice this month in the simple single-env case). Recommended: Option A+C combined -- N
+independent workers via standard SubprocVecEnv, each with its own L3 model copy on CPU
+(not GPU) -- same simplicity as A, wins on speed AND avoids all VRAM contention with L1's
+concurrent Ollama usage.
+STEP 3 (minimal benchmark, n_envs=2/4, real checkpoint + real data): first pass (no thread
+capping) showed the OPPOSITE of the prediction -- 0.14x/0.11x speedup (7-9x SLOWER).
+Reported plainly rather than proceeding on a bad assumption. Root cause confirmed via ps
+aux, not assumed: severe CPU thread oversubscription (workers at ~375% CPU each, N
+processes x multi-threaded torch/BLAS ops competing for 16 physical cores). Fixed
+(torch.set_num_threads(1) + OMP/MKL env vars) and re-ran: vec_env.reset() for N parallel
+workers' first cold reset (~2.1-2.9s) essentially matches a SINGLE worker's own reset cost
+-- confirms resets genuinely overlap across processes. But steady-state rate across two
+repeated runs of the IDENTICAL n_envs=2 config disagreed by more than 2x (3.384 vs 8.527
+dec/sec) -- this round's benchmarks never fixed a random seed, so different runs sample
+genuinely different real market days/episode lengths, an uncontrolled confound in the
+benchmark design itself, not a mysterious result. Honest conclusion: thread capping is a
+confirmed, reproducible, mandatory fix (not optional); the resulting speedup magnitude is
+genuinely uncertain from this round's data (0.81x-2.16x across readings) and NOT reliable
+enough to extrapolate a specific 2,000,000-step/n_envs=8 runtime -- stated explicitly
+rather than picking whichever number looks better.
+STEP 4: Recommendation is Option A+C (N CPU-inference workers, SubprocVecEnv,
+torch.set_num_threads(1) mandatory) WITH a properly controlled follow-up benchmark (fixed
+seeds, longer duration, repeated trials) before full implementation -- not implementing
+this round, per instruction. Five correctness risks documented for a future full
+implementation to test (seed reproducibility per-worker, per-worker LSTM isolation,
+cross-episode-leak fix holding inside SubprocVecEnv workers specifically, distributional
+equivalence via a fixed paired-seed set single-env-vs-parallel comparison rather than
+byte-identical equivalence, SAC train_freq/gradient_steps semantics under multi-env).
+Files: scripts/profile_l2_throughput.py, scripts/benchmark_parallel_l2.py,
+scripts/benchmark_parallel_l2_v2.py (all new, throwaway measurement code, not wired into
+train_l2.py) -- committed this round. docs/reports/phase4_l2_reconciliation_and_plan.md
+updated with full Steps 1-4 findings and the resolved-checkpoint fact.
+Files owned/in-progress: none uncommitted as of this update.
+Blocking/open questions: throughput is the sole remaining blocker (checkpoint question is
+resolved). A real training launch needs EITHER a properly controlled parallelization
+benchmark confirming a trustworthy speedup number, OR a decision to accept the ~5.5-day
+single-env runtime as-is given the checkpoint's own honest performance (ties TWAP, per the
+handoff doc) -- that tradeoff is not this doc's call to make.
+Next planned step: awaiting direction -- (a) build the properly-controlled follow-up
+benchmark (fixed seeds, longer duration) to get a trustworthy speedup number before any
+full implementation, or (b) reconsider whether throughput engineering is worth the
+investment given the checkpoint's own tie-not-beat result against TWAP, or (c) something
+else. No production parallelization code and no real training launch until one of these
+is decided.
 
 ## L3 / Env-Physics
 Last updated: 2026-08-23 18:15 HKT

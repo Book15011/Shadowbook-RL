@@ -10,7 +10,7 @@ including reasoning later corrected or superseded, rather than deleting it.
 
 ---
 
-## CURRENT STATE (as of 2026-08-21, this round) -- read this first
+## CURRENT STATE (as of 2026-08-24, updated across multiple rounds) -- read this first
 
 ### Snapshot
 
@@ -371,20 +371,218 @@ hand-computed-fixture or determinism-assertion style, no GPU, no real checkpoint
 **Not built, out of scope for this round:** Decision (a) above (VecNormalize on L2's own
 obs/reward) is still only decided, not implemented -- unaffected by this round's work.
 
+### Parallelization design + measurement (2026-08-24, this round) -- design/measurement only, not implemented
+
+Frozen checkpoint per `docs/reports/l3_frozen_handoff.md` (read first, stands alone):
+`models/l3_frozen_backup/l3_executioner_v1_frozen.zip` /
+`l3_vecnormalize_frozen.pkl`, sha256-verified against the handoff doc's stated checksums
+before any measurement below. **This checkpoint ties TWAP, does not beat it** (handoff
+doc's own honest performance statement) -- noted here since it bears on how much
+engineering investment in throughput is worth committing before any further RL result is
+in hand, though that's a call for whoever owns the go/no-go, not resolved here.
+
+#### Step 1 -- bottleneck confirmed by profiling, not reasoning (real checkpoint, real data)
+
+`scripts/benchmark_parallel_l2.py`'s sibling, `scripts/profile_l2_throughput.py`,
+monkeypatch-instruments the real production code path (`make_l2_wrapped_env`, the real
+frozen checkpoint, the real archive) -- no source files modified. 120 real L2 decisions,
+single env, GPU L3 inference:
+
+| component | % of wall-clock | n calls | per-call |
+|---|---|---|---|
+| `env.reset()` | **51.0%** | 7 | 2083.8ms |
+| `L3.predict()` | 35.5% | 5735 | 1.769ms |
+| `env.step()` | 6.1% | 5735 | 0.302ms |
+| `SAC.train()` | 5.9% | 120 | 14.011ms |
+| other/overhead | 1.6% | -- | -- |
+
+Rate: 4.194 decisions/sec -- matches this doc's earlier arithmetic-based Task-1 estimate
+(~4.15/sec) closely, now directly measured rather than derived. **Confirms**: the
+bottleneck is I/O (`env.reset()`, dominant at 51%), not gradient updates (`SAC.train()`,
+5.9% -- clearly NOT the bottleneck). `L3.predict()` is a real secondary cost (35.5%) worth
+accounting for in the design, not dismissible.
+
+Two more measurements, per instruction not to assume:
+- **L3 model's real per-process VRAM footprint: 454MB**, measured via `nvidia-smi`'s
+  per-process accounting while a process holds the model loaded -- NOT the ~3MB
+  `torch.cuda.memory_allocated()` reports (that only tracks tensor allocations, not the
+  CUDA context overhead that actually dominates a small model's real footprint).
+- **CPU predict() is FASTER than GPU for this specific tiny model**: 0.894-0.937ms/call
+  (CPU, measured both with and without `torch.set_num_threads(1)` -- consistent) vs.
+  1.720ms/call (GPU). The model is small enough (`lstm_hidden_size=128`,
+  `net_arch=[128]`) that GPU kernel-launch/CPU-GPU-sync overhead exceeds the actual
+  compute, so GPU is the slower choice here, not the faster one intuition would suggest.
+
+#### Step 2 -- the three designs, evaluated against the measured profile
+
+**Option B (batched central inference) is structurally capped and higher-risk, ruled out
+first:** even perfect, zero-cost batching can only remove the 35.5% `L3.predict()` share --
+the LARGER 51% `env.reset()` share is untouched by construction (it's per-worker I/O, not
+inference), so B's own ceiling is well below what A/C achieve by parallelizing *both*
+buckets as a side effect of process-level parallelism. Against that capped upside, B
+carries the highest implementation risk of the three: it needs `FrozenL3Wrapper`'s inner
+loop restructured to manage *per-worker* LSTM state across a batched, asynchronously-
+arriving call -- explicitly, this is the harder version of a bug class this round's own
+prior work already found and fixed twice in the simple single-env case (hardcoded
+non-determinism; cross-episode state leak, both in `wrappers.py`'s `reset()`/`step()`).
+Not recommended.
+
+**Option A (N independent GPU model copies) vs. Option C (CPU per worker):** given CPU is
+measured *faster* than GPU for this model, and the real per-worker VRAM cost (454MB, not
+an estimate) would still need to coexist with L1's concurrent Ollama usage (~15GB peak
+per this round's stated constraint) -- at n_envs=8, Option A's GPU variant needs
+8x454MB = 3.63GB, which *does* fit in the ~9.5GB headroom under L1's stated peak, so VRAM
+is not a hard blocker for A either. But given C is simpler in resource terms (zero GPU
+contention risk with L1 at all) AND measured faster per call, **A and C are combined**:
+N independent workers, each with its own model copy, each on CPU. Same implementation
+complexity as plain Option A (standard `SubprocVecEnv`, no wrapper restructuring, mirrors
+L3's own already-established `n_envs=8` pattern) -- this is not a tradeoff between A and C,
+C wins on both speed and resource-safety for this specific model.
+
+**What could silently break (confirmed, not hypothetical -- found live this round):** naive
+per-worker CPU inference without capping thread counts causes severe oversubscription (N
+worker processes x torch/BLAS defaulting to multi-threaded ops each x 16 physical cores --
+observed directly via `ps aux` showing ~375% CPU per worker at n_envs=4). This is not a
+minor tuning detail; it was the dominant effect in this round's first benchmark (see Step 3).
+
+#### Step 3 -- minimal benchmark: the measured speedup did NOT match the design's prediction, reported plainly
+
+`scripts/benchmark_parallel_l2.py` (SubprocVecEnv, N workers, each with its own CPU L3
+model copy, real checkpoint + real data) at n_envs=2 and n_envs=4, 120 cumulative steps,
+first pass (no thread capping):
+
+| n_envs | measured rate | vs. 4.194/sec baseline |
+|---|---|---|
+| 2 | 0.604 dec/sec | **0.14x -- 7x SLOWER** |
+| 4 | 0.465 dec/sec | **0.11x -- 9x SLOWER** |
+
+**This is the opposite of the design's prediction, and is reported here plainly rather
+than proceeding to full implementation on it.** Root cause identified, not assumed: `ps
+aux` during the run showed each worker process at ~375% CPU -- confirming the thread-
+oversubscription risk flagged in Step 2 was not hypothetical, it was the dominant effect.
+
+`scripts/benchmark_parallel_l2_v2.py` re-ran with the fix (`torch.set_num_threads(1)` set
+inside each worker before model construction, plus `OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1`)
+and separates one-time startup cost (subprocess spawn + first cold-cache `reset()`) from
+steady-state rate, since a 120-step *cumulative* benchmark divided across N workers gives
+each worker a much smaller sample (e.g. 30 steps/worker at n_envs=4) than the single-env
+baseline's full 120 -- a real risk of mistaking startup-amortization bias for a genuine
+rate difference.
+
+Confirmed first: `vec_env.reset()` (N workers' first cold reset, in parallel) took
+2.1-2.9s regardless of N -- essentially matching a SINGLE worker's own `~2.08s reset()`
+cost from Step 1. **This confirms `reset()` genuinely overlaps well across separate
+processes** -- the core premise behind parallelizing the I/O-bound share holds.
+
+Steady-state rate, thread-capped, two separate runs of the identical configuration:
+
+| Run | n_envs=2 | n_envs=4 |
+|---|---|---|
+| A (n_envs=2 run alone) | 3.384 dec/sec (0.81x) | -- |
+| B (n_envs=2 then n_envs=4, same process) | 8.527 dec/sec (2.03x) | 9.072 dec/sec (2.16x) |
+
+**These two measurements of the SAME n_envs=2 configuration disagree by more than 2x
+(3.384 vs. 8.527 dec/sec), and this round's benchmarks never fixed a random seed** --
+`reset()` draws a random day/window/side/qty per episode, so different runs sample
+genuinely different real market data with different episode lengths and different real
+matching-engine compute load. This is an uncontrolled confound in this round's own
+benchmark design, not a mysterious result -- flagged plainly rather than picking whichever
+number is more convenient. **Extrapolating a precise 2,000,000-step/n_envs=8 runtime from
+this data would overstate confidence the measurement doesn't support.** What IS solidly
+established, reproducibly, across every run this round:
+1. Thread oversubscription, uncapped, is a severe, real problem (~9x slower) -- must be
+   fixed in any implementation, not optional tuning.
+2. Fixed, `reset()` genuinely overlaps well across parallel workers (~1x a single reset's
+   cost regardless of N, confirmed twice).
+3. Fixed, steady-state throughput lands somewhere in a wide band from a mild slowdown
+   (0.81x) to a real win (~2.1x) across repeated short samples of the identical config --
+   the direction is not even consistently positive at this measurement's scale, though the
+   preponderance of evidence (3 of 4 readings once threads are capped: reset overlap
+   confirmed, both n_envs=4 readings, and one of two n_envs=2 readings all >=1x) leans
+   toward net-positive, not confidently so.
+
+**Bounding a plausible 2,000,000-step/n_envs=8 estimate, with the above caveat stated
+explicitly:** taking the more conservative (lower) of the two thread-capped n_envs=4
+readings as unavailable (only one n_envs=4 reading exists, 9.072 dec/sec, itself only one
+sample) and the range this round actually observed (0.81x-2.16x of the 4.194/sec
+baseline, i.e. roughly 3.4-9.1 dec/sec at n_envs=2-4) -- **a real n_envs=8 run could
+plausibly land anywhere from modestly worse than today's single-env ~5.5-day estimate to
+several days faster, and this round's measurements do not narrow that range enough to
+commit to a specific number.** Recommend NOT quoting a specific runtime prediction from
+this round's data as though it were reliable.
+
+#### Step 4 -- recommendation, and what a full implementation needs to verify
+
+**Recommendation: Option A+C (N independent CPU-inference workers, standard
+`SubprocVecEnv`), with `torch.set_num_threads(1)` (or equivalent) mandatory per worker --
+not optional -- and WITH a properly controlled follow-up benchmark (fixed seeds, longer
+duration, multiple repeated trials) before committing engineering time to a full
+implementation.** This is a design-and-measurement round; the measurement this round
+produced is good enough to rule out Option B and to identify a mandatory correctness/
+performance fix for A/C (thread capping), but not good enough to confidently quote a
+speedup number or a 2M-step runtime -- and the honest thing to do with that gap is say so,
+not launch a full implementation on the optimistic reading of noisy data.
+
+**Correctness risks a full implementation needs to test for (verifying vectorized ==
+single-env BEHAVIOR, not merely speed):**
+1. **Seed reproducibility, run-to-run** -- this round's own benchmarks never fixed a seed,
+   which is exactly why Step 3's numbers are noisy. A real implementation needs the same
+   paired-seed discipline `ValISEvalCallback` already uses (`EVAL_SEED_BASE` + per-episode
+   offset) extended to a per-worker seeding scheme (matching how `train_l3.py` already
+   seeds its own `SubprocVecEnv` workers via `set_random_seed()` distributing `seed+idx`),
+   confirmed to produce genuinely different draws per worker but reproducible draws for a
+   fixed seed set.
+2. **Per-worker LSTM/state isolation** -- naturally satisfied by A/C's design (each worker
+   is a fully separate OS process with its own complete `FrozenL3Wrapper` instance, no
+   cross-worker state-sharing channel exists at all, unlike Option B's central risk) --
+   still worth a positive regression test confirming N workers produce genuinely
+   *different* L3 action sequences (proving no accidental state aliasing), not just
+   asserting shapes are correct.
+3. **The cross-episode state leak already found and fixed this round** (`wrappers.py`'s
+   `reset()` clearing `l2_target_slice_ratio_override`/`l2_urgency`) needs a regression
+   test confirming it holds *inside* a `SubprocVecEnv` worker specifically, not just
+   assumed to carry over because the code is unchanged -- the fix is unconditional so it
+   should, but "should" isn't "verified."
+4. **Distributional equivalence, not byte-identical equivalence, is the right bar.** A
+   parallel run will not reproduce a single-env run's outcomes byte-for-byte (different
+   seed-to-worker assignment, different interleaving) -- the correct test is: for a FIXED,
+   matched seed set (`ValISEvalCallback`'s own paired seeds are a natural candidate), does
+   a single-env sequential pass through those seeds produce the SAME set of
+   (seed -> fill_ratio, IS_total_bps) outcomes as the same seeds distributed across N
+   parallel workers, regardless of which worker processed which seed or wall-clock order?
+   This directly tests "does parallelizing change WHAT gets computed," which speed
+   benchmarks alone cannot answer.
+5. **SAC's `train_freq`/`gradient_steps` semantics under a multi-env `VecEnv`** should
+   follow SB3's own standard, well-trodden multi-env off-policy semantics (not
+   L2-specific), but is worth a direct check that the effective transitions-per-gradient-
+   update ratio at n_envs>1 matches single-env's, not silently drifting.
+
+Benchmark scripts (`scripts/profile_l2_throughput.py`,
+`scripts/benchmark_parallel_l2.py`, `scripts/benchmark_parallel_l2_v2.py`) are throwaway
+measurement code, not part of the production training path -- committed for
+reproducibility/traceability, not wired into `train_l2.py`.
+
 ### What's currently blocking
 
-**Two things, not one.** (1) L3's matched A/B training runs, which will determine the final
-frozen L3 checkpoint -- when that result lands, the only things that need to change on L2's
-side are `--l3-checkpoint` and `--l3-vecnormalize`; everything else (observation space,
-action-space transform, hyperparameters, wrapper mechanics) is independent of which
-checkpoint wins. (2) **Throughput -- a real run at the current single-env design is
-impractical (~5.5 days), not just slow.** Parallelizing (the primary recommendation above)
-is not yet built. Recommend treating both as blocking a *real* launch: even once the A/B
-result lands, launching at ~5.5 days/run without parallelization would be a real cost, not
-a formality. Decision (a) (VecNormalize on L2's own obs/reward) remains recommended before
-a real run specifically, not blocking; decision (b) (eval callback) is now built (Task 2
-above) -- neither blocks further design or CPU-only wiring work, and (a) can still be built
-in parallel with waiting on the A/B result.
+**Checkpoint identity is RESOLVED** (2026-08-24): `docs/reports/l3_frozen_handoff.md`
+designates the frozen checkpoint (`models/l3_frozen_backup/l3_executioner_v1_frozen.zip` /
+`l3_vecnormalize_frozen.pkl`, sha256-verified) -- L3 research is closed, no further A/B
+result pending. `train_l2.py` needs no code changes to use it (per the handoff doc's own
+integration-compatibility section). Honest note carried over from that doc: this
+checkpoint ties TWAP, does not beat it -- worth keeping in view when weighing further
+throughput engineering investment against the underlying RL result's own strength, though
+that tradeoff call belongs to whoever owns the go/no-go, not this doc.
+
+**The sole remaining blocker is throughput.** A real run at the current single-env design
+is impractical (~5.5 days). This round's parallelization design/measurement work (above)
+identified a promising direction (N independent CPU-inference workers) and a mandatory fix
+(thread-count capping, confirmed catastrophic if skipped -- ~9x slower) but did **not**
+produce a measurement precise enough to commit to a specific speedup number or a full
+implementation -- see the "measured speedup did NOT match the design's prediction" finding
+above for why. Next step is a properly controlled follow-up benchmark (fixed seeds, longer
+duration, repeated trials), not full implementation yet. Decision (a) (VecNormalize on
+L2's own obs/reward) remains recommended before a real run, not blocking; decision (b)
+(eval callback) is built (Task 2 above).
 
 ---
 
