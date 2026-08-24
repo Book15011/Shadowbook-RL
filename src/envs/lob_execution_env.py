@@ -88,6 +88,7 @@ import pandas as pd
 
 from src.data.features import obi, zscore
 from src.envs.matching_engine import QueueState, queue_position_ratio, update_queue, walk_market_fill
+from src.data.l2_numeric_format import read_day as _read_numeric_day
 from src.envs.reward import RewardWeights, compute_implementation_shortfall, step_reward
 
 _log = logging.getLogger(__name__)
@@ -327,6 +328,7 @@ class LOBExecutionEnv(gym.Env):
         l1_confidence: float = 0.0,
         l2_urgency: float = 0.5,
         l2_target_slice_ratio_override: float | None = None,
+        use_numeric_format: bool = False,
     ) -> None:
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -364,7 +366,15 @@ class LOBExecutionEnv(gym.Env):
         # date_range pins the exact file set independent of whatever else has landed on
         # disk since; without it, behavior is unchanged (whatever is currently present),
         # which remains fine for exploratory/dev use.
-        all_files = sorted(self.data_dir.glob("*.parquet"))
+        # use_numeric_format (2026-08-24, storage-format round): opt-in, same pattern as
+        # zeta/eta_replace/subtract_twap_baseline -- defaults to the original JSON/parquet
+        # path, no behavior change for any existing caller. When True, data_dir is expected
+        # to hold the converted *.npzst files (src/data/l2_numeric_format.py), NOT the
+        # original *.parquet files -- the two formats are read from separate directory
+        # trees by design (the original archive is read-only, never converted in place).
+        self.use_numeric_format = use_numeric_format
+        glob_pattern = "*.npzst" if use_numeric_format else "*.parquet"
+        all_files = sorted(self.data_dir.glob(glob_pattern))
         if date_range is not None:
             start_date, end_date = date_range
             self._files = [p for p in all_files if start_date <= _extract_date(p) <= end_date]
@@ -376,10 +386,11 @@ class LOBExecutionEnv(gym.Env):
             )
         if not self._files:
             raise FileNotFoundError(
-                f"No parquet files found in {self.data_dir}"
+                f"No {glob_pattern} files found in {self.data_dir}"
                 + (f" for date_range={date_range}" if date_range is not None else "")
             )
         self._day_cache: dict[Path, pd.DataFrame] = {}
+        self._day_cache_numeric: dict[Path, dict[str, np.ndarray]] = {}
 
         self._funding_df = self._load_funding_history(Path(funding_rate_dir))
 
@@ -435,6 +446,50 @@ class LOBExecutionEnv(gym.Env):
                 self._day_cache.pop(next(iter(self._day_cache)))
             self._day_cache[path] = pd.read_parquet(path, columns=self._NEEDED_DAY_COLUMNS)
         return self._day_cache[path]
+
+    def _load_day_numeric(self, path: Path) -> dict[str, np.ndarray]:
+        """Numeric-format counterpart to _load_day -- same cache dict shape/eviction
+        policy (FIFO, _MAX_CACHED_DAYS), a separate dict since the cached value type
+        differs (dict[str, np.ndarray] vs pd.DataFrame). len(day_data["ts"]) is the
+        numeric-format equivalent of len(day_df) -- both give the day's real row
+        count, which reset() uses BEFORE the window is known (see reset()'s own
+        comment on this) -- verified equal to the original for every converted file
+        (see tests/test_reset_vectorization_equivalence.py and the conversion
+        script's own per-file row-count check)."""
+        if path not in self._day_cache_numeric:
+            if len(self._day_cache_numeric) >= self._MAX_CACHED_DAYS:
+                self._day_cache_numeric.pop(next(iter(self._day_cache_numeric)))
+            self._day_cache_numeric[path] = _read_numeric_day(path)
+        return self._day_cache_numeric[path]
+
+    def _build_ticks_numeric(self, day_data: dict[str, np.ndarray], start: int, end: int) -> list[TickView]:
+        """Numeric-format counterpart to _build_ticks -- constructs the same TickView
+        list from pre-parsed arrays instead of per-row JSON parsing. bid_prices[i]
+        etc. are row-slices (views, read-only since the source came from
+        np.frombuffer) of the already-loaded (n, 20) arrays -- values are identical
+        to what _parse_levels(row.bids) would produce from the original JSON at the
+        same row (verified directly, not assumed -- see the conversion round's
+        equivalence tests), just without paying the JSON-decode cost per tick."""
+        ts = day_data["ts"][start:end]
+        best_bid = day_data["best_bid"][start:end]
+        best_ask = day_data["best_ask"][start:end]
+        mid_price = day_data["mid_price"][start:end]
+        spread = day_data["spread"][start:end]
+        bid_prices = day_data["bid_prices"][start:end]
+        bid_sizes = day_data["bid_sizes"][start:end]
+        ask_prices = day_data["ask_prices"][start:end]
+        ask_sizes = day_data["ask_sizes"][start:end]
+        ticks = []
+        for i in range(end - start):
+            ticks.append(
+                TickView(
+                    ts=int(ts[i]), best_bid=float(best_bid[i]), best_ask=float(best_ask[i]),
+                    mid_price=float(mid_price[i]), spread=float(spread[i]),
+                    bid_prices=bid_prices[i], bid_sizes=bid_sizes[i],
+                    ask_prices=ask_prices[i], ask_sizes=ask_sizes[i],
+                )
+            )
+        return ticks
 
     def _load_funding_history(self, funding_dir: Path) -> pd.DataFrame:
         """Loaded once at construction (not per-episode -- it is a small,
@@ -593,8 +648,12 @@ class LOBExecutionEnv(gym.Env):
 
         file_idx = int(self.np_random.integers(0, len(self._files)))
         day_path = self._files[file_idx]
-        day_df = self._load_day(day_path)
-        n_rows = len(day_df)
+        if self.use_numeric_format:
+            day_data = self._load_day_numeric(day_path)
+            n_rows = len(day_data["ts"])
+        else:
+            day_df = self._load_day(day_path)
+            n_rows = len(day_df)
 
         # needed/start/end use self.lookback_ticks (NOT self._max_lookback_ticks) --
         # deliberately unchanged from Phase 2a so the RNG draw sequence, and therefore
@@ -616,7 +675,10 @@ class LOBExecutionEnv(gym.Env):
         # post-hoc slicing decision made AFTER start is drawn above -- it does not
         # perturb the RNG state, so it cannot change which window a given seed selects.
         buffer_ticks = min(self._max_lookback_ticks, start)
-        self._ticks = self._build_ticks(day_df, start - buffer_ticks, end)
+        if self.use_numeric_format:
+            self._ticks = self._build_ticks_numeric(day_data, start - buffer_ticks, end)
+        else:
+            self._ticks = self._build_ticks(day_df, start - buffer_ticks, end)
         self._episode_start = buffer_ticks  # index into self._ticks where the real episode begins
         self._tick_idx = self._episode_start
 
