@@ -206,49 +206,79 @@ def _rolling_return(mids: np.ndarray, window_ticks: int) -> np.ndarray:
 def _rolling_rms(values: np.ndarray, window_ticks: int) -> np.ndarray:
     """out[i] = sqrt(mean(values[max(0,i-window_ticks+1):i+1]**2)) -- a
     trailing-window RMS, window shrinking gracefully near the start of the
-    array rather than requiring the full window to be available."""
+    array rather than requiring the full window to be available.
+
+    Vectorized (2026-08-24, was a python range(n) loop) -- w=min(window_ticks,i+1)
+    is never 0 for i>=0/window_ticks>=1 (both guaranteed by every caller), so the
+    scalar version's `if w > 0 else 0.0` branch was dead code, not a case this
+    vectorization needs to reproduce. Same csum/subtract/divide/sqrt arithmetic
+    per element, just computed via fancy indexing instead of a python loop --
+    verified byte-identical against the original, not assumed (see
+    tests/test_reset_vectorization_equivalence.py)."""
     n = len(values)
     sq = values.astype(float) ** 2
     csum = np.concatenate([[0.0], np.cumsum(sq)])
-    out = np.empty(n, dtype=float)
-    for i in range(n):
-        w = min(window_ticks, i + 1)
-        out[i] = math.sqrt((csum[i + 1] - csum[i + 1 - w]) / w) if w > 0 else 0.0
-    return out
+    idx = np.arange(1, n + 1)
+    w = np.minimum(window_ticks, idx)
+    left = idx - w
+    return np.sqrt((csum[idx] - csum[left]) / w)
 
 
 def _rolling_sum(values: np.ndarray, window_ticks: int) -> np.ndarray:
     """out[i] = sum(values[max(0,i-window_ticks+1):i+1]) -- trailing-window
-    sum, same shrinking-near-the-start behavior as _rolling_rms."""
+    sum, same shrinking-near-the-start behavior as _rolling_rms.
+
+    Vectorized (2026-08-24, was a python range(n) loop) -- same csum/subtract
+    arithmetic per element via fancy indexing instead of a python loop,
+    verified byte-identical (see tests/test_reset_vectorization_equivalence.py)."""
     n = len(values)
     csum = np.concatenate([[0.0], np.cumsum(values.astype(float))])
-    out = np.empty(n, dtype=float)
-    for i in range(n):
-        w = min(window_ticks, i + 1)
-        out[i] = csum[i + 1] - csum[i + 1 - w]
-    return out
+    idx = np.arange(1, n + 1)
+    left = np.maximum(0, idx - window_ticks)
+    return csum[idx] - csum[left]
 
 
 def _rolling_mean_std(values: np.ndarray, window_ticks: int) -> tuple[np.ndarray, np.ndarray]:
     """out[i] = (trailing mean, trailing std) of values[max(0,i-window_ticks+1):i+1] --
     unlike _rolling_rms (which assumes a near-zero-mean series like returns), this is for
     a raw, non-centered series (e.g. a book level's resting size) where the mean itself
-    is a meaningful, non-zero quantity to track."""
+    is a meaningful, non-zero quantity to track.
+
+    Vectorized (2026-08-24, was a python range(n) loop) -- same csum/subtract/divide
+    arithmetic per element via fancy indexing instead of a python loop, verified
+    byte-identical (see tests/test_reset_vectorization_equivalence.py)."""
     n = len(values)
     v = values.astype(float)
     csum = np.concatenate([[0.0], np.cumsum(v)])
     csum_sq = np.concatenate([[0.0], np.cumsum(v * v)])
-    mean_out = np.empty(n, dtype=float)
-    std_out = np.empty(n, dtype=float)
-    for i in range(n):
-        w = min(window_ticks, i + 1)
-        s = csum[i + 1] - csum[i + 1 - w]
-        sq = csum_sq[i + 1] - csum_sq[i + 1 - w]
-        m = s / w
-        variance = max(0.0, sq / w - m * m)
-        mean_out[i] = m
-        std_out[i] = math.sqrt(variance)
-    return mean_out, std_out
+    idx = np.arange(1, n + 1)
+    w = np.minimum(window_ticks, idx)
+    left = idx - w
+    s = csum[idx] - csum[left]
+    sq = csum_sq[idx] - csum_sq[left]
+    mean_out = s / w
+    variance = np.maximum(0.0, sq / w - mean_out * mean_out)
+    return mean_out, np.sqrt(variance)
+
+
+def _vec_qty_at_price(price_matrix: np.ndarray, size_matrix: np.ndarray, query_prices: np.ndarray) -> np.ndarray:
+    """Vectorized, row-wise form of TickView.qty_at_price: for each row i, the size
+    at the first column (in that row's own original array order -- price_matrix's
+    column order must match the tick's own bid_prices/ask_prices order exactly,
+    zero-padded past each tick's real level count) within atol=TICK_SIZE/2
+    (rtol=0.0) of query_prices[i], or 0.0 if no column matches. Identical semantics
+    to the scalar `sizes[matches][0]` / `0.0` in TickView.qty_at_price -- argmax on
+    a boolean array returns the first True, matching `[0]` on the boolean-masked
+    array exactly. Zero-padding is safe here specifically because BTCUSDT trades at
+    ~$100k+, so a padded 0.0 price can never fall within the $0.05 atol of a real
+    query price and can never be mistaken for a real match -- verified byte-
+    identical against the scalar version, not assumed (see
+    tests/test_reset_vectorization_equivalence.py)."""
+    matches = np.isclose(price_matrix, query_prices[:, None], atol=TICK_SIZE / 2, rtol=0.0)
+    found = matches.any(axis=1)
+    first_idx = matches.argmax(axis=1)
+    rows = np.arange(len(query_prices))
+    return np.where(found, size_matrix[rows, first_idx], 0.0)
 
 
 class LOBExecutionEnv(gym.Env):
@@ -264,6 +294,22 @@ class LOBExecutionEnv(gym.Env):
     # why this does not change the RNG draw sequence / Phase 2a reproducibility.
     _MAX_LOOKBACK_S = 60.0
     _FUNDING_LOOKBACK_PERIODS = 90  # roughly 30 days at the standard 8h funding cadence
+    # Part A (docs/reports/phase3_l3_baseline_milestone.md): normalization window for
+    # _ticks_since_placement_norm(), the new placement-anchored staleness signal.
+    # Deliberately NOT horizon_ticks (3000) -- that timescale is already covered by the
+    # existing ticks_since_own_fill_norm (obs idx 14). This signal needs to flag a
+    # SPECIFIC resting placement going stale much sooner, so a CANCEL_AND_REPLACE has a
+    # chance to become reward-positive before the episode just runs out. 300 ticks (30s)
+    # is chosen from this project's own measured fast-fill timescale, not an arbitrary
+    # guess: successful fills clustered at a 125-195 tick median across every checkpoint
+    # tested in the coefficient sweep (docs/reports/phase3_l3_baseline_milestone.md) --
+    # 300 ticks gives roughly 1.5-2.4x that typical fast-fill time as headroom before
+    # flagging a placement as unusually stale, relative to how fast fills happen when
+    # the policy is working. Not derived from Section 2.4's expected_wait_time directly
+    # (q_ahead / avg_trade_rate) -- that needs a live per-price trade-rate estimate this
+    # environment does not currently compute (see the earlier rollout investigation,
+    # which flagged this same gap).
+    _PLACEMENT_STALENESS_WINDOW_TICKS = 300.0
 
     def __init__(
         self,
@@ -357,6 +403,7 @@ class LOBExecutionEnv(gym.Env):
         self._rv60s_std: float = 1.0
         self._funding_rate_z: float = 0.0
         self._last_fill_tick_idx: int | None = None
+        self._resting_placed_tick_idx: int | None = None
         self._episode_fills: list[dict] = []  # full history for the episode, for eval reporting
 
     # ~828MB/day measured in memory (pd.read_parquet + memory_usage(deep=True) on
@@ -447,14 +494,59 @@ class LOBExecutionEnv(gym.Env):
         self._rv60s_mean = float(np.mean(self._rv60s_series)) if n else 0.0
         self._rv60s_std = float(np.std(self._rv60s_series)) if n > 1 else 1.0
 
+        # Single pass over self._ticks builds every per-tick array/matrix the rest of
+        # this method needs: capped-at-10 size matrices (book_depth_norm, idx 19-38,
+        # unchanged from before) and, new (2026-08-24), FULL (uncapped) price/size
+        # matrices + best_bid/best_ask arrays for the vectorized touch-depletion
+        # computation below, which must search each tick's ENTIRE book (not just the
+        # top 10 levels) to match TickView.qty_at_price's own unpadded search exactly.
+        # Moved earlier in this method (was after the depletion loop) so the
+        # capped-at-10 matrices can be built in the same pass -- book_depth_mean/std
+        # below has no data dependency on signed/absvol, so this reordering does not
+        # change any computed value, only which order two independent blocks run in.
+        max_bid_levels = max((len(t.bid_prices) for t in self._ticks), default=0)
+        max_ask_levels = max((len(t.ask_prices) for t in self._ticks), default=0)
+        bid_size_matrix = np.zeros((n, 10), dtype=float)
+        ask_size_matrix = np.zeros((n, 10), dtype=float)
+        bid_price_full = np.zeros((n, max_bid_levels), dtype=float)
+        bid_size_full = np.zeros((n, max_bid_levels), dtype=float)
+        ask_price_full = np.zeros((n, max_ask_levels), dtype=float)
+        ask_size_full = np.zeros((n, max_ask_levels), dtype=float)
+        best_bid_arr = np.empty(n, dtype=float)
+        best_ask_arr = np.empty(n, dtype=float)
+        for i, t in enumerate(self._ticks):
+            k = min(10, len(t.bid_sizes))
+            bid_size_matrix[i, :k] = t.bid_sizes[:k]
+            k = min(10, len(t.ask_sizes))
+            ask_size_matrix[i, :k] = t.ask_sizes[:k]
+            k = len(t.bid_prices)
+            bid_price_full[i, :k] = t.bid_prices
+            bid_size_full[i, :k] = t.bid_sizes
+            k = len(t.ask_prices)
+            ask_price_full[i, :k] = t.ask_prices
+            ask_size_full[i, :k] = t.ask_sizes
+            best_bid_arr[i] = t.best_bid
+            best_ask_arr[i] = t.best_ask
+
+        # Touch-depletion (idx 12/40 flow series): vectorized (2026-08-24, was a
+        # python range(1, n) loop calling TickView.qty_at_price/np.isclose once per
+        # tick -- cProfile showed this loop was ~77% of this method's own cost at
+        # n~3600 ticks/reset). Same qty_at_price semantics via _vec_qty_at_price
+        # above, same max(0, ...)/subtract/add arithmetic, verified byte-identical
+        # against the original scalar loop (see tests/test_reset_vectorization_equivalence.py).
         signed = np.zeros(n, dtype=float)
         absvol = np.zeros(n, dtype=float)
-        for i in range(1, n):
-            prev, curr = self._ticks[i - 1], self._ticks[i]
-            bid_dep = max(0.0, prev.qty_at_price(prev.best_bid, "bid") - curr.qty_at_price(prev.best_bid, "bid"))
-            ask_dep = max(0.0, prev.qty_at_price(prev.best_ask, "ask") - curr.qty_at_price(prev.best_ask, "ask"))
-            signed[i] = ask_dep - bid_dep  # ask depletion -> taker BUY pressure; bid depletion -> taker SELL
-            absvol[i] = ask_dep + bid_dep
+        if n > 1:
+            prev_best_bid = best_bid_arr[:-1]
+            prev_best_ask = best_ask_arr[:-1]
+            prev_bid_at_prev = _vec_qty_at_price(bid_price_full[:-1], bid_size_full[:-1], prev_best_bid)
+            curr_bid_at_prev = _vec_qty_at_price(bid_price_full[1:], bid_size_full[1:], prev_best_bid)
+            prev_ask_at_prev = _vec_qty_at_price(ask_price_full[:-1], ask_size_full[:-1], prev_best_ask)
+            curr_ask_at_prev = _vec_qty_at_price(ask_price_full[1:], ask_size_full[1:], prev_best_ask)
+            bid_dep = np.maximum(0.0, prev_bid_at_prev - curr_bid_at_prev)
+            ask_dep = np.maximum(0.0, prev_ask_at_prev - curr_ask_at_prev)
+            signed[1:] = ask_dep - bid_dep  # ask depletion -> taker BUY pressure; bid depletion -> taker SELL
+            absvol[1:] = ask_dep + bid_dep
 
         signed_5s = _rolling_sum(signed, ticks_5s)
         abs_5s = _rolling_sum(absvol, ticks_5s)
@@ -470,15 +562,8 @@ class LOBExecutionEnv(gym.Env):
         # Window reuses ticks_60s (no explicit window length is given in the spec for this
         # feature; 60s matches the already-established realized_vol_60s_z/
         # taker_buy_sell_ratio_1m window, a consistent, documented choice rather than an
-        # arbitrary new one).
-        bid_size_matrix = np.zeros((n, 10), dtype=float)
-        ask_size_matrix = np.zeros((n, 10), dtype=float)
-        for i, t in enumerate(self._ticks):
-            k = min(10, len(t.bid_sizes))
-            bid_size_matrix[i, :k] = t.bid_sizes[:k]
-            k = min(10, len(t.ask_sizes))
-            ask_size_matrix[i, :k] = t.ask_sizes[:k]
-
+        # arbitrary new one). bid_size_matrix/ask_size_matrix built above, in the
+        # single combined pass over self._ticks.
         self._book_depth_mean = np.zeros((n, 20), dtype=float)
         self._book_depth_std = np.zeros((n, 20), dtype=float)
         for level in range(10):
@@ -573,6 +658,7 @@ class LOBExecutionEnv(gym.Env):
         self._resting_side = None
         self._episode_fills = []
         self._last_fill_tick_idx = None
+        self._resting_placed_tick_idx = None
         self._terminated_early = False
 
         # EXPERIMENTAL 5 (reward.py module docstring): computed once here,
@@ -764,6 +850,24 @@ class LOBExecutionEnv(gym.Env):
             return 1.0
         return float(np.clip((self._tick_idx - self._last_fill_tick_idx) / self.horizon_ticks, 0.0, 1.0))
 
+    def _ticks_since_placement_norm(self) -> float:
+        """Part A (docs/reports/phase3_l3_baseline_milestone.md): reward-internal
+        only, NOT part of the 42-dim observation vector -- feeds only the new
+        eta_replace reward term, unlike _ticks_since_own_fill_norm() which feeds
+        both obs idx 14 and r_stale. Normalized against
+        _PLACEMENT_STALENESS_WINDOW_TICKS (see its own docstring for why), not
+        horizon_ticks. self._resting_placed_tick_idx is stamped on every new
+        placement in _place_limit(), including the fresh order from a
+        CANCEL_AND_REPLACE -- unlike self._last_fill_tick_idx, it is never
+        explicitly cleared when self._resting resolves, matching that field's own
+        init-only pattern exactly; this is safe because the reward term this feeds
+        is itself gated on `resting`, so a stale leftover value between one
+        order resolving and the next placement can never actually be read."""
+        if self._resting_placed_tick_idx is None:
+            return 1.0
+        ticks_since_placement = self._tick_idx - self._resting_placed_tick_idx
+        return float(np.clip(ticks_since_placement / self._PLACEMENT_STALENESS_WINDOW_TICKS, 0.0, 1.0))
+
     def _compute_l2_target_slice_ratio(self) -> float:
         """Default: what a fixed-TWAP schedule would have executed by now, as a
         fraction of the full parent order (linear in elapsed time -- only the
@@ -933,6 +1037,7 @@ class LOBExecutionEnv(gym.Env):
         self._resting = QueueState(q_ahead=q_ahead, own_qty_remaining=size)
         self._resting_price = price
         self._resting_side = side
+        self._resting_placed_tick_idx = self._tick_idx
         return []
 
     def step(self, action):
@@ -1020,6 +1125,7 @@ class LOBExecutionEnv(gym.Env):
             queue_ahead_at_cancel=queue_ahead_at_cancel, queue_at_level=queue_at_level,
             resting=self._resting is not None,
             ticks_since_own_fill_norm=self._ticks_since_own_fill_norm(),
+            ticks_since_placement_norm=self._ticks_since_placement_norm(),
         )
         self._episode_fills.extend(step_fills)
 

@@ -283,6 +283,65 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-24 12:40 HKT
+State: env.reset() optimization round -- Task 0 first (docs/reports/v1_master_state.md,
+committed on its own, a full cross-track "as of now" snapshot frozen before any code
+change). Then profiled reset() itself (Task 1): at real 405-day training scale, the
+day-cache hit rate is only 2.4% (cache holds 5/405 days) -- essentially every reset()
+during real training pays the full ~1.4s I/O miss cost; the prior benchmark's own 10-day
+pool sees 48.8% hits, an artifact of that pool's narrowness, not representative. cProfile
+pinpointed ~77% of _precompute_feature_series's own cost (34.8% of total reset()) as an
+unvectorized python loop calling TickView.qty_at_price/np.isclose once per tick (~14,400
+calls/reset).
+Vectorized it (Task 2/4): _rolling_sum/_rolling_rms/_rolling_mean_std and the
+touch-depletion loop now use numpy fancy-indexing instead of python range(n) loops -- same
+arithmetic, no RNG/windowing touched. _precompute_feature_series dropped from ~498ms to
+~19ms (~25x). Explicitly did NOT implement two candidates the task asked about: per-day
+feature caching and larger _MAX_CACHED_DAYS both fail at real 405-day scale (a whole-day
+precompute costs ~240x more per call than per-episode, and cache hit rate scales roughly
+with cache_size/pool_size -- doubling the cache only lifts hit rate from ~2.4% to ~2.5% on
+a 405-file pool) -- stated as real negative findings, not hedged.
+Verified seed-equivalence (Task 3), not assumed: env.reset()/env.step() traces (obs at
+every tick, rewards, terminal IS) for 10 fixed real seeds, run before and after the edit,
+compared via exact np.array_equal (not np.allclose) -- byte-identical across all seeds and
+both the initial seeded reset AND a subsequent unseeded reset (the day-cache-hit path).
+Plus 17 new permanent hand-computed-fixture regression tests
+(tests/test_reset_vectorization_equivalence.py) and the full existing suite (158/162
+passing, same 4 pre-existing unrelated failures as always -- test_bulk_backfill.py
+network-mock issues, test_l2_capture.py resync logic, confirmed unrelated).
+Re-ran the controlled n_envs benchmark unmodified (Task 4): real, reproducible gain at
+every n_envs value (+10.1% at n_envs=1 up to +25.0% at n_envs=8, CoV stayed 0.1-2.0%, not
+noise). n_envs=8: 9.729 -> 12.163 dec/sec. Re-extrapolated 2,000,000-step wall-clock:
+2.38 -> 1.90 days at the best configuration. Go/no-go moves from NO to MARGINAL against
+the same stated guidance (under ~1 day workable, 1-2 days marginal, beyond that rethink) --
+a real improvement, not a clean yes. The prior round's two representativeness caveats
+still apply and now have a concrete number behind one of them (this benchmark's 10-day
+pool's 48.8% cache hit rate vs. the real pool's 2.4%) -- both still lean toward the true
+number being worse than 1.90 days, not better. Full detail:
+docs/reports/phase4_l2_reconciliation_and_plan.md's new "env.reset() optimization round"
+section.
+Files: src/envs/lob_execution_env.py (edited, L3's file -- in-scope this round per
+instruction, L3's research is closed; reward.py/train_l3.py/L1's files not touched --
+short flag note left in L3's own section below for that track's awareness).
+scripts/profile_reset.py, scripts/profile_reset_cprofile.py,
+scripts/capture_reset_snapshot.py, scripts/compare_reset_snapshots.py (new, throwaway
+measurement/verification code). tests/test_reset_vectorization_equivalence.py (new,
+permanent). docs/reports/v1_master_state.md (new). Committed this round: Task 0
+separately, then Tasks 1-4 (the env.py edit, new scripts/tests, doc updates) as one
+follow-up commit.
+Files owned/in-progress: none uncommitted as of this update.
+Blocking/open questions: throughput is no longer a clean NO, but not a clean YES either --
+1.90 days at n_envs=8 is inside the marginal band, with caveats leaning pessimistic. Open
+for whoever owns the go/no-go: proceed at n_envs=8 accepting marginal economics, pursue
+the flagged (not implemented) lazy-tick-construction lever for a further gain, a smaller
+training budget, or reconsider given the checkpoint's own honest tie-not-beat result
+against TWAP.
+Next planned step: awaiting direction. No production parallelization code, no real
+training launch, until one of the above is decided.
+
+PRIOR ENTRY BELOW, for context on the controlled parallelization benchmark this round
+built on:
+
 Last updated: 2026-08-24 09:07 HKT
 State: Controlled follow-up benchmark to last round's noisy parallelization result
 (0.14x/0.11x uncapped, then two disagreeing thread-capped readings of the SAME n_envs=2
@@ -354,6 +413,20 @@ Next planned step: awaiting direction. No production parallelization code, no re
 training launch, until one of the above is decided.
 
 ## L3 / Env-Physics
+
+**[Flag from the L2/shared-infra session, 2026-08-24 12:40 HKT, not an L3 entry --
+L3's own status below is unmodified.]** This round's env.reset() optimization work
+(see the L2 section above) edited `src/envs/lob_execution_env.py` -- explicitly
+in-scope per this round's own instruction, since L3's research is closed. Vectorized
+three rolling-window helpers and the touch-depletion loop inside
+`_precompute_feature_series`; `reward.py`/`train_l3.py` were NOT touched. Verified
+byte-identical behavior (10 fixed real seeds, before/after, exact `np.array_equal`)
+plus 17 new permanent regression tests -- full detail in
+`docs/reports/phase4_l2_reconciliation_and_plan.md`'s new "env.reset() optimization
+round" section. Flagging here since this file already carried a separate,
+pre-existing uncommitted change from L3's own prior session (the documented
+functionally-inert staleness-round addition, eta_replace=0.0) -- that pre-existing
+change is untouched by this edit and remains exactly as L3's own session left it.
 Last updated: 2026-08-23 18:15 HKT
 State: L3 RESEARCH PHASE CLOSED. Frozen and handed off for L1->L2->L3
 integration -- full detail in docs/reports/l3_frozen_handoff.md (new,

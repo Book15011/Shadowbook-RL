@@ -712,6 +712,220 @@ benchmark measured throughput, not correctness, so none of them were resolved by
 Benchmark code (`scripts/benchmark_controlled.py`) committed as throwaway measurement
 code, not wired into `train_l2.py` -- consistent with the prior round's scripts.
 
+### env.reset() optimization round (2026-08-24) -- profiled, vectorized, verified, measured
+
+Frozen "before" state recorded in `docs/reports/v1_master_state.md`, committed on its own
+before any code change, per instruction. `lob_execution_env.py` is L3's file; L3's research
+is closed, so editing it was in-scope this round -- `reward.py`, `train_l3.py`, and L1's
+files were not touched.
+
+#### Task 1 -- profiling reset(), not guessing
+
+`scripts/profile_reset.py` monkeypatch-instruments `_load_day` (tagged hit/miss),
+`_build_ticks`, and `_precompute_feature_series` directly on the real env, real data, two
+scenarios: (A) this project's own controlled 10-day benchmark pool (`scripts/benchmark_controlled.py`'s
+pool, cache holds 5/10 days) and (B) the REAL full 405-day train split (cache holds 5/405).
+41 resets each (1 seeded + 40 unseeded, matching how SB3 actually drives an env after its
+one seeded initial reset -- the env's own internal RNG advances and picks new files on every
+subsequent call, not just the first).
+
+| | Scenario A (10-day pool) | Scenario B (real 405-day split) |
+|---|---|---|
+| `_load_day` hit rate | 48.8% (20/41) | 2.4% (1/41) |
+| `_load_day` miss cost | 1565ms | 1400ms |
+| `_load_day` blended mean | 802ms | 1365ms |
+| `_build_ticks` | 147ms (10.3%) | 170ms (8.3%) |
+| `_precompute_feature_series` | 498ms (34.8%) | 499ms (24.4%) |
+| other | ~0% (noise-level) | ~0% (noise-level) |
+| **TOTAL reset()** | **1429ms** | **2045ms** |
+
+**Cross-check against the prior round's coarser number**: the earlier profiling round
+(this doc's "Throughput measurement" section above) measured reset() at 2083.8ms/call
+averaged over 7 calls from a real smoke test -- extremely close to this round's Scenario B
+(2044.75ms), consistent with that smoke test having drawn from a wide/unrestricted file
+pool (near-always-miss), not the narrow 10-day pool. Same finding, now decomposed and on a
+larger, controlled sample (n=40 vs n=7).
+
+**cProfile line-level breakdown** (`scripts/profile_reset_cprofile.py`, 15 resets,
+Scenario A) pinpointed exactly where `_precompute_feature_series`'s 34.8% share actually
+goes: **~77% of it is the touch-depletion loop's `TickView.qty_at_price`/`np.isclose`
+calls** (one Python-level call per tick, ~14,400 calls at n~3600 ticks/reset, each paying
+real per-call numpy overhead -- `seterr`/`geterr` context management, `asarray`, the
+reduction machinery inside `np.isclose` itself -- not just the comparison itself). A
+further **~18% is `_rolling_mean_std`'s own Python `for i in range(n)` loop** (called 20
+times per reset, once per book-depth level). `_load_day`'s cost, by contrast, is ~97% pure
+I/O (`pyarrow`'s `table_to_dataframe`/`read`) -- confirmed via cProfile, not assumed;
+nothing here is a Python-inefficiency artifact, it is the real cost of reading a real
+~828MB/day parquet file.
+
+**Day-cache hit/miss rate under REALISTIC conditions is the headline finding of this
+task**: at the real 405-day training scale, the cache (`_MAX_CACHED_DAYS=5`) is hit only
+2.4% of the time -- essentially every reset() during real training pays the full I/O
+miss cost. The 48.8% hit rate in Scenario A is an artifact of that benchmark's
+deliberately narrow 10-day pool (already flagged as a representativeness caveat in the
+prior round) -- it does not reflect what a real run experiences, and should not be used to
+size cache-related decisions. One additional, previously-undocumented detail found while
+reading `_load_day`: eviction is **FIFO, not LRU** (`self._day_cache.pop(next(iter(self._day_cache)))`
+evicts whichever entry was inserted earliest, regardless of how recently it was hit) --
+noted for completeness, not something worth fixing given the finding below.
+
+#### Task 2 -- optimizations, ranked by payoff vs. risk
+
+1. **RECOMMENDED, implemented this round: vectorize `_precompute_feature_series`'s
+   Python-loop sub-computations** (the touch-depletion loop and the three rolling-window
+   helpers `_rolling_sum`/`_rolling_rms`/`_rolling_mean_std`). **Payoff, measured not
+   estimated: `_precompute_feature_series` dropped from ~498ms to ~19-20ms (~25x), cutting
+   TOTAL reset() by 34.6% (Scenario A) / 23.6% (Scenario B, the realistic one).** Risk:
+   LOW -- pure re-expression of identical arithmetic via numpy fancy-indexing instead of a
+   Python loop (same subtract/divide/sqrt operations per element, same array-order
+   first-match semantics for the price search), touches no RNG draw and no windowing
+   logic. **Does NOT change env behavior** -- verified, not assumed: byte-identical
+   (`np.array_equal`) observations, step rewards, and terminal IS across 10 fixed real
+   seeds, both the initial seeded reset and a subsequent unseeded reset (the day-cache-hit
+   path), plus the full existing test suite (158/162 passing, same 4 pre-existing
+   unrelated failures as always) and 17 new permanent hand-computed-fixture regression
+   tests. See Task 3 below and `tests/test_reset_vectorization_equivalence.py`.
+
+2. **NOT RECOMMENDED: precomputing feature series once per day (cached alongside
+   `day_df`), sliced per episode.** This was explicitly suggested as a candidate and is
+   REJECTED for the real 405-day run, for a reason the profile makes concrete: the
+   per-episode window (~3,600 ticks) is a small fraction of a real day (~864,000 rows,
+   ~240x more), so a whole-day precompute would cost roughly 240x more per call than the
+   current per-episode cost -- and at the measured 2.4% real cache hit rate, a given day is
+   evicted (FIFO) after only a handful of reuses before that upfront cost amortizes. Net
+   effect at real scale: **worse, not better** -- this is a real, load-bearing negative
+   finding, not a hedge. It would be a genuine win only in a narrow, repeated date-range
+   regime (this benchmark's own 10-day pool) -- not representative of real training, per
+   the prior round's own caveat about that pool.
+
+3. **NOT RECOMMENDED: raising `_MAX_CACHED_DAYS`.** For the real 405-day pool, expected
+   hit rate scales roughly with cache_size/pool_size (5/405 ≈ 1.2%, close to the measured
+   2.4%) -- even doubling the cache to 10 days only lifts expected hit rate to ~2.5%,
+   essentially unmeasurable, while directly costing more RAM per worker (~828MB/cached
+   day) at exactly the scale (`n_envs=8`) where RAM headroom is the thing under active
+   measurement this project. Not a viable lever at real-training scale; it only "works" on
+   an artificially narrow pool, same caveat as item 2.
+
+4. **NOT IMPLEMENTED THIS ROUND, flagged as a larger, higher-risk future lever: lazy
+   `TickView`/feature construction.** Episodes terminate early on average (~18 of a
+   possible ~60 decisions, per the prior round's own smoke-test measurement) -- so a
+   meaningful fraction of each episode's built ticks (up to ~70%) are likely never visited
+   before the episode ends. Building/computing features lazily as `tick_idx` advances,
+   rather than eagerly over the whole horizon at `reset()`, could plausibly recover a
+   comparable-order saving to item 1 -- but requires restructuring the rolling-window
+   computations to work incrementally (not just re-expressing the same math vectorized),
+   materially larger surface area for a subtle bug, and interacts with the buffer/lookback
+   window in a way that needs its own careful design. Not attempted this round given the
+   "safe changes only" bar; a real candidate for a future round if throughput after this
+   round's changes is still not enough on its own.
+
+5. **NOT A LEVER: `_load_day`'s I/O cost itself.** ~97% of a cache-miss `_load_day` call
+   (cProfile-confirmed) is `pyarrow` parquet decode -- reading real, necessarily-large
+   market data. No Python-level inefficiency was found here to fix. A faster storage
+   format or column-pruned read is a data-pipeline change with broad blast radius (shared
+   by L1/L3), out of scope and risk for this round -- flagged, not pursued.
+
+6. **Smaller, not pursued this round: `_build_ticks`'s JSON parsing (`_parse_levels`).**
+   ~9% of total reset() (cProfile), essentially all `json.loads` + array conversion, one
+   call per tick per side. A faster JSON library (e.g. `orjson`) could plausibly cut this
+   further as a drop-in, same-output change -- smaller payoff than item 1 and adds a new
+   dependency, so not pursued this round; noted as the next-smallest lever if more is
+   needed later.
+
+#### Task 3 -- seed-equivalence, verified not assumed
+
+Read `reset()`'s own comments on RNG draw order (the lookback-buffer-enlargement note) and
+the `ref_depth` scoping incident before making any change -- neither is touched by this
+round's edit: every change operates purely on `self._ticks`/derived arrays AFTER the RNG
+has already selected the file/window/side/size, never on the draw sequence itself.
+
+**Verification, in two layers:**
+1. **Real data, real seeds, full env**: `scripts/capture_reset_snapshot.py` captured
+   `env.reset()`/`env.step()` traces (observations at every tick, rewards, terminal IS
+   total_bps + fill_ratio) for 10 fixed seeds, run against the code BEFORE this round's
+   edit and again AFTER, each seed covering both the initial seeded reset and one
+   subsequent unseeded reset (exercising the day-cache-hit path specifically). Compared
+   via exact `np.array_equal` (not `np.allclose`) -- **PASS, byte-identical across all 10
+   seeds and every field, both reset paths.**
+2. **Permanent regression coverage**: `tests/test_reset_vectorization_equivalence.py` (17
+   new tests, committed) -- each vectorized helper checked against its own original
+   Python-loop implementation (reproduced verbatim in the test, since the original no
+   longer exists in source once replaced) across ordinary/edge-case window sizes
+   (window=1, window>n, n=1, n=0), `_vec_qty_at_price` checked against
+   `TickView.qty_at_price` (unchanged) including a no-match case and a duplicate-tolerance
+   first-match-wins case, and one full `env.reset()` integration test on a tiny synthetic
+   day with hand-computed expected touch-depletion values traced through to `obs[12]`.
+   Full suite: 158/162 passing (same 4 pre-existing, unrelated failures documented
+   elsewhere in this project -- `test_bulk_backfill.py` network-mock issues,
+   `test_l2_capture.py` resync logic -- confirmed not touched by this change).
+
+No divergence found at any point -- nothing to revert.
+
+#### Task 4 -- re-measured after the fix: real gain, verdict moves from NO to MARGINAL
+
+`scripts/benchmark_controlled.py` re-run unmodified (same seed=42, same fixed 10-day pool,
+same 480 timesteps/trial, same 3 trials/config, same thread-capping) against the
+now-vectorized env code -- only the env changed, nothing about the benchmark's own
+methodology did, so this is a clean before/after comparison.
+
+| n_envs | mean dec/sec (was) | mean dec/sec (now) | change | CoV% | speedup | efficiency | RSS | VRAM |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 5.651 | **6.224** | +10.1% | 0.1% | 1.00x | 100.0% | 5,131MB | 881MB |
+| 2 | 6.865 | **8.332** | +21.4% | 1.0% | 1.34x | 66.9% | 10,056MB | 1,276MB |
+| 4 | 8.852 | **11.055** | +24.9% | 2.0% | 1.78x | 44.4% | 15,870MB | 2,056MB |
+| 8 | 9.729 | **12.163** | +25.0% | 1.2% | 1.95x | 24.4% | 26,677MB | 3,600MB |
+
+**Real, reproducible gain at every n_envs value** (CoV stayed low, 0.1-2.0%, so this isn't
+noise) -- and the gain is LARGER at higher n_envs (+25.0% at n_envs=8 vs +10.1% at
+n_envs=1), consistent with reset()'s I/O-bound remainder now being a larger relative share
+of a smaller total, and the removed compute cost mattering more when it was competing for
+the same CPU cores parallel workers already contend for. RSS/VRAM essentially unchanged
+from before (26.7GB/3.6GB at n_envs=8 vs 26.2GB/3.6GB previously) -- expected, this change
+doesn't touch memory footprint, only compute inside an already-allocated reset() call. The
+n_envs=4 "knee" observation still holds: 11.055/12.163 = 90.9% of n_envs=8's throughput at
+half the resources, materially unchanged from before (91%).
+
+**Re-extrapolated 2,000,000-step wall-clock, from these new controlled rates directly:**
+
+| n_envs | wall-clock (was) | wall-clock (now) |
+|---|---|---|
+| 1 | 4.10 days | 3.72 days |
+| 2 | 3.37 days | 2.78 days |
+| 4 | 2.62 days | 2.09 days |
+| 8 | **2.38 days** | **1.90 days** |
+
+**Go/no-go, re-assessed against the same stated guidance (under ~1 day workable, 1-2 days
+marginal, beyond that rethink): the verdict moves from NO to MARGINAL.** At the best
+configuration (n_envs=8), 1.90 days now falls inside the marginal band, not outside it --
+a real, measured improvement from last round's clear no. This is not a small or
+questionable gain (25% throughput at the configuration that matters, verified reproducible
+across 3 trials, low CoV) and it is being reported as exactly what it is: enough to move
+the number from clearly impractical into marginal territory, not enough to clear the
+"under ~1 day, clearly workable" bar on its own.
+
+**The same two caveats from last round's extrapolation still apply, unchanged by this
+round's work, and still lean toward the true number being worse than 1.90 days, not
+better:** this benchmark's narrow, repeated 10-day date_range likely still benefits from
+warm OS page cache in a way a real 405-day-diverse run would not (Task 1's own hit-rate
+finding makes this concrete now: the benchmark's pool sees a 48.8% day-cache hit rate,
+the real 405-day pool sees 2.4% -- a real run pays the ~1.4s I/O miss cost on all but
+~1 in 40 resets, this benchmark pays it on barely half); and policy-behavior drift as L2
+actually learns (untested by a 480-step benchmark) could still change average episode
+length, and therefore reset() frequency, in either direction over a real run. **Stated
+plainly: this round's optimization is real and worth having, but it moves the honest
+verdict from "no" to "marginal, and more likely to land on the pessimistic side of
+marginal than the optimistic side," not to a clean "yes."** That is a genuinely different,
+better position than last round's -- not a reason to stop being careful about the
+remaining uncertainty.
+
+**Correctness risks -- the five from the design round, plus the two the prior benchmark
+round added, are UNCHANGED by this round's work** (a throughput/optimization round, not a
+parallelization-correctness round -- none of those seven items were re-examined here).
+One item is arguably strengthened, not resolved: seed reproducibility now has additional
+evidence behind it, since this round's own equivalence check (10 fixed seeds, byte-exact
+before/after) is itself a seed-reproducibility proof, on top of the parallelization
+benchmark's low CoV from last round.
+
 ### What's currently blocking
 
 **Checkpoint identity is RESOLVED** (2026-08-24): `docs/reports/l3_frozen_handoff.md`
@@ -720,20 +934,25 @@ designates the frozen checkpoint (`models/l3_frozen_backup/l3_executioner_v1_fro
 result pending. `train_l2.py` needs no code changes to use it. Honest note carried over
 from that doc: this checkpoint ties TWAP, does not beat it.
 
-**Throughput is now answered, not just measured -- and the answer is no, not yet.** The
-controlled benchmark above (fixed seed + fixed date_range, CoV 0.1-1.3%, trustworthy)
-found a real, reproducible 1.72x speedup at n_envs=8 (CPU L3 inference, thread-capped) --
-but extrapolated to a full 2,000,000-step run, that is **2.38 days**, outside the stated
-workable/marginal range even at the best-measured configuration, and the extrapolation's
-own caveats (narrow benchmark date_range, untested mid-training policy-behavior drift)
-lean toward this being an optimistic reading, not pessimistic. **Parallelizing envs alone,
-at the scale tested, does not make a full 2,000,000-step L2 run practical.** This is a
-real, considered result, not a gap waiting to be closed by more engineering effort applied
-to the same approach -- next steps (a smaller training budget, a fundamentally different
-approach to the reset()-dominated cost, or accepting the current single-env economics for
-a much shorter run) are a design decision for whoever owns the go/no-go, not resolved
-here. Decision (a) (VecNormalize on L2's own obs/reward) remains recommended before any
-real run, not blocking; decision (b) (eval callback) is built (Task 2 above).
+**Throughput verdict moved from NO to MARGINAL this round (2026-08-24), via a real,
+measured env.reset() optimization, not further parallelization.** The prior round's
+controlled benchmark found parallelizing envs alone insufficient (2.38 days at n_envs=8,
+outside the workable/marginal range). This round profiled reset() itself (Task 1 above),
+found ~77% of its own compute-bound sub-cost was an unvectorized Python loop, vectorized
+it with no behavior change (verified byte-identical, Task 3 above), and re-measured: a
+reproducible 25% throughput gain at n_envs=8, moving the 2,000,000-step extrapolation to
+**1.90 days -- inside the stated marginal band, not outside it.** This is not a clean
+"yes" (still not under the ~1 day workable bar) and the same representativeness caveats
+from before still apply, now with a concrete number behind them (this benchmark's 10-day
+pool sees a 48.8% day-cache hit rate; the real 405-day pool sees 2.4% -- Task 1's own
+finding) -- both caveats still lean toward the true number being worse than 1.90 days,
+not better. **Stated plainly: genuinely closer to practical than last round, not yet
+clearly practical.** Next steps (proceed at n_envs=8 accepting marginal economics, pursue
+the flagged-but-not-implemented lazy-tick-construction lever for a further gain, a smaller
+training budget, or accepting the current economics for a shorter run) remain a design
+decision for whoever owns the go/no-go, not resolved here. Decision (a) (VecNormalize on
+L2's own obs/reward) remains recommended before any real run, not blocking; decision (b)
+(eval callback) is built (Task 2, prior round).
 
 ---
 
