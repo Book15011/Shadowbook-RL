@@ -283,69 +283,75 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
-Last updated: 2026-08-24 08:29 HKT
-State: Checkpoint identity RESOLVED -- docs/reports/l3_frozen_handoff.md designates the
-frozen checkpoint (models/l3_frozen_backup/l3_executioner_v1_frozen.zip, sha256-verified),
-L3 research closed, no code changes needed on L2's side to use it. This round was design +
-measurement only for the throughput problem (no full implementation), per instruction.
-STEP 1 (profiling, real checkpoint + real data, no reasoning-only estimate): 120 real L2
-decisions, single env, GPU L3 inference -- env.reset() 51.0% (7 calls, ~2084ms each),
-L3.predict() 35.5% (5735 calls, 1.77ms each), env.step() 6.1%, SAC.train() 5.9%. Confirms
-I/O (reset), not gradient updates, is the bottleneck -- refines it: predict() is a real
-secondary cost too. Also measured, not assumed: L3 model's real per-process VRAM footprint
-via nvidia-smi is 454MB (not the ~3MB torch's own allocator reports -- CUDA context
-overhead dominates for a model this small); CPU predict() is FASTER than GPU for this
-specific tiny model (0.89-0.94ms vs 1.72ms/call, consistent with and without thread
-capping) -- the model is small enough that GPU kernel-launch/sync overhead exceeds actual
-compute.
-STEP 2: Option B (batched central inference) ruled out -- capped at addressing only the
-35.5% predict() share (the larger 51% reset() share is untouched by construction) for the
-highest implementation risk of the three (per-worker LSTM state management across a
-batched call -- the harder version of a bug class this track's own tests already caught
-twice this month in the simple single-env case). Recommended: Option A+C combined -- N
-independent workers via standard SubprocVecEnv, each with its own L3 model copy on CPU
-(not GPU) -- same simplicity as A, wins on speed AND avoids all VRAM contention with L1's
-concurrent Ollama usage.
-STEP 3 (minimal benchmark, n_envs=2/4, real checkpoint + real data): first pass (no thread
-capping) showed the OPPOSITE of the prediction -- 0.14x/0.11x speedup (7-9x SLOWER).
-Reported plainly rather than proceeding on a bad assumption. Root cause confirmed via ps
-aux, not assumed: severe CPU thread oversubscription (workers at ~375% CPU each, N
-processes x multi-threaded torch/BLAS ops competing for 16 physical cores). Fixed
-(torch.set_num_threads(1) + OMP/MKL env vars) and re-ran: vec_env.reset() for N parallel
-workers' first cold reset (~2.1-2.9s) essentially matches a SINGLE worker's own reset cost
--- confirms resets genuinely overlap across processes. But steady-state rate across two
-repeated runs of the IDENTICAL n_envs=2 config disagreed by more than 2x (3.384 vs 8.527
-dec/sec) -- this round's benchmarks never fixed a random seed, so different runs sample
-genuinely different real market days/episode lengths, an uncontrolled confound in the
-benchmark design itself, not a mysterious result. Honest conclusion: thread capping is a
-confirmed, reproducible, mandatory fix (not optional); the resulting speedup magnitude is
-genuinely uncertain from this round's data (0.81x-2.16x across readings) and NOT reliable
-enough to extrapolate a specific 2,000,000-step/n_envs=8 runtime -- stated explicitly
-rather than picking whichever number looks better.
-STEP 4: Recommendation is Option A+C (N CPU-inference workers, SubprocVecEnv,
-torch.set_num_threads(1) mandatory) WITH a properly controlled follow-up benchmark (fixed
-seeds, longer duration, repeated trials) before full implementation -- not implementing
-this round, per instruction. Five correctness risks documented for a future full
-implementation to test (seed reproducibility per-worker, per-worker LSTM isolation,
-cross-episode-leak fix holding inside SubprocVecEnv workers specifically, distributional
-equivalence via a fixed paired-seed set single-env-vs-parallel comparison rather than
-byte-identical equivalence, SAC train_freq/gradient_steps semantics under multi-env).
-Files: scripts/profile_l2_throughput.py, scripts/benchmark_parallel_l2.py,
-scripts/benchmark_parallel_l2_v2.py (all new, throwaway measurement code, not wired into
-train_l2.py) -- committed this round. docs/reports/phase4_l2_reconciliation_and_plan.md
-updated with full Steps 1-4 findings and the resolved-checkpoint fact.
+Last updated: 2026-08-24 09:07 HKT
+State: Controlled follow-up benchmark to last round's noisy parallelization result
+(0.14x/0.11x uncapped, then two disagreeing thread-capped readings of the SAME n_envs=2
+config, 3.38 vs 8.53 dec/sec -- root cause: unfixed seed + unfixed date_range). This round
+fixed both: every one of 12 runs (n_envs=1/2/4/8 x 3 trials) sampled the SAME fixed 10-day
+pool from the real train split (first 10 gap-free dates) with the SAME fixed seed (42).
+Result: coefficient of variation dropped to 0.1-1.3% across every configuration (from >2x
+swings) -- the fix worked, confirmed by measurement, not assumed.
+Sweep result (thread-capped throughout, mandatory per last round): n_envs=1: 5.651 dec/sec
+(NOTE -- already higher than the original 4.194 dec/sec GPU baseline from two rounds ago,
+since this config also uses CPU L3 inference, this round's recommended design, not GPU --
+that switch alone is a ~35% gain before any parallelism). n_envs=2: 6.865 (1.21x speedup,
+60.7% efficiency). n_envs=4: 8.852 (1.57x, 39.2% efficiency) -- flagged explicitly per
+instruction: reaches 91% of n_envs=8's raw throughput using half the RAM/VRAM, a real knee
+in the curve worth knowing if resource contention with L1 becomes binding. n_envs=8: 9.729
+(1.72x, 21.5% efficiency) -- real, reproducible speedup, but clearly sub-linear at every
+step, not close to ideal scaling anywhere tested.
+Real RAM/VRAM measured (not assumed) via /proc/<pid>/status + nvidia-smi per-process
+accounting: n_envs=8 uses 26.2GB RSS (NOT the same as L3's own n_envs=8 PPO budget of
+~38.8GB -- confirmed different, not assumed to match) and 3.6GB VRAM (fits comfortably
+alongside L1's stated ~15GB peak). One anomaly flagged, not fixed: VRAM scales ~linearly
+with n_envs (matching ~454MB/worker, this round's own earlier GPU-inference measurement)
+even though these workers run L3 inference on CPU -- suggests CPU-inference workers are
+still initializing an unneeded CUDA context, worth investigating in a full implementation
+to reclaim that VRAM.
+Extrapolation to a real 2,000,000-step run, from the controlled rates directly:
+n_envs=8 -> 205,571s = 57.1h = 2.38 days (best measured). n_envs=4 -> 2.62 days. n_envs=2
+-> 3.37 days. n_envs=1 -> 4.10 days. Go/no-go per the stated guidance (under ~1 day
+workable, 1-2 days marginal, beyond that rethink): NO, plainly, even at the best
+configuration -- 2.38 days is outside the marginal band. Extrapolation's own caveats
+(benchmark's narrow, repeated 10-day date_range likely benefits from warm OS page cache a
+real 405-day-diversity run wouldn't get; policy behavior drift as L2 actually learns is
+untested by a short benchmark) both lean toward this being an OPTIMISTIC reading, not
+pessimistic -- real wall-clock is more likely to be worse than 2.38 days than better.
+Stated plainly per instruction, not stretched to clear the bar: parallelizing envs alone,
+at the scale tested, does not make a full 2M-step L2 run practical.
+Five correctness risks from last round still stand (seed reproducibility per-worker now
+partially validated by this round's low CoV, but a dedicated different-workers-draw-
+different-episodes test is still not built; per-worker LSTM isolation; the cross-episode-
+leak fix holding inside SubprocVecEnv specifically; distributional equivalence via
+matched-seed comparison; SAC train_freq/gradient_steps semantics under multi-env -- none
+resolved by a throughput-only benchmark). Two new items added this round: unnecessary CUDA
+context init in CPU workers (~454MB/worker wasted VRAM); this benchmark's controlled
+date_range trading representativeness for low variance -- a full implementation should
+re-validate against the real 405-day split before trusting these exact absolute numbers
+for capacity planning (relative comparison across n_envs is trustworthy; absolute rate may
+not transfer unchanged).
+Separately this round: found and fixed a real .gitignore gap (models/*.zip and
+models/*.pkl only matched files directly under models/, not nested subdirectories like
+models/l2_checkpoints_smoke/ or the real models/l2_checkpoints/) -- discovered when
+smoke-test binaries showed up staged by something/someone else on this shared box despite
+looking gitignored. Also: a first commit attempt for that fix accidentally swept in four
+unrelated files staged by another concurrent session in the window between this session's
+status check and commit -- caught immediately via git show --stat HEAD, corrected with a
+non-destructive git reset (no content lost), re-verified via git diff --cached before
+re-committing. Noting this for the record since it's a real, live risk on this shared box,
+not hypothetical -- verify staged content immediately before every commit, not just git
+status shortly before.
+Files: scripts/benchmark_controlled.py (new, throwaway measurement code, not wired into
+train_l2.py) -- committed this round, along with the .gitignore fix and design doc
+updates.
 Files owned/in-progress: none uncommitted as of this update.
-Blocking/open questions: throughput is the sole remaining blocker (checkpoint question is
-resolved). A real training launch needs EITHER a properly controlled parallelization
-benchmark confirming a trustworthy speedup number, OR a decision to accept the ~5.5-day
-single-env runtime as-is given the checkpoint's own honest performance (ties TWAP, per the
-handoff doc) -- that tradeoff is not this doc's call to make.
-Next planned step: awaiting direction -- (a) build the properly-controlled follow-up
-benchmark (fixed seeds, longer duration) to get a trustworthy speedup number before any
-full implementation, or (b) reconsider whether throughput engineering is worth the
-investment given the checkpoint's own tie-not-beat result against TWAP, or (c) something
-else. No production parallelization code and no real training launch until one of these
-is decided.
+Blocking/open questions: throughput engineering via env-parallelization alone has now been
+tested and answered -- not sufficient on its own to make a 2M-step run practical. Open
+question for whoever owns the go/no-go, not resolved here: proceed with a smaller training
+budget, pursue a fundamentally different approach to the reset()-dominated cost, or
+reconsider given the checkpoint's own honest tie-not-beat result against TWAP.
+Next planned step: awaiting direction. No production parallelization code, no real
+training launch, until one of the above is decided.
 
 ## L3 / Env-Physics
 Last updated: 2026-08-23 18:15 HKT
