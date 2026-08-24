@@ -300,6 +300,69 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-25 03:05 HKT
+State: episode replay visualizer built alongside the live training run
+(l2v1_20260825, ~85,800 gradient updates at last check, healthy, no errors). Zero
+interference: no GPU, no real data, tiny synthetic checkpoints only, verified via
+ps/free -h and the training log before and after this task.
+
+scripts/replay_episode.py: given one episode (checkpoint/seed as required CLI
+args, no defaults), produces one coherent 3-panel PNG + plain-language summary
+aimed at a trading reader, not a codebase reader -- price path with best bid/ask
+band, arrival price, terminal mid, and child-order placements marked by outcome
+(filled / replaced before filling / still open at episode end / market-crossing
+fill); execution progress vs. the linear TWAP schedule with ahead/behind shading
+(this IS what schedule_deviation means, shown rather than named); L2's own
+participation-rate multiplier and urgency over the same time axis so steering is
+visible against what else is happening; a text summary with the Perold IS
+decomposition (execution/opportunity/fees) against a same-seed TWAP baseline run
+on the base env for a same-window comparison. Labels are trader-plain throughout
+("2 ticks behind touch" via marker position, not "offset=-2") -- no obs indices
+anywhere in the output.
+
+Captures tick-level detail via monkeypatch instrumentation on the real, unmodified
+FrozenL3Wrapper/LOBExecutionEnv (same pattern as scripts/profile_l2_throughput.py)
+-- inert by construction: the capture hook exists only inside this script's own
+process and is never installed unless this script runs; wrappers.py/
+lob_execution_env.py were not touched at all, so nothing about the live run's own
+code path changed.
+
+One real, non-obvious case found while reading _place_limit() and handled
+explicitly: a crossing LIMIT/CANCEL_AND_REPLACE routes through
+walk_market_fill() exactly like a real MARKET order, so its own placement tick
+can carry a non-maker fill -- without explicit handling this looked in the chart
+like an order silently left open forever. 5 new permanent tests lock this in
+(tests/test_replay_episode.py), covering both sides' placement-price formula
+against _place_limit()'s own source, not guessed.
+
+Verified on synthetic data only (tiny untrained checkpoints, CPU, ~400-row
+synthetic day): a direct CLI-level smoke run confirmed the full pipeline --
+argparse, real file I/O for all four checkpoint/vecnormalize paths, both the L2
+episode and the same-seed TWAP comparison episode, figure generation -- runs
+end to end. Caught and fixed one real bug in the process: the summary text box
+was overflowing the saved PNG's right edge at the original line lengths (fixed
+by explicit shorter lines + more bottom margin, not by trusting matplotlib's own
+wrapping). Actually inspected the rendered PNG (not just "it didn't crash") to
+confirm the fix and that the chart reads sensibly.
+
+One known, honestly-flagged limitation: reconstruct_child_orders() does not
+handle a crossing placement that fills only PART of the order and rests the
+remainder on the same tick -- not observed in the one episode verified, and
+_place_limit()'s own source wasn't fully read far enough to confirm whether this
+case is even possible; flagged rather than silently assumed away.
+
+Files: scripts/replay_episode.py, tests/test_replay_episode.py (new, committed).
+Uncommitted, harmless: same throwaway storage-format prototype scripts noted in
+the eval-harness entry below, untouched this round.
+
+Blocking/open questions: none for this task. Next planned step: once
+l2v1_20260825 completes, point this at the real checkpoint alongside
+scripts/eval_l2_n500.py -- replay a handful of real episodes (both
+representative and any n=500 outlier the eval harness flags) for qualitative
+read alongside the statistical one.
+
+PRIOR ENTRY BELOW, for context on the n=500 eval harness this task ran alongside:
+
 Last updated: 2026-08-25 02:10 HKT
 State: n=500 evaluation harness built alongside the live training run
 (l2v1_20260825, ~2.6% through 2,000,000 steps at last check, healthy -- fps~19,
