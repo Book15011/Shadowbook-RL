@@ -300,11 +300,96 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
-Last updated: 2026-08-24 23:15 HKT
-State: train_l2.py vectorized (SubprocVecEnv, correctness-verified), hardened for a
-multi-day run, shakedown complete. Five gated tasks, in order. Committed:
-src/train/train_l2.py + tests/test_train_l2.py (242df76). NOT this file's own commit
-until the end of this entry.
+Last updated: 2026-08-25 00:15 HKT
+State: pre-launch review of the vectorized train_l2.py (previous entry below) resolved
+four items, real changes not just documentation. Committed: src/train/train_l2.py +
+tests/test_train_l2.py (3872067). Still awaiting the user's own go-ahead before the real
+2M-step launch -- not started this round either, per the review's own "stop" instruction.
+
+ITEM 1 (VecNormalize -- a real decision, not inherited from the wiring round's scope
+boundary): sampled 40 real episodes (real frozen L3, real numeric-format data, random
+actions) and found genuine evidence for adding it, not just theoretical concern: several
+L2 obs dims have non-zero empirical means (time_remaining_norm 0.64, schedule_deviation
+0.20, own_open_orders_norm 0.23, ticks_since_own_fill_norm 0.21 -- none settle near 0 the
+way an already-centered feature would) and empirical std heterogeneous across dims whose
+declared _OBS_SPEC clip ranges already differ 5x (0 for structurally-zero/L1-stub dims,
+up to ~0.96 for some book_depth_norm_i). Matches L3's own in-project precedent of
+normalizing despite already-range-bounded inputs. Added VecNormalize(norm_obs=True,
+norm_reward=True, clip_obs=5.0, gamma=L2_GAMMA) around the production vec_env only --
+make_l2_env's own single, non-vectorized construction (this test file's fast mechanics
+tests) stays deliberately unnormalized, and its own canary test's comment now says why
+that's still correct rather than stale.
+
+Structural knock-on effects, all implemented: resolve_l2_final_save_paths is now
+pair-returning (model, vecnormalize) like train_l3.py's own version (was single-path);
+new --resume-vecnormalize, REQUIRED alongside --resume-from (unlike
+--resume-replay-buffer, which stays optional -- VecNormalize's running stats are real
+model state, not optional bookkeeping, matching train_l3.py's own asymmetry between its
+required --resume-vecnormalize and this project's own optional replay-buffer resume);
+CheckpointCallback gets save_vecnormalize=True on real runs.
+
+Verified, not assumed, per instruction -- three separate checks: (a) new unit test
+(test_l2_policy_action_applies_vecnormalize_when_present) builds a real VecNormalize-
+wrapped vec env, confirms get_vec_normalize_env() resolves non-None, and confirms
+normalize_obs() actually transforms the observation ValISEvalCallback feeds to predict()
+(not silently a no-op -- the previously-dead branch in _l2_policy_action is dead no
+longer). (b) A live kill-and-resume test with all three --resume-from/
+--resume-replay-buffer/--resume-vecnormalize flags together: killed a real run after a
+checkpoint landed, resumed, got 5 clean post-resume eval firings and zero errors across
+the rest of a full run to its own final save (both model.zip and vecnormalize.pkl written
+correctly) -- one process mistake made and caught during this: the resume test's own
+completion poll used a wrong grep pattern (looked for step=800/1000/1200, but a resumed
+run's eval callback resets its OWN _last_eval_step counter to 0, so it actually fired at
+step=604 relative to the resumed num_timesteps=600 baseline -- never matched), so the
+disposable test run finished naturally and its final save landed on the ACTUAL canonical
+paths (models/l2_strategist_v1.zip, l2_vecnormalize.pkl, since neither existed yet).
+Caught immediately by checking the log directly rather than trusting the stalled poll;
+both files deleted right away -- canonical L2 checkpoint still does not exist, confirmed
+after cleanup. (c) A separate ~13-minute confirmatory shakedown (run_name=vnshakedown1,
+n_envs=4, production defaults, VecNormalize now active) showed RSS (17.6-18.6GB
+throughout) and the first eval firing (step=10364) landing in the same range as the
+original pre-VecNormalize shakedown's own numbers -- no material behavior change from
+adding VecNormalize, confirmed rather than assumed negligible. All disposable checkpoint/
+test artifacts from every test this round deleted afterward (own scratch output).
+
+ITEM 2 (resume seeding inconsistency -- a real bug, not a doc gap): make_l2_subproc_env's
+workers were constructed with args.seed BEFORE the --resume-from branch ran, so a
+resumed run's workers always seeded at --seed's own value/42 default even when the SAC
+model itself correctly reseeded at the ORIGINAL run's model.seed via
+model.set_random_seed(model.seed) -- --seed's own help text claimed workers reused
+model.seed on resume, but the code didn't actually do that. Fixed by reordering: on
+--resume-from, the checkpoint now loads (env=None) to read model.seed BEFORE vec_env is
+constructed, and that value threads into every worker's torch.manual_seed(seed+rank),
+making the documented behavior actually true. The startup seed print also moved to after
+this resolution and now states explicitly when a resume is using model.seed instead of
+--seed's own value (verified directly in the resume test above: printed
+"seed=42 (from resumed model.seed, not --seed=42 -- see --seed's own help)" correctly).
+
+ITEM 3 (disk headroom): checked directly (df -h): 214GB available. Checkpointing at the
+default cadence (--checkpoint-freq-timesteps 50,000) over the full 2,000,000-step run is
+40 firings x (~174MB replay buffer + ~3.5MB model + ~3.6KB vecnormalize) ~= ~7GB
+accumulated, not pruned as it goes -- comfortably inside headroom (~3.3% of available),
+not remotely tight. No retention logic added (the review's own conditional -- "if it's
+tight" -- didn't hold); --checkpoint-freq-timesteps's own CLI help now states this
+arithmetic and the checked number directly rather than leaving it an unstated assumption.
+
+ITEM 4 (wall-clock and eval budget, using the ALREADY-established REAL throughput, not
+the harness's uncorrected number): at n_envs=4 with the correct gradient_steps=4 (~17
+dec/s, isolated cleanly last round via a controlled --gradient-steps 1 vs 4 comparison --
+NOT the harness's own uncorrected 23.847 dec/s, which was never run with this round's own
+UTD-preserving fix), 2,000,000 steps ~= 32.7 hours ~= 1.36 days. n_envs=8 was not
+independently re-measured with its own correctly-scaled gradient_steps=8 this round
+either -- if the same proportional slowdown applies (17/23.847 ~= 71%), an EXTRAPOLATED,
+not measured, ~24.5 hours ~= 1.02 days. --eval-freq's default (10,000) gives 200 firings
+over the full run at ~35-40s each (measured, both the original and confirmatory
+shakedowns) ~= ~2.1 hours total, ~6.4% of the 32.7h run -- reported as a real,
+non-trivial cost, not assumed negligible from the single-env-era design comment's
+outdated "under 2%" estimate.
+
+Recommendation restated with these four items resolved: n_envs=4, total_timesteps=2,000,000,
+expected wall-clock ~32.7 hours (not ~18h, not the harness's ~23.3h) -- awaiting the
+user's own review and go-ahead before that launch, per instruction.
+
 
 TASK 1 (vectorize train_l2.py): ported the pattern scripts/benchmark_controlled_numeric.py
 measured (SubprocVecEnv, per-worker CPU-only frozen-L3 inference, mandatory thread-capping)
