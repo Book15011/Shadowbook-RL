@@ -300,11 +300,78 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
-Last updated: 2026-08-25 00:15 HKT
-State: pre-launch review of the vectorized train_l2.py (previous entry below) resolved
-four items, real changes not just documentation. Committed: src/train/train_l2.py +
-tests/test_train_l2.py (3872067). Still awaiting the user's own go-ahead before the real
-2M-step launch -- not started this round either, per the review's own "stop" instruction.
+Last updated: 2026-08-25 01:20 HKT
+State: REAL 2,000,000-STEP TRAINING RUN LAUNCHED AND IN PROGRESS. run_name=l2v1_20260825,
+launched ~2026-08-25 01:14 HKT under nohup (survives SSH disconnect), log at
+logs/l2_train_real_l2v1_20260825.log. Do not launch a second L2 training run
+concurrently -- GPU/CPU capacity is claimed by this one until it completes or is
+deliberately stopped.
+
+n_envs=6, NOT 4 or 8 -- a live-measured result, not the earlier round's own extrapolation:
+with each n_envs's own correctly-scaled gradient_steps (the UTD-preserving fix from the
+vectorization round), n_envs=6 measured ~23.3 dec/s vs n_envs=8's ~21 dec/s -- 6 is BOTH
+faster AND lighter (RSS ~22.7GB vs ~28.8GB) than 8 for this real script, not a tradeoff.
+Root cause: gradient_steps scales linearly with n_envs (more GPU gradient-update work
+per training() call), while raw env-stepping throughput from added parallelism hits
+diminishing returns (already visible in the original harness sweep's own efficiency
+numbers, 59.5% at n_envs=4 down to 39.7% at n_envs=8) -- past 6 workers here, the added
+gradient cost outweighs the extra parallelism. Checked this isn't a CPU-oversubscription
+artifact: 16 vCPUs available, 6-8 thread-capped workers + main process doesn't approach
+that ceiling directly Full n_envs sweep this round (n_envs: dec/s / RSS): 4: ~17 /
+~18.5GB, 6: ~23.3 / ~22.7GB, 8: ~21 / ~28.8GB -- all measured with --no-eval on an
+otherwise-idle box, matching what production will actually see now that the user has
+committed to keeping the box dedicated for the run's duration.
+
+Pre-launch checks, all done and reported before starting per instruction:
+- models/l2_strategist_v1.zip / l2_vecnormalize.pkl confirmed absent (the earlier
+  resume-test mishap that once created them -- see the previous entry below -- was
+  already cleaned up; re-confirmed fresh immediately before this launch).
+- Fresh free -h/nvidia-smi/df -h/ps: 47GB RAM available, GPU 0MB used, 214GB disk free,
+  ps showed only baseline OS/vscode/streamlit processes -- genuinely idle box confirmed,
+  not assumed, immediately before committing to a 24+ hour run.
+- --l3-checkpoint sha256 (a5443e2a4c6c1d4427d4ce1cb83e65d622ea688d8953f5bf94b29e87fbcaa77d)
+  verified fresh (not from memory) against docs/reports/l3_frozen_handoff.md's own
+  recorded value -- exact match. Paired VecNormalize sha256 also checked and matches.
+- Wall-clock estimate corrected before launch, not left ambiguous: the ~23.3 dec/s
+  n_envs=6 measurement was --no-eval (training-only), so 2,000,000/23.3 ~= 23.8h training
+  + 200 eval firings x ~37.5s ~= 2.1h eval overhead = ~25.9 HOURS TOTAL, honestly stated
+  as inclusive of eval, not the training-only figure alone.
+
+Small addition made just before this launch, committed separately (9eec0be): main() now
+prints every resolved arg (sorted, after all defaults/auto-resolution) at startup, so
+logs/l2_train_real_l2v1_20260825.log is a self-contained record of exactly what ran even
+without the original launch command.
+
+Launch config (also in the log itself, printed in full): --l3-checkpoint
+models/l3_frozen_backup/l3_executioner_v1_frozen.zip, --l3-vecnormalize
+models/l3_frozen_backup/l3_vecnormalize_frozen.pkl (the doc-recorded frozen checkpoint,
+NOT L3's own currently-live/mid-flux working checkpoint -- see this file's own L3 section
+for why those differ right now), --total-timesteps 2000000, --n-envs 6, --seed 42,
+--run-name l2v1_20260825, --use-numeric-format (explicit, though already the default),
+--eval (explicit, already the default), --checkpoint-freq-timesteps/--eval-freq/
+--n-eval-episodes all left at their defaults (50000/10000/10 -- already checked for disk
+headroom and eval-overhead budget in the prior entry below). VecNormalize
+(norm_obs=True, norm_reward=True) is active throughout, per this round's own added
+support. gradient_steps=6 confirmed correctly auto-derived (matches n_envs, per
+_resolve_gradient_steps).
+
+Monitoring plan per instruction: check-ins at ~1h, ~6h, then roughly every 6h until
+completion, each covering process-alive/RSS/VRAM/dec-s/ep_len_mean/eval-IS-vs-TWAP-
+passthrough. Hard stop-and-report triggers: RSS climbing steadily (not plateauing --
+the buffer's own footprint is a fixed ~174MB regardless of how full it is, confirmed
+directly from real checkpoint file sizes last round, so sustained growth would mean a
+leak, not normal filling), a worker dying silently (the SubprocVecEnv/multiprocessing.Pool
+hang failure mode from the numeric-conversion round's own diagnosis -- looks alive, isn't
+making progress), eval IS diverging badly or NaN-ing, or checkpoints missing their
+expected cadence. Explicitly NOT a stop condition: an unpromising eval trend on its own --
+SAC is expected to look bad early, and per docs/reports/l3_frozen_handoff.md's own honest
+performance statement, the frozen L3 checkpoint itself only ties TWAP (does not beat it),
+so L2's own early numbers should be read against that same honest baseline, not an
+inflated expectation. Final n=500 evaluation against the pre-registered bar (beat
+frozen-L3-alone at 0.994, ideally beat TWAP at 0.889, both paired tests agreeing) is
+explicitly a SEPARATE round per instruction -- not evaluated here, not evaluated at
+completion either, only reported.
+
 
 ITEM 1 (VecNormalize -- a real decision, not inherited from the wiring round's scope
 boundary): sampled 40 real episodes (real frozen L3, real numeric-format data, random
