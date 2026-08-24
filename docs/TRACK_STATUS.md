@@ -300,10 +300,195 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-24 23:15 HKT
+State: train_l2.py vectorized (SubprocVecEnv, correctness-verified), hardened for a
+multi-day run, shakedown complete. Five gated tasks, in order. Committed:
+src/train/train_l2.py + tests/test_train_l2.py (242df76). NOT this file's own commit
+until the end of this entry.
 
-**[Flag from the L1/shared-infra session, 2026-08-24 21:20 HKT, not a regular L2 entry --
-L2's own status below is unmodified. Done at direct user instruction on the numeric-
-format conversion in progress at status-check time.]** Four gated tasks, in order:
+TASK 1 (vectorize train_l2.py): ported the pattern scripts/benchmark_controlled_numeric.py
+measured (SubprocVecEnv, per-worker CPU-only frozen-L3 inference, mandatory thread-capping)
+into the actual production script -- every n_envs number to date came from that throwaway
+harness, never train_l2.py itself, which was still single-env before this round (confirmed
+by reading it directly, not assumed). New make_l2_subproc_env() worker factory: each
+SubprocVecEnv worker constructs its OWN LOBExecutionEnv + FrozenL3Wrapper + RecurrentPPO
+instance inside its own _init() (post-fork), loads the frozen L3 checkpoint on CPU
+regardless of --device (only the SAC policy itself trains on --device, typically cuda),
+and sets OMP_NUM_THREADS/MKL_NUM_THREADS=1 (module-level, before any other import) +
+torch.set_num_threads(1) per worker -- this project's own prior round measured an
+un-thread-capped attempt at this same pattern at 7-9x SLOWER from oversubscription, so
+this is treated as mandatory, not an optimization. use_numeric_format threaded through
+make_l2_wrapped_env/ValISEvalCallback as a new trailing, defaulted kwarg (every existing
+positional call site in tests/test_train_l2.py is unaffected); new --use-numeric-format
+CLI flag defaults ON (the numeric-format archive, converted+equivalence-verified last
+round, is now this project's production input), with --data-dir resolved from it
+explicitly and printed at run start, per the round's own hard boundary that this choice
+must never be silently inherited. --n-envs added, default 4 (rationale under Task 4
+below). make_l2_env (single, non-vectorized, Monitor-wrapped) is UNCHANGED and still used
+by tests/test_train_l2.py's existing fast mechanics tests -- the new vectorized path is
+fully separate, so none of the pre-existing single-env test coverage needed to change.
+
+TASK 2 (five correctness risks, all tested empirically this round, not just reasoned
+about):
+1. Seed reproducibility under SubprocVecEnv -- needed an EXTRA fix SB3 does not provide.
+   SAC(seed=...) -> BaseAlgorithm.set_random_seed() seeds the MAIN process's own
+   python/numpy/torch RNGs and calls env.seed(seed) on the VecEnv (SubprocVecEnv resolves
+   this to per-worker env.reset(seed=seed+idx) on the next reset(), confirmed against the
+   installed SB3 2.3.2 source -- same mechanism train_l3.py's own module docstring already
+   documented). This does NOT reach a SubprocVecEnv worker's own separate process's torch
+   RNG, which is exactly what the frozen L3's training-time predict(deterministic=False)
+   samples from -- left unseeded, two runs with an identical --seed would still diverge
+   through the frozen L3's own stochastic action choices. Fixed: torch.manual_seed(seed +
+   rank) inside each worker's _init(), same seed+idx offset convention SB3 itself uses.
+   Verified by running the real script twice with an identical --seed (--n-envs 4,
+   --smoke-test, --eval-freq 100): grepped rollout/eval/loss metrics from both runs --
+   byte-for-byte IDENTICAL output across the entire run, not approximately close.
+2+3+4. Per-worker LSTM state isolation, the cross-episode leak fix (wrappers.py's
+   FrozenL3Wrapper.reset(), which zeroes l2_target_slice_ratio_override/l2_urgency before
+   calling env.reset()) holding under SubprocVecEnv's own auto-reset machinery, and exact
+   matched-seed equivalence vs. a solo single-env run -- verified together via a dedicated
+   scratch script (not committed): built a real n_envs=4 SubprocVecEnv seeded at
+   BASE_SEED=999 using make_l2_subproc_env directly, stepped a fixed, pre-generated
+   30-step action sequence, and captured each worker's full obs/reward/done trajectory.
+   Compared each worker i's trajectory against a SOLO SubprocVecEnv(n_envs=1) seeded
+   directly at BASE_SEED+i (matching SB3's own per-worker seed-offset convention) given
+   the IDENTICAL action sequence for that worker slot. Stated criterion up front: exact
+   byte-identical (np.array_equal) equivalence, not merely distributional -- achievable
+   here since every component (env dynamics, RNG, frozen L3 sampling once seeded per
+   point 1) is deterministic given a seed. Result: all 4/4 workers PASS, byte-identical
+   obs/reward/done sequences, INCLUDING across an auto-reset episode boundary each of the
+   4 workers hit naturally during the 30-step window (auto-reset correctly invoked
+   FrozenL3Wrapper.reset(), not some inner unwrapped env, and no cross-worker state bled
+   between the 4 separate OS processes). Any LSTM-isolation or leak-fix failure would have
+   perturbed a worker's post-boundary trajectory away from its solo-run counterpart --
+   none did.
+5. SAC's train_freq=1/gradient_steps semantics under n_envs>1 -- confirmed against the
+   installed SB3 2.3.2 source (off_policy_algorithm.py): train_freq=(1,"step")'s
+   `num_collected_steps` counter increments once per env.step() CALL regardless of
+   env.num_envs, so it always triggers exactly ONE training() call per env.step() call --
+   meaning gradient_steps (fixed at 1, Section 4.1's literal single-env-only reference
+   value, never re-derived for parallel workers) would silently cut the update-to-data
+   ratio to 1/n_envs once n_envs>1, a real, silent change to SAC's sample efficiency
+   nobody had deliberately chosen. Fixed: new _resolve_gradient_steps(n_envs, override)
+   (pure function, unit-tested), defaults to n_envs, preserving the original
+   1-gradient-step-per-transition ratio the reference value gave at n_envs=1. Also
+   reapplied explicitly on --resume-from (model.gradient_steps = ... after SAC.load()) --
+   caught in review before it shipped: SAC.load() restores gradient_steps from the
+   ORIGINAL run's own pickled hyperparams, so resuming with a DIFFERENT --n-envs than the
+   original run used would otherwise silently keep the stale, mismatched value.
+   buffer_size=500,000 needed NO fix -- confirmed against SB3's ReplayBuffer source that
+   this is a TOTAL transition cap, divided by n_envs internally
+   (self.buffer_size = max(buffer_size // n_envs, 1)), so its real memory footprint is
+   independent of n_envs by construction (see Task 4's own ~174MB measurement below).
+
+TASK 3 (multi-day hardening):
+- Save-path safety: new --run-name/--overwrite-canonical + resolve_l2_final_save_paths()
+  (L2 analog of train_l3.py's own resolve_final_save_paths() guard and its
+  docs/reports/l3_replace_value_probe.md incident -- single-path here since L2 has no
+  VecNormalize to pair). A run's final save can no longer silently overwrite
+  models/l2_strategist_v1.zip (still doesn't exist -- confirmed before AND after this
+  round's testing). Periodic CheckpointCallback's name_prefix is now run-name-tagged too
+  (l2_sac_<run-name>_*, was a fixed, collision-prone "l2_sac" before), matching
+  train_l3.py's own precedent for why this matters (two real runs' intermediate
+  checkpoints silently overwrote each other there once). --smoke-test saves are
+  deliberately EXEMPT from both (already fixed, clearly-namespaced, no collision risk,
+  genuinely low-stakes).
+- New --checkpoint-freq-timesteps (default 50,000, n_envs-divided per SB3's own
+  CheckpointCallback documentation), with save_replay_buffer=True on real (non-smoke)
+  runs.
+- --resume-from/--resume-replay-buffer: NOT just implemented -- actually tested by
+  launching a real (non-smoke) run, waiting for a checkpoint to land (checkpoint_freq_
+  timesteps=200 for this test), then SIGKILL-ing the process (not a graceful stop, a real
+  crash simulation) once past a second checkpoint at 400 steps. Verified clean death (no
+  leaked processes, memory/GPU fully released). Resumed from the 400-step checkpoint +
+  its paired replay buffer: log confirmed "resumed replay buffer ... (99 transitions)"
+  and "resumed from ...: loaded num_timesteps=400" -- both consistent with the pre-crash
+  state (400 timesteps / 4 envs = 100 vec-steps, ~99 stored). Training continued correctly
+  past the resume point (total_timesteps 400 -> 636+, n_updates climbing normally, losses
+  evolving continuously not restarting), and the eval callback fired correctly at the
+  resumed state (step=404, right after resume). Killed again (SIGKILL) before it could
+  reach its own final save -- deliberately, since no canonical L2 checkpoint exists yet
+  and this was a disposable test, not a real run. Test checkpoint files (killtest1,
+  killtest1_resumed -- ~866MB total, mostly replay-buffer pickles) deleted afterward, this
+  session's own scratch output.
+- Survives SSH disconnect: every launch this round used nohup + a detached background
+  shell (established session pattern), verified via a completely fresh, independent SSH
+  connection after each launch per this session's own standing discipline -- the local
+  Bash tool's own "launch" command hung on the known SSH/nohup stdio quirk on EVERY
+  launch this round, never treated as a signal of remote state either way.
+- ValISEvalCallback: confirmed wired in and active by default (--eval defaults True,
+  unchanged), firing correctly under the vectorized path -- see Task 4's shakedown for
+  real firing-cost measurements at production defaults (eval_freq=10,000,
+  n_eval_episodes=10).
+
+TASK 4 (shakedown, ~53 real minutes, --n-envs 4, real numeric-format data, full
+production defaults -- eval on, checkpoint_freq_timesteps=50,000, run_name=shakedown1):
+- RSS (summed VmRSS across the main process + all 4 workers): 18.34GB at launch -> 18.65GB
+  after 50,736 timesteps / 6 eval firings / 1 checkpoint (~1.6% drift over the whole run)
+  -- consistent with buffer_size being pre-allocated up front, not something that grows as
+  it fills: every replay-buffer checkpoint .pkl this round (killtest1's, killtest1_
+  resumed's, AND shakedown1's, at totally different num_timesteps) was exactly 174,002,069
+  or 174,002,070 bytes, confirming the ~174MB footprint predicted from the SB3 buffer-math
+  fix above is real, fixed, and independent of how full the buffer actually is. No leak.
+- 4/4 workers stayed alive and stable the entire run, no crashes, no stalls.
+- 6 eval firings (steps 10k/20k/30k/40k/50k+), each costing ~35-40s wall-clock (~6%
+  overhead at this run's own throughput -- higher than the single-env design comment's
+  "under 2%" estimate, since eval's fixed per-firing cost stayed the same while --n-envs
+  raised how often it fires per unit wall-clock; still a small, acceptable overhead, not a
+  problem, just a fact worth recording plainly rather than the older, no-longer-accurate
+  single-env estimate).
+- Checkpoint landed correctly at the production-default 50,000-step cadence with correct
+  run-tagged naming and a valid paired replay-buffer file.
+- All test artifacts from this shakedown deleted afterward (this session's own scratch
+  output, same as the kill-resume test's).
+
+Measured throughput vs. the harness, isolated cleanly: the shakedown's own steady-state
+rate (~17 dec/s, delta-based, past the one-time eval-baseline startup cost) is materially
+below the numeric-format harness's 31.808/23.847 dec/s (n_envs=8/4). Root-caused, not left
+unexplained: a controlled --gradient-steps 1 vs --gradient-steps 4 comparison, both
+--no-eval, both --n-envs 4 (apples-to-apples against the harness, which never had eval or
+the gradient_steps fix): gradient_steps=1 (the harness's implicit, uncorrected value)
+steady-states at ~24-25 dec/s, matching the harness's 23.847 dec/s closely; gradient_steps=4
+(this round's correctness fix, Task 2 item 5) steady-states at ~17-18 dec/s, matching the
+real shakedown almost exactly. The entire gap is the deliberate UTD-preserving fix itself
+-- 4x more GPU gradient updates per collected batch than the harness ever measured, not a
+bug, not subprocess or eval overhead, not an artifact of the real data vs. the harness's
+own data pool.
+
+This changes the 2,000,000-step run estimate materially: at n_envs=4's real, correctness-
+fixed throughput (~17 dec/s), 2,000,000 / 17 ~= 32.7 hours ~= 1.36 days -- still better
+than the original 1.84-day parquet baseline, but well above both the harness's own
+uncorrected 0.73-day estimate AND the "~18 hours minimum" figure the round's own framing
+used, since neither of those ever included this fix. Reported plainly, not smoothed over
+with the faster, uncorrected number. n_envs=8 was not independently re-measured this round
+(the round's own "then stop" boundary, see Task 5) -- the RSS-headroom evidence gathered
+(production n_envs=4 needed ~18.6GB including the eval apparatus the harness never had,
+comfortably under this box's 48GB available) suggests n_envs=8 remains viable on paper,
+but its own gradient_steps=8 throughput was not directly measured, so no numeric claim is
+made for it here.
+
+TASK 5 (report): delivered directly to the user, not duplicated here in full -- covers
+implementation state, all five correctness results, hardening verification (including the
+actual kill-and-resume test), shakedown numbers, the isolated throughput-gap finding, and
+a recommended n_envs=4 / total_timesteps=2,000,000 for the real run, pending the user's own
+review before launch (explicitly not started this round, per instruction).
+
+Files touched: src/train/train_l2.py (rewritten in place, vectorized + hardened),
+tests/test_train_l2.py (extended: new tests for use_numeric_format threading,
+_resolve_gradient_steps, resolve_l2_final_save_paths, and the new --n-envs/--seed/
+--gradient-steps/--resume-replay-buffer-requires-resume-from CLI surface -- all 18 tests,
+including every pre-existing one, still pass). Both committed as 242df76. Did NOT touch
+src/envs/wrappers.py or tests/test_wrappers.py (read only, to understand FrozenL3Wrapper's
+exact behavior before relying on it) -- no fix needed there this round, everything
+required was achievable from train_l2.py's own side. src/envs/lob_execution_env.py
+remains uncommitted with an unrelated in-progress diff (use_numeric_format support this
+round's own work depends on, plus whatever L3's own current staleness/eta_replace round
+has added) -- read to confirm the use_numeric_format constructor param's exact current
+behavior, not modified or staged, consistent with this file being another track's
+in-flight work.
+
+No git push (commit locally only, per standing instruction). No protected files edited.
+
 
 TASK 1 (diagnosis): the numeric-format conversion (scripts/convert_l2_to_numeric_parallel.py,
 382/441 done) was HUNG, not slow -- 6 workers idle at 99.3% CPU, no new output in 80+ min.
