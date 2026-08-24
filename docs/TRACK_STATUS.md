@@ -300,6 +300,75 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+
+**[Flag from the L1/shared-infra session, 2026-08-24 21:20 HKT, not a regular L2 entry --
+L2's own status below is unmodified. Done at direct user instruction on the numeric-
+format conversion in progress at status-check time.]** Four gated tasks, in order:
+
+TASK 1 (diagnosis): the numeric-format conversion (scripts/convert_l2_to_numeric_parallel.py,
+382/441 done) was HUNG, not slow -- 6 workers idle at 99.3% CPU, no new output in 80+ min.
+py-spy dumped the parent and all 6 live workers: parent blocked in next() waiting for a
+result, every worker idle in queue.get() waiting for a task that will never come. dmesg
+confirmed root cause: the kernel OOM-killed 6 python workers within the first ~3.5 minutes
+of the original N_WORKERS=8 run (6.1-7.8GB RSS each at time of death). multiprocessing.Pool
+respawns killed workers automatically (why 6 workers still looked "running" -- they were
+replacements) but never retries or surfaces an exception for a task whose worker was
+SIGKILLed -- the result is silently lost forever, and next() blocks indefinitely once all
+other dispatchable work is exhausted. Checked write_day() before considering any restart:
+writes atomically (temp file + Path.replace()), so no corrupted output existed for the lost
+file(s). The 59 still-unconverted files skewed toward the largest in the dataset (including
+the top 2 by size) -- large files driving memory pressure, not one malformed input.
+
+TASK 2 (equivalence gate on the 382 already-converted, run BEFORE converting further):
+scripts/compare_formats_equivalence.py existed but had never been run -- no log, no
+result, anywhere. Ran it: 10/10 seeds PASS on its own hardcoded pool. Caught before trusting
+that alone: that pool is the pre-existing 10-day "benchmark pool" converted by a SEPARATE,
+earlier process (mtimes 16:29-16:38, before the mass-conversion run even started at 17:12)
+-- passing it does NOT touch anything the stalled parallel script actually produced. Built
+an extended check targeting 8 individually-verified mass-converted files directly (the 3
+largest, chronological first/last, 3 mid-range), date_range=(day,day) to pin each check to
+one specific file: 8/8 PASS, 10 seeds each. 18 days x 10 seeds = 180 comparisons, all
+byte-identical (np.array_equal, not np.allclose).
+
+TASK 3 (finish conversion, only after 1-2 cleared): killed the hung process (clean SIGTERM,
+cascaded correctly, 48GB memory freed). Fix: N_WORKERS 8 -> 4 (rationale recorded inline in
+the script). Resumed (idempotent, skip-already-converted) -- completed all 441 files in 7.8
+minutes, no further OOM, memory finished clean. Then re-ran equivalence across the FULL set
+per instruction, with 100% coverage (not a sample) of the 59 files that were in flight
+during the crash, since those are the most likely to be anomalous: 59/59 PASS, 10 seeds
+each = 590 comparisons, 27.3 min, all byte-identical. Combined across all three equivalence
+rounds this session: 77 distinct days x 10 seeds = 770 comparisons, 100% pass. Final output:
+12.98GB (data/raw_l2_bybit_numeric/BTCUSDT/, 441 .npzst files).
+
+TASK 4 (re-benchmark, numeric format, same controlled method as the parquet baseline --
+fixed seed=42, same fixed 10-day pool, 3 trials/config, thread-capping,
+scripts/benchmark_controlled_numeric.py, NOT wired into train_l2.py, same throwaway-
+harness status as the original benchmark_controlled.py): n_envs=8 gives 31.808 dec/sec vs
+the parquet baseline's 12.575 dec/sec -- a 2.53x speedup, very tight noise (CoV 0.1-0.9%
+across the whole sweep). 2,000,000-step extrapolation: 0.73 days, down from 1.84 days.
+This crosses the project's own stated go/no-go threshold from MARGINAL (1-2 days) into
+WORKABLE (under ~1 day). Full sweep: n_envs=1 10.016/s, n_envs=2 15.491/s, n_envs=4
+23.847/s, n_envs=8 31.808/s (efficiency 100%/77.3%/59.5%/39.7%, same diminishing-returns
+shape as the parquet sweep, just uniformly faster).
+
+Committed: scripts/convert_l2_to_numeric_parallel.py (with the N_WORKERS fix baked in --
+was never committed by anyone before this, so its whole history starts here) and
+scripts/benchmark_controlled_numeric.py, one commit (a2e51f4). Did NOT stage/commit any of
+L2's other pre-existing untracked scratch files from this round (check_level_counts.py,
+compare_formats_equivalence.py, convert_l2_to_numeric.py, convert_one_day*.py,
+test_zstd_raw.py, src/data/l2_numeric_format.py, tests/test_numeric_format_equivalence.py)
+-- those are L2's own work to commit when ready, not mine to sweep in.
+
+IMPORTANT, explicitly noted per instruction and NOT done this round: train_l2.py is still
+single-env, unchanged -- confirmed by reading it directly, not assumed. Every n_envs number
+above (both parquet and numeric) comes from throwaway benchmark harnesses, never the
+production training script. Building vectorized training (SubprocVecEnv + CPU inference
+per worker + thread-capping, wired into train_l2.py itself) is next round's work, not
+started here.
+
+PRIOR ENTRY BELOW, L2's own last regular round (env.reset() I/O optimization, predates the
+numeric-format work entirely):
+
 Last updated: 2026-08-24 16:10 HKT
 State: env.reset() I/O round (round 2 of 2 on this cost, last one before training per
 instruction). Attacked _load_day's ~1400-1560ms/miss cost directly. Checked parquet file
