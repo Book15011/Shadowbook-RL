@@ -272,20 +272,67 @@ def test_eval_callback_wired_into_sac_learn_fires_and_logs(tmp_path):
 
 
 def test_get_vec_normalize_env_is_none_when_l2_obs_not_normalized(tmp_path):
-    # Documents current, deliberate state (docs/reports/phase4_l2_reconciliation_and_plan.md's
-    # Decision (a): VecNormalize for L2's own obs is recommended but not yet implemented)
-    # -- _l2_policy_action's defensive `if vec_normalize is not None` branch is currently
-    # always the None path. This test exists so that decision's implementation status is
-    # pinned by a test, not just a doc claim -- it should start failing (and be updated,
-    # not silently left) the day someone adds VecNormalize around the L2 training env.
-    # Still true after this round's vectorization work -- out of that round's own stated
-    # scope (see train_l2.py's module docstring).
+    # Documents current, deliberate state for make_l2_env's own single, non-vectorized
+    # construction specifically -- NOT the real production path any more. Real training
+    # (main()'s own vec_env) DOES now wrap in VecNormalize, with real evidence behind the
+    # decision (see train_l2.py's module docstring and
+    # test_l2_policy_action_applies_vecnormalize_when_present below, which pins the
+    # OPPOSITE behavior for that path). make_l2_env stays deliberately unnormalized --
+    # it exists only for this test file's own fast, non-multiprocess mechanics tests, was
+    # never main()'s own training path even before this round's VecNormalize addition
+    # (see that function's own docstring), and still isn't now.
     env = _build_env(tmp_path)
     l3_model = _build_tiny_recurrent_ppo(env)
     vecnorm_path = _write_fake_vecnormalize(tmp_path, env)
     train_env = make_l2_env(_date_range(tmp_path), 20, 2, l3_model, vecnorm_path, 4, False, data_dir=_data_dir(tmp_path))
     sac_model = SAC("MlpPolicy", train_env, buffer_size=100, batch_size=8, device="cpu", verbose=0)
     assert sac_model.get_vec_normalize_env() is None
+
+
+def test_l2_policy_action_applies_vecnormalize_when_present(tmp_path):
+    # The new thing this round adds: main()'s real training vec_env is now wrapped in
+    # VecNormalize (see module docstring for the evidence behind the decision).
+    # ValISEvalCallback._l2_policy_action already branched on
+    # `self.model.get_vec_normalize_env() is not None` before this round (dead code until
+    # now, since nothing ever attached a VecNormalize-wrapped env to the model) -- this
+    # test exercises that branch for real rather than assuming it works: builds a tiny SAC
+    # model against a VecNormalize-wrapped DummyVecEnv (a faithful, lighter-weight stand-in
+    # for main()'s real SubprocVecEnv+VecMonitor+VecNormalize stack -- get_vec_normalize_env()
+    # walks ANY VecEnvWrapper chain, Dummy or Subproc, the same way), steps it enough times
+    # for the running obs stats to move off their fresh mean=0/var=1 initialization (a
+    # freshly-constructed VecNormalize would make normalize_obs() near-identity and prove
+    # nothing), then confirms (a) get_vec_normalize_env() resolves to non-None, and (b) the
+    # eval callback's own normalize_obs() call actually changes the observation it feeds to
+    # predict(), not silently passing it through unchanged.
+    env = _build_env(tmp_path)
+    l3_model = _build_tiny_recurrent_ppo(env)
+    vecnorm_path = _write_fake_vecnormalize(tmp_path, env)
+    train_env_raw = make_l2_wrapped_env(
+        _date_range(tmp_path), 20, 2, l3_model, vecnorm_path, 4, False, data_dir=_data_dir(tmp_path),
+    )
+    dummy_vec = DummyVecEnv([lambda: train_env_raw])
+    normalized_vec = VecNormalize(dummy_vec, norm_obs=True, norm_reward=True, clip_obs=5.0)
+    normalized_vec.reset()
+    for _ in range(10):
+        normalized_vec.step(np.array([normalized_vec.action_space.sample()]))
+
+    sac_model = SAC("MlpPolicy", normalized_vec, buffer_size=100, batch_size=8, device="cpu", seed=0, verbose=0)
+    vec_normalize = sac_model.get_vec_normalize_env()
+    assert vec_normalize is not None
+
+    eval_cb = ValISEvalCallback(
+        val_date_range=_date_range(tmp_path), horizon_ticks=20, lookback_ticks=2,
+        ticks_per_l2_decision=4, l3_model=l3_model, l3_vecnormalize_path=vecnorm_path,
+        l2_include_prev_action=False, eval_freq=2, n_eval_episodes=2, verbose=0,
+        data_dir=_data_dir(tmp_path),
+    )
+    eval_cb.model = sac_model  # normally wired by BaseCallback.init_callback() inside .learn()
+
+    raw_obs, info = eval_cb._eval_env.reset(seed=123)
+    normalized_obs = vec_normalize.normalize_obs(raw_obs[None, :])
+    assert not np.array_equal(normalized_obs, raw_obs[None, :])  # confirms normalization actually did something
+    action = eval_cb._l2_policy_action(raw_obs)  # must not crash, exercises the exact code path
+    assert action.shape == eval_cb._eval_env.action_space.shape
 
 
 # --------------------------------------------------------------------------------------
@@ -306,34 +353,52 @@ def test_resolve_gradient_steps_explicit_override_wins():
 
 # --------------------------------------------------------------------------------------
 # resolve_l2_final_save_paths -- same guard/rationale as train_l3.py's
-# resolve_final_save_paths (see tests/test_train_l3.py), adapted for L2's single-path
-# (no VecNormalize) save.
+# resolve_final_save_paths (see tests/test_train_l3.py). Now pair-returning (model,
+# vecnormalize) like train_l3.py's own version, since L2 has a VecNormalize to pair
+# starting this round -- was single-path before.
 # --------------------------------------------------------------------------------------
 
 def test_resolve_l2_final_save_paths_fresh_dir_uses_canonical(tmp_path):
-    model_stem = resolve_l2_final_save_paths(
+    model_stem, vecnorm_path = resolve_l2_final_save_paths(
         run_name="20260101_000000", overwrite_canonical=False, models_dir=tmp_path,
     )
     assert model_stem == str(tmp_path / "l2_strategist_v1")
+    assert vecnorm_path == str(tmp_path / "l2_vecnormalize.pkl")
 
 
 def test_resolve_l2_final_save_paths_existing_canonical_redirects(tmp_path):
     (tmp_path / "l2_strategist_v1.zip").write_bytes(b"existing checkpoint")
-    model_stem = resolve_l2_final_save_paths(
+    model_stem, vecnorm_path = resolve_l2_final_save_paths(
         run_name="probe_20260101", overwrite_canonical=False, models_dir=tmp_path,
     )
     assert model_stem == str(tmp_path / "l2_strategist_v1_probe_20260101")
+    assert vecnorm_path == str(tmp_path / "l2_vecnormalize_probe_20260101.pkl")
     # And nothing was actually touched -- resolve_l2_final_save_paths only decides, it
     # does not write.
     assert (tmp_path / "l2_strategist_v1.zip").read_bytes() == b"existing checkpoint"
 
 
+def test_resolve_l2_final_save_paths_existing_vecnorm_only_still_redirects(tmp_path):
+    # Only the VecNormalize half exists (e.g. an interrupted prior save) -- OR, not AND:
+    # still redirects, so a run can never leave a mismatched model/VecNormalize pair
+    # behind by only overwriting the missing half. Same guarantee as train_l3.py's own
+    # version, mirrored here (see tests/test_train_l3.py's own equivalent test).
+    (tmp_path / "l2_vecnormalize.pkl").write_bytes(b"existing vecnormalize")
+    model_stem, vecnorm_path = resolve_l2_final_save_paths(
+        run_name="probe_20260101", overwrite_canonical=False, models_dir=tmp_path,
+    )
+    assert model_stem == str(tmp_path / "l2_strategist_v1_probe_20260101")
+    assert vecnorm_path == str(tmp_path / "l2_vecnormalize_probe_20260101.pkl")
+
+
 def test_resolve_l2_final_save_paths_overwrite_canonical_flag_forces_canonical(tmp_path):
     (tmp_path / "l2_strategist_v1.zip").write_bytes(b"existing checkpoint")
-    model_stem = resolve_l2_final_save_paths(
+    (tmp_path / "l2_vecnormalize.pkl").write_bytes(b"existing vecnormalize")
+    model_stem, vecnorm_path = resolve_l2_final_save_paths(
         run_name="20260101_000000", overwrite_canonical=True, models_dir=tmp_path,
     )
     assert model_stem == str(tmp_path / "l2_strategist_v1")
+    assert vecnorm_path == str(tmp_path / "l2_vecnormalize.pkl")
 
 
 # --------------------------------------------------------------------------------------
@@ -400,3 +465,29 @@ def test_cli_resume_replay_buffer_requires_resume_from():
     # integration round rather than re-invoking main()'s full argv/GPU/data-file path
     # here; this test only pins that the CLI still parses the (invalid) combination
     # through to main() rather than argparse silently rejecting or coercing it.
+
+
+def test_cli_resume_vecnormalize_required_alongside_resume_from():
+    # Unlike --resume-replay-buffer (optional even with --resume-from -- see that flag's
+    # own help), --resume-vecnormalize is REQUIRED alongside --resume-from: main() raises
+    # ValueError if exactly one of the pair is given (bool(a) != bool(b)), mirroring
+    # train_l3.py's own --resume-from/--resume-vecnormalize pairing check. Same "parses
+    # fine, main() validates" split as the replay-buffer test above -- this only pins that
+    # both flags parse through correctly, both alone and together; the actual raise is
+    # exercised directly by hand (not re-invoked here, same reasoning as above).
+    from src.train.train_l2 import build_parser
+
+    args = build_parser().parse_args([
+        "--l3-checkpoint", "unused.zip", "--l3-vecnormalize", "unused.pkl",
+        "--total-timesteps", "1", "--resume-from", "unused_model.zip",
+    ])
+    assert args.resume_from == "unused_model.zip"
+    assert args.resume_vecnormalize is None
+
+    args_paired = build_parser().parse_args([
+        "--l3-checkpoint", "unused.zip", "--l3-vecnormalize", "unused.pkl",
+        "--total-timesteps", "1",
+        "--resume-from", "unused_model.zip", "--resume-vecnormalize", "unused_vecnorm.pkl",
+    ])
+    assert args_paired.resume_from == "unused_model.zip"
+    assert args_paired.resume_vecnormalize == "unused_vecnorm.pkl"

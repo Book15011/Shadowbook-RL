@@ -28,14 +28,26 @@ was actually trained under (docs/TRACK_STATUS.md's L3 entry: "RewardWeights() re
 defaults") -- so L2 trains against exactly the reward shape its frozen L3 policy already
 learned to act under, by construction, not by needing an override flag to match it.
 
-Still NOT added, matching "wiring only" scope from the round this script was first built:
-no VecNormalize around the L2-level SAC env itself (Section 4.1's reference train_l2.py
-snippet doesn't show one either, unlike its L3 counterpart) -- decided (recommend adding
-before a real run, does not block further work) but not implemented, see docs/reports/
-phase4_l2_reconciliation_and_plan.md's CURRENT STATE section. Deliberately NOT added in
-this round either (the vectorization round) -- out of that round's own stated scope, and
-tests/test_train_l2.py's test_get_vec_normalize_env_is_none_when_l2_obs_not_normalized
-pins this as a canary, not silently left stale.
+VecNormalize (norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=L2_GAMMA -- same
+shape as L3's own VecNormalize(train_l3.py)) now wraps the production vec_env, decided
+with real evidence rather than inherited from the wiring round's own scope boundary: a
+40-episode sample of real L2 observations (real frozen L3, real numeric-format data,
+random actions) showed several dims with genuinely non-zero means (time_remaining_norm
+mean=0.64, schedule_deviation mean=0.20, own_open_orders_norm mean=0.23,
+ticks_since_own_fill_norm mean=0.21 -- none of these settle near 0 the way a
+already-centered feature would) and heterogeneous empirical std across dims whose
+declared _OBS_SPEC clip ranges already differ 5x (roughly 0 for the structurally-zero/
+L1-stub dims, up to ~0.96 for some book_depth_norm_i dims) -- a real, evidence-backed
+scale/centering mismatch across the 41 dims a Gaussian SAC policy and its Q-function both
+have to share weights across, not merely a theoretical concern read off the clip bounds.
+Matches L3's own in-project precedent of normalizing despite already-range-bounded
+inputs. This is ONLY around the production vec_env in main() -- make_l2_env's own single,
+non-vectorized construction (used by tests/test_train_l2.py's fast mechanics tests) stays
+deliberately unnormalized; test_get_vec_normalize_env_is_none_when_l2_obs_not_normalized
+still documents that path correctly, see its own updated comment. Resuming now needs
+--resume-vecnormalize alongside --resume-from/--resume-replay-buffer, same pairing
+discipline as L3's own checkpoint/.pkl -- see resolve_l2_final_save_paths() below, now
+pair-returning like train_l3.py's version instead of single-path.
 
 Held-out eval (ValISEvalCallback below) IS now built -- modeled directly on train_l3.py's
 own ValISEvalCallback (same held-out-val-split, paired-seed, real-IS-metric conventions),
@@ -122,7 +134,7 @@ from sb3_contrib import RecurrentPPO
 from stable_baselines3 import SAC
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecNormalize
 
 from src.data.split import load_split
 from src.envs.lob_execution_env import LOBExecutionEnv
@@ -137,6 +149,14 @@ _SMOKE_TEST_MAX_TIMESTEPS = 10_000  # guards against --smoke-test + a real-sized
 # LOBExecutionEnv's own original-format default, kept only for an explicit opt-out.
 NUMERIC_DATA_DIR = "data/raw_l2_bybit_numeric/BTCUSDT"
 PARQUET_DATA_DIR = "data/raw_l2_bybit/BTCUSDT"
+
+# Shared between VecNormalize's own gamma-scaled reward discounting and SAC's own gamma
+# -- these MUST match (VecNormalize's reward normalization uses a running discounted
+# return estimate, gamma-scaled the same way the algorithm's own returns are), so this is
+# a single named constant rather than two separately-typed literals that could drift.
+# Re-derived value (not Section 4.1's reference) -- see the SAC() call below for the
+# derivation.
+L2_GAMMA = 0.995
 
 
 def _sha256(path: str) -> str:
@@ -267,28 +287,37 @@ def _resolve_gradient_steps(n_envs: int, override: int | None) -> int:
 
 def resolve_l2_final_save_paths(
     run_name: str, overwrite_canonical: bool, models_dir: Path = Path("models"),
-) -> str:
+) -> tuple[str, str]:
     """L2 analog of train_l3.py's resolve_final_save_paths -- same rationale: a bounded
     L3 probe run's final save once silently overwrote a verified checkpoint this way (see
     train_l3.py's own module docstring and docs/reports/l3_replace_value_probe.md), and
     this project's own convention since then is that no training script's final save
-    unconditionally overwrites its canonical checkpoint. L2 has no VecNormalize to pair
-    (this script does not wrap the training env in VecNormalize -- see module docstring),
-    so this resolves a single model path, not a pair the way train_l3.py's version does.
+    unconditionally overwrites its canonical checkpoint. Now pair-returning like
+    train_l3.py's own version (was single-path before this round, back when L2 had no
+    VecNormalize to pair -- see module docstring): the two canonical files are checked
+    with OR, not AND, so if either already exists, BOTH outputs redirect together, and a
+    run can never leave a mismatched model/VecNormalize pair behind by only overwriting
+    one of them -- exact same guarantee as train_l3.py's version, same reason.
 
     Pure path-decision logic, no I/O beyond the existence check -- kept separate from
     main() specifically so it's unit-testable without a GPU, training loop, or real
     config/data files (see tests/test_train_l2.py, mirroring tests/test_train_l3.py's own
     coverage of the L3 version). Does not apply to --smoke-test saves, which already use
-    a fixed, clearly-namespaced path (models/l2_strategist_smoke_test) with no collision
-    risk against the canonical checkpoint.
+    fixed, clearly-namespaced paths (models/l2_strategist_smoke_test.zip and
+    models/l2_vecnormalize_smoke_test.pkl) with no collision risk against the canonical
+    checkpoint.
 
-    Returns model_save_stem (no .zip suffix, matching SB3 model.save()'s own convention).
+    Returns (model_save_stem, vecnorm_save_path). model_save_stem has no .zip suffix,
+    matching SB3 model.save()'s own convention (it appends .zip itself).
     """
     canonical_model = models_dir / "l2_strategist_v1.zip"
-    if canonical_model.exists() and not overwrite_canonical:
-        return str(models_dir / f"l2_strategist_v1_{run_name}")
-    return str(models_dir / "l2_strategist_v1")
+    canonical_vecnorm = models_dir / "l2_vecnormalize.pkl"
+    if (canonical_model.exists() or canonical_vecnorm.exists()) and not overwrite_canonical:
+        return (
+            str(models_dir / f"l2_strategist_v1_{run_name}"),
+            str(models_dir / f"l2_vecnormalize_{run_name}.pkl"),
+        )
+    return str(models_dir / "l2_strategist_v1"), str(models_dir / "l2_vecnormalize.pkl")
 
 
 class ValISEvalCallback(BaseCallback):
@@ -495,9 +524,17 @@ def build_parser() -> argparse.ArgumentParser:
         "predict(deterministic=False) sampling to be reproducible too, since SB3's own "
         "seeding never reaches into a SubprocVecEnv worker's separate process (confirmed "
         "against the installed SB3 source; see module docstring point 3). No seed existed "
-        "on this script at all before this round. Ignored when --resume-from is given --"
-        "the resumed model's OWN stored seed (from its original construction) is reused "
-        "instead, matching train_l3.py's own --resume-from precedent.",
+        "on this script at all before this round. Ignored when --resume-from is given -- "
+        "the resumed model's OWN stored seed (model.seed, from its original construction) "
+        "is reused instead for BOTH the SAC model's own RNGs and each worker's "
+        "torch.manual_seed(seed+rank), matching train_l3.py's own --resume-from precedent. "
+        "This requires knowing model.seed before the workers are constructed, so on "
+        "resume main() loads the checkpoint (env=None) before building vec_env, not "
+        "after -- an earlier draft of this fix got this ordering wrong: it built the "
+        "workers with --seed's own value (or its 42 default) BEFORE the resume branch "
+        "ran, so a resumed run's workers silently kept seeding at --seed/42 even when "
+        "the SAC model itself correctly reseeded at model.seed, a real inconsistency "
+        "caught in review, not by a test.",
     )
     parser.add_argument(
         "--ticks-per-l2-decision", type=int, default=50,
@@ -580,12 +617,18 @@ def build_parser() -> argparse.ArgumentParser:
         "run -- internally divided by --n-envs per SB3's own CheckpointCallback "
         "documentation (save_freq counts callback firings = env.step() calls on the "
         "VecEnv, each of which advances --n-envs timesteps at once). Also saves the "
-        "replay buffer alongside the model at each firing (CheckpointCallback's "
-        "save_replay_buffer=True, real runs only -- see --resume-replay-buffer). Smoke "
-        "tests instead save at total_timesteps//4 regardless of this flag, without a "
-        "replay buffer, and are not run-name-tagged (see --run-name). Sized against this "
-        "box's OOM history: lower this if losing up to this many steps of progress to an "
-        "unattended crash is not acceptable at the chosen --n-envs/throughput.",
+        "replay buffer AND the VecNormalize stats alongside the model at each firing "
+        "(CheckpointCallback's save_replay_buffer=save_vecnormalize=True, real runs only "
+        "-- see --resume-replay-buffer/--resume-vecnormalize). Smoke tests instead save "
+        "at total_timesteps//4 regardless of this flag, without a replay buffer, and are "
+        "not run-name-tagged (see --run-name). Sized against this box's OOM history: "
+        "lower this if losing up to this many steps of progress to an unattended crash is "
+        "not acceptable at the chosen --n-envs/throughput. Disk headroom at the default: "
+        "2,000,000 total steps / 50,000 = 40 firings x (~174MB replay buffer + ~3.5MB "
+        "model + a small vecnormalize .pkl) ~= ~7GB accumulated over a full run, not "
+        "pruned as it goes -- confirmed comfortably inside this box's own headroom (~214GB "
+        "free of 485GB at the time this was checked) for a single run at this cadence; "
+        "re-check df -h yourself if disk state may have changed since.",
     )
     parser.add_argument(
         "--run-name", type=str, default=None,
@@ -609,10 +652,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume-from", type=str, default=None,
         help="Path to an SAC model checkpoint .zip to resume from (e.g. "
         "models/l2_checkpoints/l2_sac_<run-name>_250000_steps.zip). --total-timesteps is "
-        "then interpreted as REMAINING steps, not an absolute target. See "
-        "--resume-replay-buffer to also restore the collected replay buffer (recommended "
-        "but not required -- SAC can resume with an empty buffer and refill it, at some "
-        "cost to immediate post-resume sample quality, not a correctness problem).",
+        "then interpreted as REMAINING steps, not an absolute target. Requires "
+        "--resume-vecnormalize (paired, same discipline as train_l3.py's --resume-from/"
+        "--resume-vecnormalize -- VecNormalize's running obs/reward stats are real model "
+        "state, not optional bookkeeping, so unlike --resume-replay-buffer this one is "
+        "not optional). See --resume-replay-buffer to also restore the collected replay "
+        "buffer (recommended but not required -- SAC can resume with an empty buffer and "
+        "refill it, at some cost to immediate post-resume sample quality, not a "
+        "correctness problem).",
+    )
+    parser.add_argument(
+        "--resume-vecnormalize", type=str, default=None,
+        help="Path to the matching VecNormalize .pkl for --resume-from (e.g. "
+        "models/l2_checkpoints/l2_sac_<run-name>_vecnormalize_250000_steps.pkl, produced "
+        "automatically by CheckpointCallback's save_vecnormalize=True on every real-run "
+        "checkpoint, or models/l2_vecnormalize.pkl / l2_vecnormalize_<run-name>.pkl from "
+        "a completed run's own final save -- see resolve_l2_final_save_paths()). Required "
+        "together with --resume-from -- see that flag's own help for why this one, unlike "
+        "--resume-replay-buffer, is not optional.",
     )
     parser.add_argument(
         "--resume-replay-buffer", type=str, default=None,
@@ -650,6 +707,8 @@ def main() -> None:
         )
     if args.resume_replay_buffer and not args.resume_from:
         raise ValueError("--resume-replay-buffer requires --resume-from")
+    if bool(args.resume_from) != bool(args.resume_vecnormalize):
+        raise ValueError("--resume-from and --resume-vecnormalize must be given together")
 
     run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     args.data_dir = args.data_dir or (NUMERIC_DATA_DIR if args.use_numeric_format else PARQUET_DATA_DIR)
@@ -660,7 +719,7 @@ def main() -> None:
         f"data format: {'numeric (.npzst)' if args.use_numeric_format else 'parquet/JSON'} "
         f"-- data_dir={args.data_dir}"
     )
-    print(f"n_envs={args.n_envs}, seed={args.seed}")
+    print(f"n_envs={args.n_envs}")
     if args.smoke_test:
         print(
             "[SMOKE TEST] mechanics-only run -- NOT a training run. Verifies the "
@@ -702,22 +761,47 @@ def main() -> None:
     # to share the CPU-only constraint those workers do.
     l3_model = RecurrentPPO.load(args.l3_checkpoint, device=args.device)
 
+    # Resume needs model.seed BEFORE the workers are built (see --seed's own CLI help):
+    # torch.manual_seed(seed+rank) inside each worker's _init() has to use the ORIGINAL
+    # run's seed on a resume, not --seed's own value/default, for the same reason SB3
+    # itself would reseed the model with model.seed rather than a fresh --seed. The only
+    # way to know model.seed is to load the checkpoint -- so on resume, load it here
+    # (env=None, same as train_l3.py's own --resume-from pattern) BEFORE constructing
+    # vec_env, purely to read its seed back out; model.set_env()/set_random_seed() happen
+    # further down, once vec_env actually exists.
+    if args.resume_from:
+        model = SAC.load(args.resume_from, device=args.device)
+        worker_seed = model.seed
+        print(f"seed={worker_seed} (from resumed model.seed, not --seed={args.seed} -- see --seed's own help)")
+    else:
+        worker_seed = args.seed
+        print(f"seed={worker_seed}")
+
     vec_env = SubprocVecEnv([
         make_l2_subproc_env(
             i, train_date_range, args.horizon_ticks, args.lookback_ticks,
             args.ticks_per_l2_decision, args.l2_include_prev_action,
             args.data_dir, args.use_numeric_format,
-            args.l3_checkpoint, args.l3_vecnormalize, args.seed,
+            args.l3_checkpoint, args.l3_vecnormalize, worker_seed,
         )
         for i in range(args.n_envs)
     ])
     vec_env = VecMonitor(vec_env)
+    if args.resume_from:
+        vec_env = VecNormalize.load(args.resume_vecnormalize, vec_env)
+    else:
+        # norm_obs=True/norm_reward=True/clip_obs=5.0 match train_l3.py's own
+        # VecNormalize exactly -- see module docstring for the real, evidence-based
+        # (not inherited) reasoning behind adding this at all. gamma matches L2_GAMMA
+        # (the SAC() call below), not L3's own gamma -- VecNormalize's reward
+        # normalization uses a gamma-scaled running return estimate, which has to track
+        # the SAME discounting the algorithm training on it actually uses.
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=L2_GAMMA)
 
     gradient_steps = _resolve_gradient_steps(args.n_envs, args.gradient_steps)
     print(f"gradient_steps={gradient_steps} (train_freq=1 step, i.e. once per {args.n_envs}-transition batch)")
 
     if args.resume_from:
-        model = SAC.load(args.resume_from, device=args.device)
         model.set_env(vec_env)
         # SAC.load() reconstructs the model with env=None (no env= kwarg passed to
         # .load() above), so set_random_seed()'s internal `if self.env is not None:
@@ -725,7 +809,8 @@ def main() -> None:
         # train_l3.py's own --resume-from branch (see that script's comment on this same
         # call). model.seed holds the ORIGINAL run's seed (persisted through save/load),
         # reused here rather than --seed so a resume never silently seeds differently
-        # from the run it's continuing.
+        # from the run it's continuing -- now genuinely true for the workers too (see
+        # worker_seed above), not just this model-level call.
         model.set_random_seed(model.seed)
         if args.resume_replay_buffer:
             model.load_replay_buffer(args.resume_replay_buffer)
@@ -751,7 +836,7 @@ def main() -> None:
             # -- Derived + re-confirmed for L2's real cadence (docs/reports/
             # phase4_l2_reconciliation_and_plan.md FINAL SPEC Step 3) --
             buffer_size=500_000,  # TOTAL transition cap (SB3 divides by n_envs internally, confirmed against source) -- ~8,333 L2-episode-equivalents of coverage, ~25% of the full 2M-step run's transition volume, independent of --n-envs.
-            gamma=0.995,  # re-derived on L2's OWN cadence (not L3's tick-level reasoning): effective horizon ~3.3x the 60-decision episode length, defensible given the terminal-IS-dominated reward structure.
+            gamma=L2_GAMMA,  # re-derived on L2's OWN cadence (not L3's tick-level reasoning): effective horizon ~3.3x the 60-decision episode length, defensible given the terminal-IS-dominated reward structure.
             # -- Section 4.1 reference values, carried over as-is -- NOT independently
             # derived for L2 the way the two above were; use as-is per instruction absent a
             # concrete reason not to. --
@@ -781,6 +866,7 @@ def main() -> None:
             save_path=ckpt_dir,
             name_prefix=ckpt_prefix,
             save_replay_buffer=True,
+            save_vecnormalize=True,
         )
     callbacks = [checkpoint_cb]
 
@@ -814,20 +900,22 @@ def main() -> None:
     Path("models").mkdir(exist_ok=True)
     if args.smoke_test:
         save_name = "models/l2_strategist_smoke_test"
+        vecnorm_save_path = "models/l2_vecnormalize_smoke_test.pkl"
     else:
-        save_name = resolve_l2_final_save_paths(run_name, args.overwrite_canonical, Path("models"))
+        save_name, vecnorm_save_path = resolve_l2_final_save_paths(run_name, args.overwrite_canonical, Path("models"))
         if save_name != "models/l2_strategist_v1":
             print(
-                "models/l2_strategist_v1.zip already exists and --overwrite-canonical "
-                "was not given -- NOT overwriting it (this is exactly what silently "
-                f"clobbered a verified L3 checkpoint once before -- see "
-                "docs/reports/l3_replace_value_probe.md). Saving this run's final "
-                f"checkpoint to {save_name}.zip instead. Pass --overwrite-canonical if "
-                "this run is deliberately meant to supersede the current canonical "
-                "checkpoint."
+                "models/l2_strategist_v1.zip and/or models/l2_vecnormalize.pkl already "
+                "exist and --overwrite-canonical was not given -- NOT overwriting them "
+                "(this is exactly what silently clobbered a verified L3 checkpoint once "
+                "before -- see docs/reports/l3_replace_value_probe.md). Saving this run's "
+                f"final checkpoint to {save_name}.zip / {vecnorm_save_path} instead. Pass "
+                "--overwrite-canonical if this run is deliberately meant to supersede the "
+                "current canonical checkpoint."
             )
     model.save(save_name)
-    print(f"Saved model to {save_name}.zip")
+    vec_env.save(vecnorm_save_path)
+    print(f"Saved model to {save_name}.zip, VecNormalize to {vecnorm_save_path}")
     if args.smoke_test:
         print("[SMOKE TEST] complete -- mechanics-only, not a performance signal. No real training was launched.")
 
