@@ -300,6 +300,57 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-26 06:36 HKT
+State: REAL 2,000,000-STEP TRAINING RUN COMPLETE. run_name=l2v1_20260825, ran
+~29.34h wall-clock (105,630s), total_timesteps=1,999,974. Throughput held
+steady at 18.8-18.93 dec/s across the entire run (consistent at every check-in
+from the 1h mark through completion -- never still settling, never
+degrading). No mechanical failures across the full run: all 9 processes
+(main + resource_tracker + forkserver + 6 workers) alive throughout, verified
+directly via /proc at every check-in, not inferred from a pgrep pattern count
+(one check-in's pgrep undercount was caught and corrected mid-run -- see this
+session's own record if the detail matters). RSS held flat in a tight
+25.8-25.9GB band the entire run, no leak. Checkpoints landed on the expected
+~44-minute/49,998-step cadence with no gaps. Zero tracebacks/errors/NaNs
+anywhere in the full log.
+
+Final save confirmed at the canonical paths: models/l2_strategist_v1.zip
+(3,459,901 bytes) and models/l2_vecnormalize.pkl (3,997 bytes), both written
+2026-08-26 06:34 HKT -- the first real canonical L2 checkpoint to exist (the
+pre-launch round's resume-test mishap created and then deleted these same
+paths once; this is the genuine article).
+
+Final eval-callback numbers (paired seeds 5000000..5000009, n=10/firing,
+TWAP-passthrough baseline IS_total_bps=0.9976 throughout): last 12 firings
+(steps 1.88M-1.99M) ranged 2.63-3.62, last logged firing at step=1,990,398
+mean=2.6331. Reported as-logged only, per explicit instruction -- NOT
+evaluated against the pre-registered bar (beat frozen-L3-alone at 0.994,
+ideally beat TWAP at 0.889, both paired tests agreeing) here. That is
+scripts/eval_l2_n500.py's job (see its own entry below), a separate,
+not-yet-run round.
+
+Both scripts/eval_l2_n500.py (n=500 evaluation harness) and
+scripts/replay_episode.py (qualitative episode visualizer) were built and
+verified on synthetic data during the run specifically so they'd be ready
+the moment a real checkpoint existed -- see their own entries below for what
+each does and how each was verified. Next step for whoever picks this up:
+point eval_l2_n500.py at models/l2_strategist_v1.zip + models/l2_vecnormalize.pkl
+and the frozen L3 checkpoint used for training
+(models/l3_frozen_backup/l3_executioner_v1_frozen.zip + l3_vecnormalize_frozen.pkl),
+run the real n=500 evaluation, and separately point replay_episode.py at a
+handful of real episodes for a qualitative read alongside it. Not started
+this round, per instruction -- reporting completion is where this round
+stops.
+
+GPU/CPU capacity is free again -- this run no longer needs exclusive use of
+the box.
+
+No git push (commit locally only, per standing instruction). No protected
+files edited.
+
+PRIOR ENTRY BELOW, for context on the episode replay visualizer and n=500
+eval harness built alongside the run:
+
 Last updated: 2026-08-25 03:05 HKT
 State: episode replay visualizer built alongside the live training run
 (l2v1_20260825, ~85,800 gradient updates at last check, healthy, no errors). Zero
