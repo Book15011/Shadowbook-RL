@@ -300,6 +300,91 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-27 12:30 HKT
+State: L2 REWARD REDESIGN -- DESIGN ONLY, NOT IMPLEMENTED, NO TRAINING RUN.
+Full detail: docs/reports/l2_reward_redesign_proposal.md (new, committed
+661aea9, alongside scripts/analyze_l2_reward_components.py). Summary here,
+not duplicated in full.
+
+The test-split confirmation run from the prior entry was interrupted by
+explicit instruction before producing any result -- models/l2_test_
+confirmation.json does not exist, the log is empty, nothing was seen. The
+pre-registration (commit 2de9fab) and the smoke-tested runner (commit
+d578a3a) both still stand, untouched and ready to resume whenever that task
+is picked back up; the test split remains unspent.
+
+WHY this round: L2 has never had its own reward -- FrozenL3Wrapper sums
+L3's per-tick step_reward() over each 50-tick window and hands that to SAC.
+That reward was built for a tick-level executioner; L2 chooses
+participation rate and urgency at 5s cadence and controls none of the
+tick-level order-type/price/cancel decisions most of those components
+price.
+
+MEASURED (not asserted): instrumented step_reward()/compute_implementation_
+shortfall() via a verified monkeypatch (0 mismatches across 154,192 real
+ticks, 100 real val episodes, trained L2 checkpoint, deterministic) --
+r_stale alone is 85.6% of L2's net accumulated reward and 75.4% of its
+total signal magnitude. Terminal IS, the metric L2 is actually evaluated
+on, is 6.9%/11.6%. r_stale outweighs terminal IS by ~12x in the mean.
+r_placement_stale is exactly 0 (eta_replace=0 in production, structurally
+correct, not a bug).
+
+PROPOSED PRIMARY DESIGN: potential-based mark-to-market IS shaping --
+Phi(t) = a running implementation-shortfall estimate using current
+executed_frac and current mid_price, evaluated at each L2 decision;
+reward = Phi(t) - Phi(t-1). Telescopes to the real terminal IS over the
+episode while paying dense, per-decision credit along the way. Explicitly
+argued against the TWAP-baseline (variance-reduction) reward's own
+documented L3 failure (docs/reports/l3_twap_baseline_reward.md) rather than
+re-proposing it: that change subtracted a SEPARATE reference trajectory
+(a TWAP shadow) with its own independently-fixed exposure window, and the
+real agent's own drift exposure shrinking on early completion created an
+incentive to rush relative to that fixed comparison point -- the
+mechanism the report itself observed behaviorally (episode length roughly
+halved, fill_ratio up, occasional costly tail). L2 CAN plausibly trigger
+the same effect (aggressive participation_rate_multiplier -> earlier
+completion), so this is not proposed for L2 either. The primary design has
+no separate reference trajectory at all -- Phi is a function of the real
+agent's own state and the real current price only, sidestepping that
+specific failure mode structurally, not by argument alone.
+ALTERNATIVE (minimal-diff, not primary): drop r_queue/r_spread/r_stale/
+r_placement_stale from L2's aggregation, keep only r_inv (weak but
+plausible L2 attribution) + terminal IS with kappa raised. Simpler,
+less implementation risk, doesn't solve sparse credit assignment as well.
+
+IMPLEMENTATION PLAN (not started): new src/envs/l2_reward.py (pure
+function, same style as reward.py), a gated l2_reward_mode parameter on
+FrozenL3Wrapper defaulting to current behavior (same opt-in convention as
+zeta/eta_replace/subtract_twap_baseline), a telescoping unit test (sum of
+per-window shaped rewards must match compute_implementation_shortfall()'s
+own terminal number) as the core correctness check, seed-equivalence check
+on the untouched default path. L3's own training/reward.py/frozen
+checkpoint: untouched. Comparability: a reward change means the current
+checkpoint's training-time numbers stop being comparable to a redesigned
+run's; TWAP-passthrough stays the valid comparison point either way since
+it's reward-independent by construction.
+
+HONEST EXPECTED VALUE: ~15-25% odds this flips the sign to beating
+TWAP-passthrough with both tests agreeing. The credit-assignment problem is
+real and measured, not hypothetical -- but frozen L3 itself (tick-level
+control, matched reward, 20M steps) only ties TWAP, and the
+volatility-stratified result was a remarkably consistent null across
+regimes, both leaning toward "limited exploitable structure at this
+cadence/instrument" over "reward noise was hiding something real." Worth
+fixing regardless, since a clean signal is table stakes for trusting any
+future result either way. Distinguishing test proposed: retrain under the
+new reward, rerun the exact same diagnostic battery (val/train/volatility
+strata) already built this round, before anything else -- clean training
+dynamics + still-null result would point to "no structure"; a genuine,
+replicating positive would confirm "reward was the binding constraint."
+
+Not implemented, not trained, no checkpoint touched, test split untouched.
+Reported for review per instruction -- awaiting decision on whether to
+proceed to implementation.
+
+PRIOR ENTRY BELOW, for context on the test-split pre-registration (still
+standing, unresumed):
+
 Last updated: 2026-08-27 11:00 HKT
 State: PRE-REGISTRATION for the test-split confirmation run, committed BEFORE
 any test-split evaluation is executed -- the whole point of a holdout is
