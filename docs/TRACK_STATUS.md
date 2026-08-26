@@ -300,7 +300,54 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
-Last updated: 2026-08-27 10:15 HKT
+Last updated: 2026-08-27 11:00 HKT
+State: PRE-REGISTRATION for the test-split confirmation run, committed BEFORE
+any test-split evaluation is executed -- the whole point of a holdout is
+declaring terms before the number is seen, so this commit's timestamp is the
+record that these terms predate the result, not a post-hoc description of
+them. No test-split code has run yet as of this commit.
+
+CLAIM UNDER TEST: "L2 (trained) does not achieve lower IS_total_bps than
+TWAP-passthrough on the held-out test split at n=500, with both paired tests
+(t-test and Wilcoxon) agreeing at p<0.05."
+
+INTERPRETATION OF EACH OUTCOME, FIXED NOW:
+- L2 loses or ties (fails to beat passthrough with both tests agreeing
+  p<0.05): confirms the existing body of evidence (val, unrestricted train,
+  and all three volatility strata including the zero-val-overlap high
+  bucket). The negative conclusion stands, now with a genuinely independent
+  confirmation.
+- L2 WINS (beats passthrough with both tests agreeing p<0.05): this
+  contradicts every prior measurement in this project. The correct reading
+  is "one anomalous result against a large, consistent body of contrary
+  evidence," NOT "L2 works after all." A single 18-day window does not
+  overturn val (500 episodes) + unrestricted train (500) + calm/moderate/
+  high volatility strata (292/500/500) all showing the same null-to-negative
+  pattern. Any writeup encountering a test-split win must carry this framing
+  explicitly, not treat the holdout as having overturned the rest.
+
+SCOPE NOTE, also fixed now: test sits at the ~21.5th percentile of train's
+volatility distribution (models/l2_day_conditions_test.csv, computed last
+round) -- calm, like val (23.7th percentile). Whatever this run finds, it
+confirms or contradicts the CALM-regime finding specifically. The
+high-volatility question remains genuinely unverified out-of-sample
+regardless of this result -- no split, including test, samples train's
+volatile tail. This scope limitation does not change based on which way the
+test result comes out.
+
+MECHANICS: same n=500 harness (scripts/eval_l2_n500.py's own functions,
+imported), same three arms, same EVAL_SEED_BASE=5,000,000 paired-seed
+convention, same methodology -- pointed at load_split("test") instead of
+"val". This is the ONLY evaluation the test split will ever get from this
+project: one run, no re-runs, no parameter adjustments after seeing the
+number. The script will be mechanically smoke-tested on val (n=5, NOT test)
+before the real run, per the same discipline every other real launch this
+project has used -- testing the SCRIPT is not the same as spending the
+HOLDOUT, and only the latter is restricted to once.
+
+Next: build+verify the script, then the single real n=500 test run, then a
+follow-up entry with the actual result -- kept as a separate commit so this
+one stands unedited as the pre-registration record.
 State: VOLATILITY-STRATIFIED EVALUATION COMPLETE -- the negative closes out.
 No retraining, no checkpoint changes, test split's own evaluation still
 untouched. Follow-up to the prior entry's regime-matching finding (train's
