@@ -300,6 +300,93 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-27 10:15 HKT
+State: VOLATILITY-STRATIFIED EVALUATION COMPLETE -- the negative closes out.
+No retraining, no checkpoint changes, test split's own evaluation still
+untouched. Follow-up to the prior entry's regime-matching finding (train's
+whole-pool L2-vs-passthrough advantage collapsed to near-zero when
+restricted to val's own volatility range): does that advantage
+correspondingly STRENGTHEN above val's range, where val has no equivalent
+at all? Built scripts/eval_l2_bucketed.py (new, committed 27cc986) --
+restricts LOBExecutionEnv's file pool to an explicit, non-contiguous date
+bucket via a safe post-construction override of self._files (set before any
+reset(), cannot perturb the RNG-driven file_idx draw order -- equivalent to
+having constructed the env with that file set from the start). Reuses
+eval_l2_n500.py's functions unchanged.
+
+Three buckets (day counts from models/l2_day_conditions_train.csv's own
+realized_vol_bps column, val's own max = 0.1882bps as the natural boundary):
+  calm     (vol <= 0.1882, matches val's own range): 231 days
+  moderate (0.1882 < vol <= 0.30, no val equivalent): 137 days
+  high     (vol > 0.30, train's own top ~9%, no val equivalent): 37 days
+n=500 for moderate and high (fresh runs, this round); calm reuses the prior
+round's regime-matched result (n=292, post-hoc filtered from the original
+whole-train run -- not re-run, same underlying data).
+
+RESULT -- L2 vs TWAP-passthrough, per bucket:
+  calm:     mean_diff=-0.0129bps  n=292  t-test p=0.937   Wilcoxon p=0.994
+  moderate: mean_diff=+0.0362bps  n=500  t-test p=0.825   Wilcoxon p=0.221
+  high:     mean_diff=-0.0762bps  n=500  t-test p=0.804   Wilcoxon p=0.923
+                                          d_z=-0.0111 (negligible)
+NO STRENGTHENING. All three buckets sit near zero with no consistent sign or
+trend, and none clear significance in either test. The high-volatility
+bucket -- specifically constructed to have NO counterpart anywhere in val,
+520 fresh episodes across train's most volatile 9% of days -- shows
+essentially nothing (effect size an order of magnitude below even a small
+effect). Per the pre-stated criterion for this task: high-vol shows nothing,
+so the negative conclusion gets substantially stronger, and this specific
+line (does L2 have hidden value in volatile regimes it never gets credit
+for on calm-skewed val) is closed out. Not checking for unseen high-vol
+data elsewhere in the archive, per instruction (that check was conditional
+on a real high-vol edge showing up; it didn't).
+
+Also worth recording plainly, a point underweighted in the prior entry: the
+ORIGINAL whole-train advantage (-0.2532bps) was never actually
+double-test-significant even on its own terms -- Wilcoxon was p=0.3354 in
+that very same run, only the t-test came close (p=0.0703, itself still
+>0.05). The cross-split significance established in the prior entry (Task
+1, p=0.014) was about the SWING between splits being real, not about
+train's own within-split number being a robustly confirmed advantage to
+begin with. That the volatility decomposition finds it nowhere in
+particular is consistent with this having been a marginal, borderline
+aggregate effect from the start rather than a real, localizable phenomenon
+that a stratified look failed to find. Fully reconciles: nothing here
+contradicts Task 1's finding that the CROSS-SPLIT swing is real -- it just
+means the swing is better explained by regime composition (as the prior
+entry's ~52% estimate already argued) than by L2 having a genuine,
+findable edge anywhere in particular.
+
+MANDATORY CAVEAT, stays attached to every number above: these are TRAINING
+days. Even a strong result in the high bucket could not have been
+distinguished from memorization of those 37 specific days rather than a
+real, transferable volatility-conditioned skill -- this diagnostic was
+built to be unable to tell those apart, by design (see the script's own
+module docstring). Since the result came back null anyway, this caveat is
+now moot for THIS finding specifically, but it applies to any future reader
+who might otherwise be tempted to read a favorable train-side number as
+held-out evidence.
+
+TEST-SPLIT RECOMMENDATION (recommending only, not acting): stronger than
+the prior entry's. L2 now shows no real edge over TWAP-passthrough anywhere
+tested -- not on val, not on unrestricted train, not in any of three
+volatility-stratified train subsets including one specifically chosen to
+have no val counterpart. The diagnostic phase looks complete: every
+plausible confound (absolute-vs-relative comparison, regime mismatch,
+volatility-conditioned value) has been checked and none rescues a positive
+read. Spending the test split now would be a clean, final, confound-free
+confirmation -- recommended as the next and likely last step before writing
+this up, not as another diagnostic round.
+
+Files: scripts/eval_l2_bucketed.py (new, committed 27cc986). Output
+artifacts left uncommitted, same precedent as prior entries:
+models/l2_bucketed_{moderate,high}.json.
+
+Reported, not acted on further -- test-split spend is a recommendation, not
+a decision made here. Whoever owns next steps decides.
+
+PRIOR ENTRY BELOW, for context on the regime-matching correction that
+prompted this check:
+
 Last updated: 2026-08-27 06:40 HKT
 State: CORRECTION to the prior entry's Diagnostic 2 conclusion, plus a new
 split-representativeness check that turned up a project-wide concern, not
