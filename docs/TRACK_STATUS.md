@@ -300,6 +300,120 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-26 10:05 HKT
+State: POST-MORTEM DIAGNOSTICS COMPLETE on the n=500 negative (prior entry
+below). Three diagnostics, all cheap (no retraining), scripts/eval_l2_diagnostics.py
+(new, committed 968daa9) -- reuses eval_l2_n500.py's exact functions
+(imported, not reimplemented), verified correct by reproducing that run's
+exact val arm means (1.2330/1.0237/0.8893) before trusting anything else it
+reports. Test split untouched throughout.
+
+DIAGNOSTIC 1 -- collapsed or actively steering? ACTIVELY STEERING (b), not
+collapsed (a). Logged all 14,727 real decisions across the val n=500 run:
+participation_rate_multiplier mean=1.1123 std=0.6429 (neutral=1.0,
+bounds=[0,2]), spanning p1=0.0045 to p99=1.9981 -- nearly the full range.
+urgency mean=0.5008 std=0.3335 (neutral=0.5, bounds=[0,1]), p1=0.0000 to
+p99=0.9992 -- same pattern. Saturation at either bound is rare (0.5-3.1% of
+decisions). Within-episode std (0.48 participation / 0.26 urgency) confirms
+it responds to state mid-episode, not just picks one action and holds it;
+between-episode std (0.37 / 0.20) confirms different episodes get different
+treatment too. The near-neutral MEANS are simply the average of a genuinely
+wide, responsive distribution, not evidence of a constant action -- the
+policy learned real, substantial, non-degenerate behavior. It just isn't
+useful behavior (see Diagnostic 2/3, and the already-recorded n=500 result).
+
+DIAGNOSTIC 2 -- overfitting or no learnable signal? NO LEARNABLE SIGNAL (b),
+not overfitting (a). Ran the identical n=500 harness against TRAIN dates
+(train_date_range=('2024-04-18','2025-07-15'), 405 real days -- confirmed
+this is exactly what the real training run itself used, via
+logs/l2_train_real_l2v1_20260825.log's own startup print, so this is the
+real in-sample comparison, not an approximation).
+  L2 (trained):      val=1.2330  train=1.2384  (gap: +0.0054bps, negligible)
+  TWAP-passthrough:  val=1.0237  train=1.4916  (baseline itself is harder on train)
+  Pure TWAP:         val=0.8893  train=1.2555  (baseline itself is harder on train)
+L2's OWN absolute number is statistically indistinguishable between data it
+trained on for 2,000,000 steps across 405 days and data it never saw at all
+across 18 days -- if there were exploitable train-specific structure, 2M
+steps of exposure should have produced at least some gap. There isn't one.
+Note the baselines themselves ARE harder on train (market conditions differ
+across the two chronological windows, expected) -- L2 doesn't track that
+shift either direction, its absolute output level is essentially fixed
+regardless of which regime it's actually in. On train, L2 nominally beats
+TWAP-passthrough (mean_diff=-0.2532bps) but NOT significantly (t-test
+p=0.0703, Wilcoxon p=0.3354 -- neither clears 0.05, and this is IN-SAMPLE
+data); vs Pure TWAP the effect is ~zero (d_z=-0.0017). Even on the exact
+data it trained on, L2's improvement over doing nothing special isn't
+statistically real. Action distribution shape also barely differs between
+splits (participation_mult mean=1.1123/std=0.6429 val vs mean=1.1738/
+std=0.6464 train; urgency mean=0.5008/std=0.3335 val vs mean=0.5376/
+std=0.3273 train) -- the policy behaves essentially the same way regardless
+of whether it has seen the data before.
+
+DIAGNOSTIC 3 -- broad-based or a few bad days? BROAD-BASED, not a few
+outliers. Per-day breakdown of the val n=500 result (18 days, 16-36 episodes
+each -- balanced, no single day's mean is built on a tiny unreliable
+sample): L2 worse than TWAP-passthrough on 12/18 days (67%), worse than Pure
+TWAP on 14/18 days (78%). Per-day L2-minus-passthrough diff ranges -0.667 to
++1.187bps (mean +0.188, std 0.571) -- a real spread on both sides, not one
+or two catastrophic days dragging an otherwise-good aggregate. This is a
+majority-of-days negative, not a regime-specific failure limited to a
+handful of dates.
+Extra (lightweight, n=18 so suggestive not conclusive): correlated the
+per-day L2-vs-passthrough diff against day-level conditions computed
+directly from the numeric day files (day return, realized volatility, mean
+spread). |day_return_bps| r=0.469, realized_vol_bps r=0.533, mean_spread
+r=0.493 -- all positive, moderate. Day DIRECTION (signed return) has ~zero
+correlation (r=-0.024). Reading: L2 tends to do relatively worse (vs.
+passthrough) on higher-volatility/wider-spread/bigger-swing days, and
+relatively less-bad on calm, tight-spread days -- plausible but not proven
+at n=18; a real pattern worth someone revisiting if this gets pursued
+further, not a standalone conclusion.
+
+OVERALL READ: "the approach doesn't work here," not "the training procedure
+failed and a fix is worth trying" -- reasoning, not just the verdict. If this
+were primarily a training-procedure failure (undertrained, bad
+hyperparameters), the two most likely fingerprints would be a collapsed/
+degenerate policy (ruled out by Diagnostic 1 -- it's genuinely, substantially
+responsive) or a large train/val gap from latching onto train-specific
+patterns even if the wrong ones (ruled out by Diagnostic 2 -- train and val
+are statistically indistinguishable for L2's own number, and even IN-SAMPLE
+performance doesn't clear significance against either baseline). What's left
+is a policy that learned real, responsive, non-trivial behavior that simply
+doesn't map onto better execution outcomes anywhere it's tested -- train,
+val, most individual days. That reads as the observation/action-space
+transform/reward combination not containing enough exploitable structure
+for SAC to find a genuinely useful policy here, not a fixable training-run
+defect. Secondary, unresolved consideration worth flagging honestly: actor/
+critic losses grew substantially and never visibly plateaued across the full
+2,000,000-step run, and ent_coef kept climbing throughout (0.0054 -> 0.132) --
+consistent with a policy that hadn't fully settled by the end of training.
+This doesn't overturn the diagnostics above (a not-fully-converged policy
+would still show SOME train/val gap if there were real signal to
+overfit toward, and still wouldn't need to be this actively responsive to
+have just collapsed toward mediocrity) -- but it does mean "an even longer
+run would clearly still fail" is not proven either, only "this specific run,
+budget, and reward did not produce a useful policy."
+
+Files: scripts/eval_l2_diagnostics.py (new, committed 968daa9). Output
+artifacts left uncommitted, same precedent as models/l2_n500_eval_result.json:
+models/l2_diagnostics_{val,train}.json, models/l2_diagnostics_{val,train}_
+episodes.csv, models/l2_diagnostics_{val,train}_actions.csv,
+models/l2_diagnostics_val_per_day{,_with_conditions}.csv.
+
+Test split (data/splits/l2_bybit_btcusdt_split.json's test_dates) was not
+touched by any of the above, per instruction. Flagging per instruction,
+NOT acting on it: whoever owns next steps may judge that the remaining
+untouched test split's time has come for a final confirmation run -- but
+that is a deliberate, one-time spend or someone else's call, not something
+to do as part of this round's own diagnostics.
+
+Reported, not acted on further -- whoever owns next steps decides between
+revisiting the approach (reward shaping, action-space transform, observation
+set) versus abandoning this direction given the frozen L3 baseline it sits
+on top of already only ties TWAP itself.
+
+PRIOR ENTRY BELOW, for context on the n=500 evaluation result itself:
+
 Last updated: 2026-08-26 08:14 HKT
 State: REAL n=500 EVALUATION COMPLETE (scripts/eval_l2_n500.py, ~42 real
 minutes, 3 arms x 500 paired episodes, val_date_range=('2025-07-16',
