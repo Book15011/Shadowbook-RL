@@ -300,6 +300,54 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-26 08:14 HKT
+State: REAL n=500 EVALUATION COMPLETE (scripts/eval_l2_n500.py, ~42 real
+minutes, 3 arms x 500 paired episodes, val_date_range=('2025-07-16',
+'2025-08-02'), seeds 5000000-5000499). L2 (trained, models/l2_strategist_v1.zip
++ l2_vecnormalize.pkl) does NOT beat the pre-registered bar.
+
+Results (IS_total_bps mean +/- std, fill_ratio, lower IS is better):
+- L2 (trained):        1.2330 +/- 3.4546, fill_ratio=0.9206
+- TWAP-passthrough:     1.0237 +/- 3.5467, fill_ratio=0.9192
+- Pure TWAP:            0.8893 +/- 4.3525, fill_ratio=0.9963
+Pure TWAP's number here matches docs/reports/l3_frozen_handoff.md's own
+recorded TWAP baseline (0.889) almost exactly -- a real sanity check that
+this harness reproduces the known-good figure, not a coincidence to ignore.
+
+Paired comparisons (L2 vs. each baseline, positive mean_diff = L2 WORSE):
+- vs TWAP-passthrough (required bar): mean_diff=+0.2094bps, d_z=0.0748 (tiny),
+  t-test p=0.0955 (not significant), Wilcoxon p=0.0068 (significant) -- the
+  two tests DISAGREE, and the direction is unfavorable to L2 regardless.
+- vs Pure TWAP (stretch goal): mean_diff=+0.3438bps, d_z=0.0942 (tiny),
+  t-test p=0.0359 (significant), Wilcoxon p=0.0718 (not significant) -- same
+  disagreement pattern, same small unfavorable effect size.
+Per this project's own established caution about significance without
+magnitude (the budget-extension result's d_z=0.076 precedent, referenced when
+this harness was built): both effect sizes here are in that same negligible
+range -- even where one test nominally clears p<0.05, the practical
+difference is small AND in the wrong direction.
+
+Harness's own verdict (models/l2_n500_eval_result.json): beats_twap_passthrough
+= false, beats_pure_twap = false. Required bar (beat TWAP-passthrough, both
+tests agreeing, p<0.05 each) is NOT met.
+
+Worth noting for whoever picks this up next: the in-training ValISEvalCallback
+signal (n=10/firing, noisy) sat much higher (mostly 2.5-4.0 over the run's
+back half) than this real n=500 read (1.23) -- the small-n training-time
+signal overstated how bad things looked, though the real, larger-sample
+answer is still "did not beat baseline," just by a smaller and statistically
+murkier margin than the noisy signal suggested.
+
+scripts/replay_episode.py (built and verified during the training run, see
+prior entry below) is available for a qualitative look at individual
+episodes -- not run this round.
+
+Reported plainly, no further action taken this round -- whoever owns next
+steps decides whether to revisit reward shaping, training budget, or
+architecture given this result.
+
+PRIOR ENTRY BELOW, for context on the training run itself:
+
 Last updated: 2026-08-26 06:36 HKT
 State: REAL 2,000,000-STEP TRAINING RUN COMPLETE. run_name=l2v1_20260825, ran
 ~29.34h wall-clock (105,630s), total_timesteps=1,999,974. Throughput held
