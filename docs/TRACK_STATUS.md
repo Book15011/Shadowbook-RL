@@ -300,6 +300,94 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-27 00:58 HKT
+State: REWARD REDESIGN IMPLEMENTED, RE-MEASURED, AND SHAKEDOWN-VERIFIED.
+Real multi-day training run NOT launched -- stopping here for review per
+explicit instruction. Test split still unspent.
+
+TASK 1 (implement): src/envs/l2_reward.py (new) -- potential-based
+mark-to-market IS shaping, Phi(t) = -kappa*compute_implementation_shortfall(
+episode_fills_so_far, ..., terminal_mid_price=CURRENT mid).is_total_bps,
+reward = Phi(t)-Phi(t-1). Reuses compute_implementation_shortfall() as-is
+(not re-derived), so telescoping to the real terminal IS is exact by
+construction, not approximate. Wired into FrozenL3Wrapper via new
+l2_reward_mode param (default "l3_passthrough", unchanged existing
+behavior; opt-in "potential_is_shaping") and train_l2.py's new
+--l2-reward-mode CLI flag (same two choices). tests/test_l2_reward.py:
+4 hand-computed pure-function tests, plus the hard gate --
+test_potential_is_shaping_telescopes_exactly_on_real_episodes, 5 real
+episodes, real frozen L3 checkpoint, summed shaped reward vs
+-kappa*terminal_is within 1e-6 -- PASSED. Scale/variance sanity test (20
+real episodes, both modes): new reward is tighter (mean|r|=0.4207) than old
+(mean|r|=0.9046), not wildly different -- PASSED. Full suite: 50/50 passed
+(112.71s), including all 43 pre-existing tests unchanged. Committed f728772.
+
+TASK 2 (re-measure): scripts/analyze_l2_reward_components_v2.py, same
+methodology as the original 100-real-val-episode / TWAP-passthrough-action
+measurement. Headline confirmed: terminal-IS-derived signal is now 100% of
+net reward and 100% of magnitude by construction (vs 6.9%/11.6% under
+l3_passthrough). Internal composition of that signal (exec/opportunity/fees
+sub-terms, per-window Phi-deltas, 3260 windows): by magnitude opp 80.4%,
+exec 12.8%, fees 6.8%. fees deltas are one-signed (fee_bps_per_fill*
+fill_ratio is monotonic non-decreasing over an episode) -- abs-total equals
+signed-total exactly, a small steady drag, not a variance source. opp/exec
+show heavy signed-vs-abs cancellation, confirming the shaping now supplies a
+dense, market-linked per-window signal rather than a single terminal
+payout -- the intended mechanism of potential-based shaping on an otherwise
+sparse terminal reward. Committed ba5840f.
+
+TASK 3 (shakedown, ~57 real minutes wall-clock, run_name=l2rewardshakedown1,
+--n-envs 6, --total-timesteps 65000, --l2-reward-mode potential_is_shaping,
+full production path -- real frozen L3 checkpoint sha256-verified against
+the doc-recorded value, real numeric-format data, eval on, checkpoint at
+default 50,000-step cadence):
+- Throughput: ~18.97 dec/s steady-state (64,938 timesteps / 3,423s at the
+  final logged point), matching the real l2v1_20260825 run's own 18.93 dec/s
+  baseline within noise -- the new reward mode does not change per-step cost
+  materially.
+- 0 tracebacks/errors/NaNs anywhere in the full log.
+- Checkpoint mechanics confirmed correct: fired at 49,998 steps, all three
+  expected files present (model 3,459,861 bytes; replay buffer 174,001,374
+  bytes, matching the known fixed ~174MB footprint; vecnormalize 3,997
+  bytes).
+- ValISEvalCallback fired all 6 expected times (steps 10002/20004/30006/
+  40008/50010/60012), each completing cleanly against the paired-seed
+  TWAP-passthrough baseline (0.9976 IS_total_bps). L2's own eval numbers
+  this early (2.07-3.62 IS_total_bps) are NOT a performance signal -- 65k of
+  what would be a multi-million-step budget, mechanics check only, no
+  conclusion drawn from them.
+- Canonical-checkpoint guard worked exactly as designed: models/
+  l2_strategist_v1.zip / l2_vecnormalize.pkl (the real l2v1_20260825
+  checkpoint) were correctly left untouched (--overwrite-canonical not
+  given); final save went to models/l2_strategist_v1_l2rewardshakedown1.zip
+  / l2_vecnormalize_l2rewardshakedown1.pkl instead, confirmed by direct
+  listing.
+- Memory: NOT fully re-verified this round -- only one spot-check was taken
+  (main process RSS ~4.08GB at ~350s elapsed via a fresh ps snapshot), not a
+  continuous trend the way the real 29h run's own explicit RSS tracking
+  was. No crash/OOM occurred (clean run to completion is itself evidence
+  against a fast leak), and the new reward path adds only a single float
+  (self._l2_prev_phi) per env and reuses the existing
+  compute_implementation_shortfall() call already made every step under the
+  old mode -- no new persistent buffers, so no structural reason to expect
+  a regression versus the old mode's already-confirmed-stable ~22.7GB at
+  n_envs=6. Flagged honestly as a gap, not asserted as measured.
+
+Files touched this round: src/envs/l2_reward.py (new), src/envs/wrappers.py
+(pure insertion, +52/-0), src/train/train_l2.py (pure insertion, +20/-0),
+tests/test_l2_reward.py (new), scripts/analyze_l2_reward_components_v2.py
+(new). All committed locally, nothing pushed to origin/master.
+
+STOPPING HERE FOR REVIEW per explicit instruction -- the real multi-day run
+was not launched. If/when it is: TWAP-passthrough stays the valid eval
+baseline (never touches L2's reward either way); this run's checkpoint
+under the new reward is NOT training-reward-comparable to l2v1_20260825's;
+run the identical diagnostic battery (n=500 eval, the three post-mortem
+diagnostics, volatility-stratified bucketing) before drawing any conclusion,
+no shortcuts because the reward changed. Test split remains untouched.
+
+PRIOR ENTRY BELOW, for the design-only round's own context:
+
 Last updated: 2026-08-27 12:30 HKT
 State: L2 REWARD REDESIGN -- DESIGN ONLY, NOT IMPLEMENTED, NO TRAINING RUN.
 Full detail: docs/reports/l2_reward_redesign_proposal.md (new, committed
