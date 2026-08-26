@@ -48,6 +48,17 @@ written (see that doc's own implementation-note addendum for the first two):
    before calling env.reset() -- see reset()'s own comment for why this matters for both
    training (a real cross-episode leak) and eval (undermines paired-seed
    reproducibility specifically).
+
+L2_REWARD_MODE (2026-08-27, docs/reports/l2_reward_redesign_proposal.md): a fifth,
+opt-in change, same convention as correction 3's l3_deterministic -- defaults to prior
+behavior, nothing changes unless deliberately selected. `l2_reward_mode="l3_passthrough"`
+(default) is exactly the old behavior: `agg_reward` is the raw sum of L3's own
+per-tick step_reward() across the window. `l2_reward_mode="potential_is_shaping"`
+replaces that sum with src.envs.l2_reward's potential-based mark-to-market IS shaping --
+see that module's own docstring for why this exists (measured: r_stale alone was 85.6%
+of L2's reward under l3_passthrough, a component L2 does not control) and for the exact
+telescoping guarantee (Phi(t)-Phi(t-1), summing to EXACTLY -kappa*terminal_is_total_bps
+over a full episode, not approximately).
 """
 from __future__ import annotations
 
@@ -58,7 +69,10 @@ import numpy as np
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
+from src.envs.l2_reward import l2_window_reward
 from src.envs.lob_execution_env import LOBExecutionEnv, _OBS_SPEC
+
+_L2_REWARD_MODES = frozenset(("l3_passthrough", "potential_is_shaping"))
 
 # --- Index-mapping, per docs/reports/phase4_l2_reconciliation_and_plan.md FINAL SPEC 2a/2e. ---
 # Old _OBS_SPEC indices 15/16 (l2_target_slice_ratio, l2_urgency) are excluded -- L2
@@ -161,11 +175,21 @@ class FrozenL3Wrapper(gym.Wrapper):
         ticks_per_l2_decision: int = 50,
         l2_include_prev_action: bool = False,
         l3_deterministic: bool = False,
+        l2_reward_mode: str = "l3_passthrough",
     ) -> None:
         super().__init__(env)
         self.l3_model = l3_model
         self.n_ticks = ticks_per_l2_decision
         self.l2_include_prev_action = l2_include_prev_action
+        if l2_reward_mode not in _L2_REWARD_MODES:
+            raise ValueError(f"l2_reward_mode must be one of {sorted(_L2_REWARD_MODES)}, got {l2_reward_mode!r}")
+        self.l2_reward_mode = l2_reward_mode
+        # Phi(t-1) for potential_is_shaping -- see l2_reward.py's module docstring for why
+        # 0.0 is the EXACT correct initialization (not an approximation): fill_ratio=0 and
+        # arrival_price IS the episode-start tick's own mid_price by construction
+        # (LOBExecutionEnv.reset()), so Phi(0)'s opportunity term is a literal same-value
+        # subtraction, exactly 0.0. Re-zeroed in reset(), see there.
+        self._l2_prev_phi: float = 0.0
         # Controls the FROZEN L3 policy's own inner predict() calls -- separate from
         # whatever determinism the caller (e.g. SAC training vs. an eval callback) uses
         # for its OWN action selection. False (stochastic sampling) by default, matching
@@ -223,6 +247,13 @@ class FrozenL3Wrapper(gym.Wrapper):
         # because its first observation differed).
         self.env.l2_target_slice_ratio_override = None
         self.env.l2_urgency = 0.5
+        # Phi(t-1) reset to 0.0 for potential_is_shaping -- see __init__'s own comment
+        # and l2_reward.py's module docstring for why this is exact, not approximate.
+        # Cross-episode leak risk here is the same class of bug corrections 3/4 above
+        # already fixed for l2_target_slice_ratio_override/l2_urgency -- reset unconditionally
+        # regardless of which l2_reward_mode is active (cheap, and keeps this state never
+        # silently stale if the mode is switched on a reused instance).
+        self._l2_prev_phi = 0.0
         obs, info = self.env.reset(**kwargs)
         self._l3_obs = obs
         self._last_info = info
@@ -290,6 +321,27 @@ class FrozenL3Wrapper(gym.Wrapper):
 
         self._l3_obs = l3_obs
         self._last_info = info
+
+        if self.l2_reward_mode == "potential_is_shaping":
+            # Replaces agg_reward entirely -- does not add to it. self.env._episode_fills
+            # is the SAME cumulative list LOBExecutionEnv.step() itself passes to
+            # compute_implementation_shortfall() at the real terminal tick, and info["mid_price"]
+            # (built from self.env._current_tick(), i.e. self.env._ticks[self.env._tick_idx]
+            # AFTER that tick's own increment) is the SAME tick LOBExecutionEnv.step() uses for
+            # terminal_tick.mid_price when this window happens to be the terminal one -- see
+            # l2_reward.py's module docstring for why this makes Phi(T) bit-identical to the
+            # real terminal IS, not merely close, and the telescoping sum therefore exact.
+            agg_reward, self._l2_prev_phi = l2_window_reward(
+                prev_phi=self._l2_prev_phi,
+                side=self.env.side,
+                episode_fills=self.env._episode_fills,
+                qty_total=self.env.qty_total,
+                arrival_price=self.env.arrival_price,
+                current_mid_price=info["mid_price"],
+                fee_bps_per_fill=self.env.fee_bps_per_fill,
+                kappa=self.env.reward_weights.kappa,
+            )
+
         l2_obs = _downsample_window(
             np.asarray(window_obs, dtype=np.float32), info, self.env.horizon_ticks,
             l2_action if self.l2_include_prev_action else None,

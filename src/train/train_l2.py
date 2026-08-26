@@ -178,6 +178,7 @@ def make_l2_wrapped_env(
     data_dir: str = "data/raw_l2_bybit/BTCUSDT",
     l3_deterministic: bool = False,
     use_numeric_format: bool = False,
+    l2_reward_mode: str = "l3_passthrough",
 ) -> FrozenL3Wrapper:
     # data_dir defaults to LOBExecutionEnv's own default -- exposed as a parameter (not
     # previously) so tests can point this at a small synthetic data_dir instead of the
@@ -201,6 +202,7 @@ def make_l2_wrapped_env(
         ticks_per_l2_decision=ticks_per_l2_decision,
         l2_include_prev_action=l2_include_prev_action,
         l3_deterministic=l3_deterministic,
+        l2_reward_mode=l2_reward_mode,
     )
 
 
@@ -231,6 +233,7 @@ def make_l2_subproc_env(
     l3_checkpoint_path: str,
     l3_vecnormalize_path: str,
     seed: int,
+    l2_reward_mode: str = "l3_passthrough",
 ) -> Callable[[], FrozenL3Wrapper]:
     """SubprocVecEnv worker factory for real (vectorized) training -- ported from
     scripts/benchmark_controlled_numeric.py's make_env(), not a fresh design. Returns a
@@ -248,6 +251,7 @@ def make_l2_subproc_env(
             date_range, horizon_ticks, lookback_ticks,
             l3_model, l3_vecnormalize_path, ticks_per_l2_decision, l2_include_prev_action,
             data_dir=data_dir, use_numeric_format=use_numeric_format,
+            l2_reward_mode=l2_reward_mode,
         )
 
     return _init
@@ -579,6 +583,21 @@ def build_parser() -> argparse.ArgumentParser:
         "already selects the correct default path.",
     )
     parser.add_argument(
+        "--l2-reward-mode", type=str, default="l3_passthrough",
+        choices=["l3_passthrough", "potential_is_shaping"],
+        help="l3_passthrough (default): FrozenL3Wrapper sums L3's own raw per-tick "
+        "step_reward() over each window, unchanged since the vectorization round -- "
+        "measured (scripts/analyze_l2_reward_components.py) to be 85.6% r_stale, a "
+        "component L2 does not control, vs. 6.9% terminal-IS-derived signal. "
+        "potential_is_shaping: src/envs/l2_reward.py's potential-based mark-to-market IS "
+        "shaping instead -- see docs/reports/l2_reward_redesign_proposal.md for the full "
+        "design and why this doesn't inherit the TWAP-baseline reward's own documented "
+        "L3 failure (docs/reports/l3_twap_baseline_reward.md). A reward change means a "
+        "checkpoint trained under one mode is not training-reward-comparable to one "
+        "trained under the other -- TWAP-passthrough stays the valid eval baseline "
+        "either way, since it never touches L2's reward at all.",
+    )
+    parser.add_argument(
         "--eval", action=argparse.BooleanOptionalAction, default=True,
         help="Periodic held-out-val evaluation (ValISEvalCallback) against a fixed "
         "TWAP-passthrough baseline. Defaults ON -- a real multi-day run (see "
@@ -793,6 +812,7 @@ def main() -> None:
             args.ticks_per_l2_decision, args.l2_include_prev_action,
             args.data_dir, args.use_numeric_format,
             args.l3_checkpoint, args.l3_vecnormalize, worker_seed,
+            l2_reward_mode=args.l2_reward_mode,
         )
         for i in range(args.n_envs)
     ])
