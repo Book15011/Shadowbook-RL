@@ -300,6 +300,119 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-27 06:40 HKT
+State: CORRECTION to the prior entry's Diagnostic 2 conclusion, plus a new
+split-representativeness check that turned up a project-wide concern, not
+just an L2 one. No retraining, no checkpoint changes, test split's own
+per-episode evaluation still untouched (its raw market data was read for
+descriptive stats only -- see below for why that's a different thing).
+
+CORRECTION (Task 1): the prior entry's "no learnable signal, not overfitting"
+verdict was drawn from the WRONG comparison -- L2's absolute number staying
+flat between train (1.2384) and val (1.2330). That's the wrong test when the
+baselines themselves moved (TWAP-passthrough 1.0237->1.4916, Pure TWAP
+0.8893->1.2555 -- train days are harder overall). The RIGHT comparison is
+L2 relative to each baseline within its own split:
+  L2 - TWAP-passthrough:  val=+0.2094 (worse)   train=-0.2532 (better)
+  L2 - Pure TWAP:          val=+0.3438 (worse)   train=-0.0171 (~tie)
+Re-tested properly with a cross-split significance test (Welch's t + Mann-
+Whitney U comparing the per-episode diff distributions from each split, not
+just eyeballing two point estimates): the sign flip vs TWAP-passthrough IS
+real (Welch t=-2.4656 p=0.0138, Mann-Whitney p=0.0137) -- a genuine ~0.46bps
+swing, not noise. The sign flip vs Pure TWAP is NOT distinguishable from
+noise (Welch p=0.459, Mann-Whitney p=0.548) -- Pure TWAP's variance is much
+higher on train (std=10.24 vs 3.65 on val) and swamps it. TWAP-passthrough
+is the cleaner comparison anyway (same L3 wrapper both arms; only L2's
+steering differs), so this is the one that matters. Retracting "no learnable
+signal" -- it does not hold up under the correct comparison.
+
+TASK 2 -- is this real overfitting, or is val a harder regime (the
+competing explanation)? Built scripts/analyze_split_representativeness.py
+(new, committed 904d5bb) -- day-level realized_vol/mean_spread/|return|
+computed directly from the raw price series (read_day(), no model
+inference, no episode evaluation) for all 405 train days, 18 val days, and
+(descriptive only) the 18 test days.
+Result: val is NOT choppier/wider-spread than train -- it is significantly
+CALMER on every metric (val's mean sits at train percentile 23.7 for
+realized_vol, 27.4 for mean_spread, 32.8 for |return|; Mann-Whitney
+p=0.0004/0.0019/0.0065). This is the OPPOSITE direction from what the naive
+"(b) val is choppier" explanation needs -- so as literally stated, (b) is
+rejected; the raw premise that val is a harder regime is false.
+But a deeper check (restricting TRAIN episodes to only the 231/405 days
+that fall within val's own volatility range, matching regimes rather than
+splits) found something more specific: train's own -0.2532bps advantage
+over passthrough is NOT uniform across train -- on volatility-matched-to-val
+train days it shrinks to -0.0129bps (n=292, t-test p=0.937, not
+significant), i.e. essentially the same regime-conditional advantage val
+itself would need to show for "no overfitting" to hold. Comparing this
+CALM-MATCHED train subset directly against val (both now covering the same
+volatility range): residual swing = -0.2223bps (vs the original -0.4626bps
+before matching) -- about 52% of the original swing is explained by
+train's own aggregate being pulled by its higher-volatility days, which
+val has no counterpart for at all (val's own volatility max, 0.1882, sits
+below train's median). The remaining ~48% residual, while still pointing
+the same direction (train even matched-regime nominally beats val), is
+itself NOT statistically significant at this smaller matched sample (Welch
+t=-1.079 p=0.281, Mann-Whitney p=0.095).
+VERDICT: (c), both contribute, and roughly in proportion: ~52% regime
+confound (NOT the specific "val is choppier" mechanism hypothesized --
+rather "train's own high-volatility tail inflates its aggregate advantage
+in a way val's narrower, calmer range never gets to demonstrate either
+way"), ~48% residual that is directionally consistent with genuine
+memorization/overfitting but not itself confirmed at the achievable n. This
+is a real correction to a real correction: the swing is genuine (Task 1),
+but it is NOT cleanly "textbook overfitting" once regime is controlled for
+-- it is a mix, and the overfitting component specifically is suggestive,
+not proven.
+
+TASK 3 -- what this means beyond L2, stated plainly, not softened: val's
+18 days are not just "not choppier than train" -- they are a NARROW slice
+of train's overall regime diversity. Val's own realized_vol range
+([0.058, 0.188]bps) sits entirely inside roughly train's bottom third
+(train's own max is 0.984, over 5x higher); val never samples the more
+volatile days that make up a real fraction of train's 405-day distribution.
+EVERY conclusion in this project measured on val alone (L3's own "ties
+TWAP" result, the REPLACE-has-no-value finding, the TWAP-baseline A/B) was
+therefore only tested in this same narrow, calm-skewed slice of market
+conditions -- none of them have been checked against the wider volatility
+range that a real 405-day (or longer, in production) history actually
+contains. This is a genuine, previously-unstated scope limitation, not a
+claim that any of those results are wrong: it means "ties TWAP" etc. should
+be read as "ties TWAP in calm-to-moderate conditions, unverified beyond
+that," not as a general claim across all regimes. A final writeup should
+carry this caveat explicitly rather than treat val-measured results as
+settled across the board.
+Test-split recommendation (recommending only, not acting): test's own
+day-conditions percentiles (21.5 vol / 45.2 spread / 51.6 |return|, vs
+val's 23.7/27.4/32.8) put it CLOSER to train's median than val on spread
+and return, though similarly calm on volatility specifically. Spending test
+now would be a genuine, useful independent confirmation point -- a
+different calendar window reduces the "got an unlucky/lucky 18-day draw"
+risk that a single held-out window always carries. It would NOT resolve the
+deeper volatility-representativeness gap above, since test also skews calm
+on that specific axis (percentile 21.5, close to val's own 23.7) -- no
+existing split samples train's genuinely volatile tail at all. If someone
+wants that question answered, it needs a deliberately volatility-stratified
+check (e.g. evaluating against train's own high-volatility subset directly,
+same technique used above), not spending test. Recommend: worth spending
+test soon as one more confirmatory read given the project is at a real
+decision point on L2, but go in knowing it answers "does this replicate on
+different dates," not "does this hold up in volatile regimes" -- those are
+different questions and test cannot resolve the second one either.
+
+Files: scripts/analyze_split_representativeness.py (new, committed 904d5bb).
+Output artifacts left uncommitted, same precedent as prior entries:
+models/l2_day_conditions_{train,val,test}.csv. The Task 1 cross-split test
+and Task 2's regime-matching residual test were one-off analyses (not
+committed as reusable scripts) built directly on the already-saved
+models/l2_diagnostics_{val,train}_episodes.csv -- numbers recorded here in
+full since the scripts themselves weren't kept.
+
+Reported, not acted on further -- test-split spend is a recommendation, not
+a decision made here. Whoever owns next steps decides.
+
+PRIOR ENTRY BELOW, for context on the post-mortem diagnostics themselves:
+
 Last updated: 2026-08-26 10:05 HKT
 State: POST-MORTEM DIAGNOSTICS COMPLETE on the n=500 negative (prior entry
 below). Three diagnostics, all cheap (no retraining), scripts/eval_l2_diagnostics.py
