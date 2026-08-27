@@ -300,6 +300,84 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-28 12:15 HKT
+State: REAL 2,000,000-STEP RUN UNDER NEW REWARD COMPLETE
+(run_name=l2v2_potentialis_20260827, --l2-reward-mode potential_is_shaping).
+Ran 105,219s (~29.23h), total_timesteps=1,999,992 -- essentially identical
+wall-clock to l2v1_20260825's 29.34h, confirming the new reward does not
+change per-step cost materially. Mechanically clean start to finish: all 40
+checkpoints landed on the expected ~44-min/49,998-step cadence with no gaps,
+0 tracebacks/errors/NaN matches anywhere in the full log, canonical
+checkpoint guard worked correctly (models/l2_strategist_v1.zip untouched --
+final save went to models/l2_strategist_v1_l2v2_potentialis_20260827.zip /
+l2_vecnormalize_l2v2_potentialis_20260827.pkl as expected without
+--overwrite-canonical). Not evaluated yet -- n=500 eval and the full
+diagnostic battery are a separate round; test split untouched throughout.
+
+IMPORTANT CAVEAT ON THE FINAL CHECKPOINT -- late-run critic divergence,
+found live during monitoring, NOT a mechanical crash: critic_loss was
+normal (~1-2) through step ~1,600,000 (80% through training), then began
+climbing roughly exponentially for the remaining ~400,000 steps, reaching
+10,800 at the final logged point (step 1,999,992). actor_loss moved in
+lockstep (4 -> 376). ent_coef, which had fallen to near-zero by ~1.2M steps
+(the positive divergence from l2v1's own climbing ent_coef reported
+earlier -- see below), reversed and climbed back to 0.163 by the end,
+consistent with the critic no longer providing coherent value estimates for
+the entropy auto-tuning to react to. No NaN ever appeared (0 matches, full
+log checked), so this stopped short of an outright numerical crash, but the
+FINAL checkpoint's policy should be treated as potentially degraded by this
+-- do not assume later-in-training means better here. A clean checkpoint
+from immediately before the divergence onset exists: models/l2_checkpoints/
+l2_sac_l2v2_potentialis_20260827_1599936_steps.zip (critic_loss ~1-2 at
+save time). Recommend evaluating BOTH the final save and this pre-
+divergence checkpoint in the eventual n=500 round rather than assuming the
+final one is the right candidate.
+
+Root cause not diagnosed this round (out of scope -- reported live,
+training was not intervened on since so little of the run remained once
+detected). Plausible contributors, not established: Q-value overestimation
+compounding late in training (a known SAC/DDPG-family failure mode) possibly
+interacting with the new reward's own dynamics over long horizons in a way
+the ~57min/65,000-step shakedown (Task 3 of the implementation round, see
+PRIOR ENTRY BELOW) could not have caught -- that shakedown validated
+mechanics and short-run reward scale, not million-step-horizon training
+stability, and the divergence onset (~1.6M steps) is well past anything a
+1-hour shakedown reaches.
+
+ent_coef trend vs l2v1 at matching steps, tracked live during this round
+(diagnostic requested going into this run, not itself a performance claim):
+  step ~76k:    new 0.00279  vs l2v1 0.0057   (~2x lower)
+  step ~191k:   new 0.00118  vs l2v1 0.0082   (~7x lower)
+  step ~1.23M:  new 0.000579 vs l2v1 0.0334   (~58x lower, still falling)
+  step ~1.9M+:  new reversed upward to 0.163, coinciding with the critic
+                divergence above -- the earlier falling trend did NOT hold
+                through the full run, so it should not be read as a clean
+                "more learnable signal" signal on its own; it's confounded
+                by the late instability.
+
+Held-out eval (ValISEvalCallback, paired seeds 5000000..5000009 vs
+TWAP-passthrough baseline 0.9976 IS_total_bps, fired every 10,000 steps,
+~200 firings total): NOT a clean improvement story across the run. Mean
+IS_total_bps oscillated 2.5-3.5 bps for most of training (worse than
+baseline throughout), reached its single worst 10-firing block average
+(3.34 bps) around steps 1.0M-1.1M, and only in the last ~500k steps before
+the divergence settled into a modestly lower, still-noisy band (~2.1-2.5
+bps) -- still 2-2.5x worse than baseline. A few sharp unexplained
+collapses (steps ~670k, ~900k-970k) briefly dropped eval IS below baseline
+(0.4-0.6 bps) then reverted to 3+ on the very next firing -- read as
+instability, not a discovered edge. No conclusion about final policy
+quality should be drawn from these training-time firings; that is what the
+separate n=500 round is for.
+
+Next planned step (separate round, not started): n=500 evaluation against
+the pre-registered bar (beat TWAP-passthrough), run on BOTH the final
+checkpoint and the pre-divergence ~1.6M checkpoint, followed by the same
+diagnostic battery run on the original negative (post-mortem diagnostics,
+volatility-stratified bucketing) if either checkpoint's n=500 result
+warrants it. Test split stays untouched until then.
+
+PRIOR ENTRY BELOW, for the reward-redesign implementation round's own context:
+
 Last updated: 2026-08-27 00:58 HKT
 State: REWARD REDESIGN IMPLEMENTED, RE-MEASURED, AND SHAKEDOWN-VERIFIED.
 Real multi-day training run NOT launched -- stopping here for review per
