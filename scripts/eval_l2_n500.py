@@ -47,16 +47,37 @@ Run (real, only after training completes):
 """
 from __future__ import annotations
 
+import os
+
+# Thread-capping is MANDATORY, not an optimization -- see src/train/train_l2.py's own
+# module docstring point 1: an earlier un-thread-capped attempt at torch/BLAS-backed
+# vectorized eval this project measured 7-9x SLOWER from oversubscription (N threads
+# each spinning up a full-width BLAS/OMP pool on a shared, finite core count). This
+# script is single-process/single-env, not vectorized, but torch/sb3_contrib still spin
+# up a full-width thread pool by default at import time -- confirmed directly: an
+# unmodified n=500 run measured 1,353% CPU (of 1,600% available on a 16-vCPU box) for
+# what should be single-threaded work, taking 33 minutes to produce zero output before
+# being killed. Must be set before torch is imported anywhere (transitively, via
+# sb3_contrib/stable_baselines3 below), so this sits above every other import, same
+# placement as train_l2.py's own fix.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import argparse
 import json
 import time
 from typing import Any, Callable
 
 import numpy as np
+import torch
 from scipy import stats
 from sb3_contrib import RecurrentPPO
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+torch.set_num_threads(1)  # defense-in-depth -- see comment above the env vars
 
 from scripts.phase2a_sanity_suite import TWAPPolicy, run_episode
 from src.data.split import load_split

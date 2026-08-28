@@ -36,13 +36,27 @@ Run: PYTHONPATH=. .venv/bin/python -m scripts.eval_l2_bucketed \\
 """
 from __future__ import annotations
 
+import os
+
+# Thread-capping is MANDATORY, not an optimization -- see eval_l2_n500.py's own comment
+# at this same location for the measured 1,353%-CPU/33-minute/zero-output incident this
+# fixes. Must be set before torch is imported anywhere (transitively, below), so this
+# sits above every other import, same placement as train_l2.py's own fix.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import argparse
 import json
 
 import pandas as pd
+import torch
 from sb3_contrib import RecurrentPPO
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+torch.set_num_threads(1)  # defense-in-depth -- see comment above the env vars
 
 from scripts.eval_l2_n500 import (
     EVAL_SEED_BASE,
