@@ -150,12 +150,11 @@ _SMOKE_TEST_MAX_TIMESTEPS = 10_000  # guards against --smoke-test + a real-sized
 NUMERIC_DATA_DIR = "data/raw_l2_bybit_numeric/BTCUSDT"
 PARQUET_DATA_DIR = "data/raw_l2_bybit/BTCUSDT"
 
-# Shared between VecNormalize's own gamma-scaled reward discounting and SAC's own gamma
-# -- these MUST match (VecNormalize's reward normalization uses a running discounted
-# return estimate, gamma-scaled the same way the algorithm's own returns are), so this is
-# a single named constant rather than two separately-typed literals that could drift.
-# Re-derived value (not Section 4.1's reference) -- see the SAC() call below for the
-# derivation.
+# Default for --gamma (both VecNormalize's own gamma-scaled reward discounting and
+# SAC's own gamma read from the SAME --gamma value at runtime -- see that flag's own
+# help text for the derivation and the flagged-but-never-ablated 0.983 alternative).
+# Named constant so the default is documented in one place rather than a bare literal
+# inside build_parser().
 L2_GAMMA = 0.995
 
 
@@ -541,6 +540,21 @@ def build_parser() -> argparse.ArgumentParser:
         "caught in review, not by a test.",
     )
     parser.add_argument(
+        "--gamma", type=float, default=L2_GAMMA,
+        help="SAC discount factor, also threaded into VecNormalize's reward-return "
+        "scaling (same value required for both -- see the VecNormalize construction "
+        "below). Default (0.995) is L2_GAMMA, re-derived on L2's own cadence in "
+        "docs/reports/phase4_l2_reconciliation_and_plan.md Appendix B.3: effective "
+        "horizon 1/(1-0.995)=200 decisions, ~3.3x the ~60-decision-max episode length "
+        "(horizon_ticks/ticks_per_l2_decision), confirmed as a starting value with an "
+        "explicit ablation flagged, not a fully closed question. That same appendix "
+        "names gamma=0.983 (effective horizon ~=59, matching episode length) as the "
+        "concrete alternative worth testing once real training unblocks -- exposed here "
+        "as a CLI flag rather than left as an inherited, unablated constant so that "
+        "ablation can actually happen, and so any run's own printed resolved config is "
+        "a complete record of which value it used.",
+    )
+    parser.add_argument(
         "--ticks-per-l2-decision", type=int, default=50,
         help="L2 decision cadence in L3 ticks. architecture_spec.md Section 4.1 and "
         "Section 4.3 are both settled at 50 -- see docs/reports/"
@@ -822,11 +836,12 @@ def main() -> None:
     else:
         # norm_obs=True/norm_reward=True/clip_obs=5.0 match train_l3.py's own
         # VecNormalize exactly -- see module docstring for the real, evidence-based
-        # (not inherited) reasoning behind adding this at all. gamma matches L2_GAMMA
-        # (the SAC() call below), not L3's own gamma -- VecNormalize's reward
-        # normalization uses a gamma-scaled running return estimate, which has to track
-        # the SAME discounting the algorithm training on it actually uses.
-        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=L2_GAMMA)
+        # (not inherited) reasoning behind adding this at all. gamma matches args.gamma
+        # (the SAC() call below, same --gamma CLI value), not L3's own gamma --
+        # VecNormalize's reward normalization uses a gamma-scaled running return
+        # estimate, which has to track the SAME discounting the algorithm training on
+        # it actually uses.
+        vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=5.0, gamma=args.gamma)
 
     gradient_steps = _resolve_gradient_steps(args.n_envs, args.gradient_steps)
     print(f"gradient_steps={gradient_steps} (train_freq=1 step, i.e. once per {args.n_envs}-transition batch)")
@@ -866,7 +881,7 @@ def main() -> None:
             # -- Derived + re-confirmed for L2's real cadence (docs/reports/
             # phase4_l2_reconciliation_and_plan.md FINAL SPEC Step 3) --
             buffer_size=500_000,  # TOTAL transition cap (SB3 divides by n_envs internally, confirmed against source) -- ~8,333 L2-episode-equivalents of coverage, ~25% of the full 2M-step run's transition volume, independent of --n-envs.
-            gamma=L2_GAMMA,  # re-derived on L2's OWN cadence (not L3's tick-level reasoning): effective horizon ~3.3x the 60-decision episode length, defensible given the terminal-IS-dominated reward structure.
+            gamma=args.gamma,  # see --gamma's own help text for the derivation and the flagged-but-never-ablated 0.983 alternative.
             # -- Section 4.1 reference values, carried over as-is -- NOT independently
             # derived for L2 the way the two above were; use as-is per instruction absent a
             # concrete reason not to. --
