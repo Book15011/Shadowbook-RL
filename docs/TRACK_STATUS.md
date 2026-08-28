@@ -300,6 +300,61 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-29 10:15 HKT
+State: THREE-CHECKPOINT n=500 EVALUATION + DIAGNOSTIC BATTERY COMPLETE.
+Full detail: docs/reports/l2v2_checkpoint_evaluation_report.md (commit 7037805).
+Test split untouched.
+
+Evaluated l2v2 final (step 1,999,992), l2v2 pre-divergence (step 1,599,936),
+and l2v1 mid-run (step 499,980, critic_loss~26) at n=500 against
+TWAP-passthrough (1.024) and pure TWAP (0.889). None beat the pre-registered
+bar (both t-test AND Wilcoxon significant). Results: l2v2 final=1.227
+(Wilcoxon-only significant, p=0.0045, fails "both agree"), l2v2
+pre-divergence=1.117 (best, neither test significant -- statistically
+indistinguishable from baseline), l2v1 mid-run=1.177 (neither significant).
+
+Direct paired checkpoint-vs-checkpoint comparisons (same seeds) all point
+toward less-diverged checkpoints performing better (l2v2 final worse than
+its own pre-divergence checkpoint by 0.110bps; l2v1 mid-run better than
+l2v2 final by 0.050bps) -- consistent with the critic-divergence finding
+in the prior entry below, but none individually reaches significance at
+n=500 (p>=0.32 throughout).
+
+Full diagnostic battery run on the best performer (l2v2 pre-divergence):
+cross-split relative comparison reproduces the val-worse/train-better
+pattern found on the original checkpoint but weaker (swing=0.434bps vs the
+original ~0.46bps; only Welch's t significant here, p=0.025, not
+Mann-Whitney, p=0.157 -- the original had both agree). Volatility-stratified
+eval (train days, memorization-confounded) shows no strengthening with
+volatility (all |d_z|<0.011), matching the original checkpoint's own
+d_z=-0.011 high-volatility result closely.
+
+Early-stopping question (explicitly asked): evidence is directionally
+consistent across all three pairwise checkpoint comparisons (earlier/
+less-diverged always better) but not statistically established at n=500.
+Reading: stop once critic_loss starts diverging (no evidence continuing
+past that point helps), but early stopping does not turn a losing
+checkpoint into a winning one -- no checkpoint tested beats TWAP-passthrough.
+
+Real bug found and fixed mid-round: scripts/eval_l2_n500.py,
+eval_l2_diagnostics.py, eval_l2_bucketed.py have no thread-capping (unlike
+train_l2.py, fixed for the same issue during vectorization) -- first
+checkpoint attempt ran 33min at 1353% CPU with zero output, killed and
+relaunched with OMP_NUM_THREADS=1/MKL_NUM_THREADS=1/etc, dropped to ~100%
+CPU, completed normally (~46min/checkpoint thereafter). Not yet fixed in
+the scripts themselves -- workaround applied at launch time only, a
+follow-up fix is recommended but wasn't asked for this round.
+
+New script this round: scripts/analyze_l2_relative_comparison.py (commit
+1d4fdf6) -- reusable cross-split (Welch's t + Mann-Whitney on the
+L2-minus-baseline difference distributions) comparison, reimplementing the
+project's earlier ad-hoc Diagnostic-2-correction methodology.
+
+Next planned step: none launched -- reporting and awaiting direction, per
+this round's own scope (no instruction to proceed further was given).
+
+PRIOR ENTRY BELOW, for the completed training run's own context:
+
 Last updated: 2026-08-28 12:15 HKT
 State: REAL 2,000,000-STEP RUN UNDER NEW REWARD COMPLETE
 (run_name=l2v2_potentialis_20260827, --l2-reward-mode potential_is_shaping).
