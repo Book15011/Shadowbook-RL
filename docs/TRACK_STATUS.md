@@ -4,6 +4,25 @@ Shared status file for the concurrent L1/L2/L3 work sessions on this repo.
 Each session owns and updates only its own section -- merge on conflict,
 never overwrite another track's section.
 
+## PROJECT STATE: FINAL (2026-08-29)
+The L2 gamma-ablation round (immediately below) closed the last open question this project was
+pursuing. Full synthesis across all three tracks, headline results, engineering findings,
+negative results with evidence, methodological lessons, and scope/limitations:
+**`docs/reports/PROJECT_FINAL_REPORT.md`**. Start there, not here, for a first read of this
+project -- this file remains the full chronological working log underneath it.
+
+Headline: none of L1/L2/L3, in any combination or configuration tested, beats a plain TWAP
+baseline on execution quality at proper statistical power. The frozen L3 executioner ties TWAP
+(p=0.534/0.653); L2 steering on top of it never improves on it in five checkpoints across two
+reward functions and two discount factors. This is a well-supported negative result, arrived at
+by eliminating six separate candidate explanations one at a time (wrong reward, degraded critic,
+insufficient training, regime mismatch, policy collapse, overfitting) -- see the final report's
+Section 5. The strongest remaining lead for a next attempt is regime coverage: val and test both
+sit in the calm bottom third of train's own volatility range, so nothing here has been tested in
+genuinely volatile conditions.
+
+
+
 ## L1 -- Macro Analyst
 Last updated: 2026-08-25 09:15 HKT
 NOTE: a duplicate session picked up the "fix Ollama + validate real L1 end to
