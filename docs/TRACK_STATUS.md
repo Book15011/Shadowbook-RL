@@ -300,6 +300,54 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-29 15:10 HKT
+State: L2V3 n=500 EVALUATION COMPLETE. Full detail:
+docs/reports/l2v3_checkpoint_evaluation_report.md. Test split untouched.
+
+Result: a stable critic does NOT translate into a better policy here. l2v3
+final (step 1,599,936, critic_loss=0.059, never diverged) scored
+IS_bps=1.169 vs TWAP-passthrough (1.024) -- nominally worse, not
+significant (t_p=0.280, w_p=0.118), fails the pre-registered bar outright
+(wrong direction, not just non-significant). Direct paired comparison
+against l2v2's pre-divergence checkpoint (same reward, same 500 seeds,
+gamma the only difference: 0.983 vs 0.995): no detectable difference
+(mean diff=-0.053bps, d_z=-0.024, t_p=0.592, w_p=0.912) -- l2v2
+pre-divergence remains the best performer found so far (1.117), l2v3 final
+statistically indistinguishable from it.
+
+Answers this round's central question: a numerically well-conditioned
+critic (via gamma=0.983) and a critic that has to be caught pre-divergence
+(gamma=0.995) land at statistically the same held-out execution quality.
+gamma=0.983's practical value is removing the checkpoint-selection problem
+(every checkpoint usable, not just a pre-divergence one), not closing the
+gap to TWAP-passthrough.
+
+Full diagnostic battery (train-vs-val relative, volatility strata) NOT run
+this round -- conditional on clearing the pre-registered bar, which this
+checkpoint did not.
+
+Thread-capping fix (prior round, commit 4d5a544) confirmed working in
+production: 99.8% CPU during this run (vs 1,353% pre-fix), full run
+completed in 40.97min, in line with (marginally faster than) the prior
+round's ~46min/checkpoint runs that used the external-env-var workaround.
+
+Action distribution: actively steering (within-episode std
+participation_mult=0.525, urgency=0.201, both non-trivial), not collapsed
+to a constant action. urgency mean (0.260) well below neutral (0.5) --
+systematically less urgent than TWAP-passthrough's default, without a
+measurable execution-quality payoff.
+
+New script this round: scripts/compare_l2v3_vs_l2v2predivergence.py --
+direct paired checkpoint-vs-checkpoint comparison from two already-computed
+episodes CSVs (no new episodes run), reusable for any future two-checkpoint
+same-seed comparison.
+
+Next planned step: none launched -- reporting and awaiting direction, per
+this round's own scope.
+
+PRIOR ENTRY BELOW, for the gamma-ablation training run's own context:
+
+## L2 -- Strategist
 Last updated: 2026-08-29 13:50 HKT
 State: GAMMA-ABLATION TRAINING RUN COMPLETE. Full detail:
 docs/reports/l2v3_gamma_ablation_training_run_report.md. Test split untouched.
