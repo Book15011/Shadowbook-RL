@@ -300,6 +300,46 @@ between real data and the live orchestration path); (b) once GPU headroom and th
 decision are both confirmed, run the first real (mocked-no-longer) Ollama call through
 L1MacroAnalyst.maybe_refresh() using build_l1_feature_summary()'s real output as input.
 ## L2 -- Strategist
+Last updated: 2026-08-29 13:50 HKT
+State: GAMMA-ABLATION TRAINING RUN COMPLETE. Full detail:
+docs/reports/l2v3_gamma_ablation_training_run_report.md. Test split untouched.
+n=500 evaluation NOT yet run this round -- explicitly deferred per instruction.
+
+Headline result: critic_loss stayed flat (0.048-0.074 band) across the entire
+1,600,000-step budget under gamma=0.983 -- no divergence at any point. Same
+reward (potential_is_shaping) under gamma=0.995 (l2v2) tracked l2v3 closely
+through ~1.3M steps then diverged sharply starting almost exactly at the 1.6M
+mark this run stopped at (critic_loss 47x higher than l2v3's at that same
+step). l2v1 (old reward, gamma=0.995) diverged far earlier and more steadily
+throughout. Consistent with the gamma-as-lever hypothesis, via a corrected
+mechanism (TD-bootstrap-error compounding under near-flat discounting, not
+the truncation-bootstrapping claim originally proposed -- SB3's ReplayBuffer
+already handles truncation correctly, confirmed by reading its source before
+this run launched). Not a seeded ablation (one run per gamma value) -- flagged
+explicitly as a real but not fully closed finding.
+
+Two other tasks completed this round, both prerequisite to the run:
+(1) Thread-capping bug fixed in the three eval scripts (eval_l2_n500.py,
+eval_l2_diagnostics.py, eval_l2_bucketed.py -- commit 4d5a544), matching the
+pattern train_l2.py already had. Previously only worked around at launch time
+via external env vars.
+(2) --gamma exposed as a CLI flag on train_l2.py (commit 2a3eee3, default
+unchanged at 0.995), replacing the previously hardcoded L2_GAMMA module
+constant, so gamma is now actually ablatable and every run's own printed
+resolved config records which value it used.
+
+Mechanical health: 32/32 checkpoints landed on schedule with complete
+model+replay_buffer+vecnormalize triplets, 0 errors in the full log, ~19
+dec/s throughout (matching l2v1/l2v2), final save correctly diverted to
+run-tagged paths (canonical checkpoint and frozen L3 backup both confirmed
+untouched, byte/hash-identical pre- and post-run).
+
+Next planned step: none launched -- reporting and awaiting direction, per
+this round's own scope (n=500 evaluation is a separate round, not started).
+
+PRIOR ENTRY BELOW, for the three-checkpoint evaluation round's own context:
+
+## L2 -- Strategist
 Last updated: 2026-08-29 10:15 HKT
 State: THREE-CHECKPOINT n=500 EVALUATION + DIAGNOSTIC BATTERY COMPLETE.
 Full detail: docs/reports/l2v2_checkpoint_evaluation_report.md (commit 7037805).
