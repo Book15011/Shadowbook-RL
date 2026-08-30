@@ -308,16 +308,26 @@ this environment, at this cadence, with this action space, L2 steering does not 
 exploitable edge over an unsteered, frozen L3** — not because any one identifiable thing was
 broken, but because none of the things that plausibly could have been broken, were, once checked.
 
-*Illustrative figures* (`docs/reports/figures/l2_replay_frozen_seed5000167.png`,
-`l2_replay_l2v3steered_seed5000167.png`): the same seed (same day, quantity, arrival price — a
-near-median outcome for both arms, chosen so as not to cherry-pick a favorable or unfavorable
-episode), run once unsteered and once under L2's final policy. The unsteered run fills the entire
-order in 39 ticks at a flat price (IS=+1.03bps); L2's policy takes a very different path —
-front-loads aggressively (participation multiplier at its 2.0 ceiling for the first 50 ticks),
-throttles down, and finishes over 218 ticks while the market moves through a real drawdown
-(IS=+1.04bps). Two visibly different execution strategies, statistically the same outcome — a
-visual version of Section 5's central finding. These two episodes are illustrative of mechanism,
-not representative of the aggregate — Section 2's n=500 tables are the actual evidence.
+*Illustrative figures* (`docs/reports/figures/`, same seed run twice — once unsteered, once under
+L2's final policy — same day, quantity, and arrival price both times, a near-median outcome for
+both arms, chosen so as not to cherry-pick a favorable or unfavorable episode). Each run has a
+combined overview (`l2_replay_frozen_seed5000167.png`, `l2_replay_l2v3steered_seed5000167.png`)
+plus three larger single-panel versions for detail — full un-rounded prices, and every steering
+decision individually labeled with its exact chosen value — under the `_price.png`, `_execution.png`,
+and `_steering.png` suffixes of the same two base names.
+
+The unsteered run fills the entire order in 39 ticks at a flat price (IS=+1.03bps); L2's policy
+takes a very different path — front-loads aggressively (participation multiplier at its 2.0
+ceiling for the first 50 ticks: D1 in the price/steering figures below), throttles down to 0.21x
+by D2, then 0.33x and 0.70x at D3/D4, and finishes over 218 ticks while the market moves through a
+real drawdown (IS=+1.04bps). Two visibly different execution strategies, statistically the same
+outcome — a visual version of Section 5's central finding. These two episodes are illustrative of
+mechanism, not representative of the aggregate — Section 2's n=500 tables are the actual evidence.
+
+![L2's steering decisions, one at a time, seed 5000167](figures/l2_replay_l2v3steered_seed5000167_steering.png)
+*Every one of L2's 5 decisions in this episode, with the exact participation-rate multiplier and
+urgency value it chose at each — see `_price.png` for how those choices map onto where child
+orders actually landed on the price path.*
 
 ---
 
