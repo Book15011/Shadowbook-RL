@@ -402,7 +402,24 @@ Worth stating on their own because they generalize past this specific project.
 - **L1 was validated end-to-end but never trained against**, and its live signal path into L3
   through the FrozenL3Wrapper used for L2 training was never wired up (Section 1). The LLM tier's
   actual contribution to execution outcomes is completely unmeasured — not "found to be zero," but
-  never tested.
+  never tested. This is a more scoped decision than it looks, for two reasons. **First, an
+  out-of-distribution confound**: the frozen L3 checkpoint was trained entirely with obs idx 17/18
+  (`l1_risk_score`, `l1_confidence`) held at a constant stub value (0.0) — and `l1_risk_score` also
+  directly scales L3's own inventory-holding reward term (`r_inv = -lam * (1 + max(0,
+  l1_risk_score)) * (qty_remaining/qty_total)**2 * dt`, `src/envs/reward.py:302`, confirmed
+  directly in the installed code). Feeding this checkpoint a live, non-zero L1 signal without
+  retraining would not test "does L1 add value" — it would test "does this checkpoint handle an
+  input distribution it never saw," a different and confounded question. A clean test requires
+  retraining L3 itself with live L1 in the loop — LLM inference inside the training loop, at
+  600-tick cadence, across every parallel worker — substantially more expensive than any run in
+  this project, not a small follow-up. **Second, a timescale argument**: L1 produces one
+  macro-regime read roughly every ~60s (600 ticks), while Implementation Shortfall over a single
+  ~3,000-tick (~5-minute) episode is dominated by microstructure the macro read cannot see. L1's
+  only channel to affect outcomes at all is through L2's steering — and L2, with a far more direct
+  and fine-grained lever than L1 could ever supply, already had six independently tested
+  explanations for its own negative result and found no edge under any of them (Section 5). Both
+  points together make "L1 is unmeasured" a considered, scoped decision, not an oversight —
+  closing it properly is a materially bigger undertaking than the wiring gap alone suggests.
 - **The L2 training wrapper computes its target participation ratio once per 50-tick decision
   window** (`FrozenL3Wrapper.step()`, `src/envs/wrappers.py:289`, set once at the top of the
   method before the inner per-tick loop), **while a standalone L3 (no L2 in the loop) recomputes
@@ -436,11 +453,17 @@ could not answer: does any of this generalize beyond calm markets? Given six oth
 were checked and eliminated (Section 5), regime coverage is the remaining, untested, and most
 promising lever — not a new reward, not more training budget, and not a bigger LLM.
 
-Two secondary items, lower priority but cheap given the infrastructure already built: replicate
-the strongest single result (l2v2's pre-divergence checkpoint, or the gamma=0.983 stability
-finding) under at least one independent seed before trusting it further; and actually close the
-L1→L2 wiring gap and run one real, L1-in-the-loop training pass, if only to convert "unmeasured"
-into either "measured and null" or "measured and worth pursuing."
+One secondary item, lower priority but cheap given the infrastructure already built: replicate the
+strongest single result (l2v2's pre-divergence checkpoint, or the gamma=0.983 stability finding)
+under at least one independent seed before trusting it further.
+
+A real L1-in-the-loop test is a separate, larger undertaking, not a cheap follow-up (Section 7's
+out-of-distribution-confound and timescale reasoning) — it requires retraining L3 itself with live
+LLM inference in the training loop, not merely closing the L2 wiring gap. Given L2's own richer,
+higher-frequency lever already found no edge across six independently tested explanations, and
+L1's only channel to affect outcomes runs through that same steering signal, this project's
+judgment is that the expected value of that retraining does not currently justify its cost.
+Recorded here as a documented, scoped open question — deliberately not pursued in this round.
 
 ---
 
