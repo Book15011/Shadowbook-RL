@@ -22,6 +22,63 @@ sit in the calm bottom third of train's own volatility range, so nothing here ha
 genuinely volatile conditions.
 
 
+## L3 -- Execution Predictability (property, not payoff)
+Last updated: 2026-08-31 HKT
+State: COMPLETE. Full detail: docs/reports/l3_execution_predictability_report.md.
+Test split untouched, no retraining, no checkpoint changes.
+
+Question: is frozen L3's placement pattern measurably less predictable than pure TWAP's (TWAP's
+real-world weakness is being trivially predictable/exploitable by adversarial flow)? Answer: yes,
+clearly and consistently, on the same 500 val episodes used throughout this project.
+
+HARD LIMITATION, stated up front and carried through the whole report: LOBExecutionEnv has no
+adversarial participants and no market impact from the agent's own orders (confirmed directly
+against src/envs/matching_engine.py -- walk_market_fill() consumes a fixed historical book
+snapshot with no feedback to later ticks; the queue model's v_trade comes from real historical
+book-depth change, independent of the agent's own presence). This measures a PROPERTY only. It
+cannot and does not show the gap would pay off in a real adversarial market.
+
+Task 1 (descriptive): reconstructed discrete child orders for both arms via
+scripts/replay_episode.py's existing reconstruct_child_orders() (imported, extended not
+reimplemented -- see below). Found and fixed a real distortion before trusting any number: that
+function creates one ChildOrder per FILL EVENT, so TWAP's forced slice-end market completions
+(which routinely walk several thin book levels) fragmented into many same-tick pseudo-orders (13
+fragments for one real decision, in one sampled episode) -- added aggregate_placement_events() to
+merge these before computing placement-pattern metrics. Gap-timing per-episode CoV: L3=2.27 vs
+TWAP=0.79 (L3 ~2.9x less regular). Price offset: TWAP is a literal exact constant (std=0.0, every
+placement, confirmed from TWAPPolicy's own hardcoded offset_idx=5) vs L3's real spread (std=2.63
+ticks). Clearly different -- Task 2 warranted and run.
+
+Task 2 (classifier): RandomForestClassifier (50 trees, depth 8, deliberately shallow), same
+symmetric feature set for both arms (recent mid-price returns, spread level/change, own
+qty-remaining fraction, own elapsed-time fraction, ticks since own last fill/placement, current
+order_type), episode-level train/test split (400/100 episodes, seeds 5,000,000-5,000,399 train /
+5,000,400-5,000,499 test). Primary target: next-tick order_type (NOT the full action -- TWAP's
+offset is a hardcoded constant, so including it in the primary target would manufacture the
+result; offset/size reported as separate secondary classifiers instead, exactly to keep the
+by-construction artifact visible and separate from genuine timing signal).
+
+Results: order_type test_acc TWAP=0.9965 (0.18pts above its own 99.47% majority baseline --
+genuinely at ceiling) vs L3=0.7831 (20.3pts above its own 58.0% baseline -- real learnable
+structure, but nowhere near TWAP's regularity). Headline gap: -0.2134 (21.3 points). Secondary:
+offset given LIMIT/REPLACE -- TWAP 100.0%/100.0% (mechanical, by construction, flagged explicitly
+as not evidence of genuine flow-predictability) vs L3 barely above baseline (+1.3pts, close to
+unpredictable from this feature set). Size given placement -- TWAP +26.9pts over baseline
+(follows a smooth deterministic formula) vs L3 +4.1pts. Consistent across all three sub-metrics:
+TWAP at or near ceiling, L3 not.
+
+Engineering: scripts/analyze_predictability.py (new). scripts/replay_episode.py extended, not
+reimplemented -- install_tick_capture() factored out of install_capture() for reuse on a bare env
+(behavior-preserving, its own 7 tests pass unchanged), ChildOrder.placed_size added. New
+dependency: scikit-learn==1.9.0 (added to pyproject.toml, was not previously declared).
+
+Limitations: tick-level lag features, not a sequence model (a fuller model might close part of
+the gap for either arm); classifier hyperparameters fixed/shallow, not tuned per arm; one
+checkpoint, one seed, no replication; CoV is not a well-behaved statistic for the offset metric
+specifically (signed, near-zero mean) -- std reported alongside for that reason.
+
+Next planned step: none launched -- reporting and awaiting direction.
+
 
 ## L1 -- Macro Analyst
 Last updated: 2026-08-25 09:15 HKT

@@ -134,10 +134,15 @@ class EpisodeCapture:
     l2_decision_records: list[dict[str, Any]] = field(default_factory=list)
 
 
-def install_capture(wrapped_env: FrozenL3Wrapper) -> EpisodeCapture:
-    capture = EpisodeCapture()
-    base_env: LOBExecutionEnv = wrapped_env.env
-
+def install_tick_capture(base_env: LOBExecutionEnv, capture: EpisodeCapture | None = None) -> EpisodeCapture:
+    """The tick-level half of install_capture() below, factored out so it can be
+    installed on ANY LOBExecutionEnv directly -- not just one sitting inside a
+    FrozenL3Wrapper. Used by scripts/analyze_predictability.py to capture a pure
+    TWAPPolicy's own tick-level actions on the bare base env, where there is no
+    wrapper (and no L2 decisions) to speak of -- same instrumentation, same
+    tick_records schema, so downstream analysis (reconstruct_child_orders() etc.)
+    works identically on either capture's output."""
+    capture = capture if capture is not None else EpisodeCapture()
     orig_env_step = base_env.step
 
     def instrumented_env_step(action):
@@ -163,6 +168,12 @@ def install_capture(wrapped_env: FrozenL3Wrapper) -> EpisodeCapture:
         return obs, r, term, trunc, info
 
     base_env.step = instrumented_env_step
+    return capture
+
+
+def install_capture(wrapped_env: FrozenL3Wrapper) -> EpisodeCapture:
+    base_env: LOBExecutionEnv = wrapped_env.env
+    capture = install_tick_capture(base_env)
 
     orig_wrapped_step = wrapped_env.step
 
@@ -195,6 +206,14 @@ class ChildOrder:
     fill_ticks: list[int] = field(default_factory=list)
     fill_qtys: list[float] = field(default_factory=list)
     fill_prices: list[float] = field(default_factory=list)
+    placed_size: float | None = None  # the quantity requested AT PLACEMENT, not the
+    # (possibly smaller) filled quantity -- for "resting" orders this is the env's own
+    # info["resting_own_remaining"] captured on the placement tick (ground truth,
+    # confirmed a fresh non-crossing placement can never absorb a same-tick maker
+    # fill, so this value is uncontaminated by same-tick fills -- see this function's
+    # own docstring); for "market"-kind orders (both ORDER_TYPE_MARKET and a crossing
+    # LIMIT/CANCEL_AND_REPLACE) it is sum(fill_qtys), since those fill immediately and
+    # in full against available depth by construction.
 
 
 def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildOrder]:
@@ -269,6 +288,7 @@ def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildO
                 )
                 orders.append(open_order)
                 resting_remaining = rec["resting_own_remaining"]
+                open_order.placed_size = resting_remaining
                 # Crossed-price immediate fill: same-tick non-maker fill means this
                 # "placement" never actually rested -- it executed immediately, like a
                 # market order.
@@ -280,6 +300,8 @@ def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildO
                         open_order.outcome = "filled"
                         open_order.kind = "market"
                         resting_remaining = None
+                if open_order.kind == "market":
+                    open_order.placed_size = sum(open_order.fill_qtys)
             # else: already resting -- a real no-op in the env, not a new order.
 
         elif rec["order_type"] == ORDER_TYPE_MARKET:
@@ -288,6 +310,7 @@ def reconstruct_child_orders(tick_records: list[dict], side: int) -> list[ChildO
                     kind="market", placement_tick=rec["tick_idx"], placement_price=f["price"],
                     offset_from_touch=0, outcome="filled",
                     fill_ticks=[rec["tick_idx"]], fill_qtys=[f["qty"]], fill_prices=[f["price"]],
+                    placed_size=f["qty"],
                 ))
 
     return orders
