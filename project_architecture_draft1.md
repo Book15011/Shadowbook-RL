@@ -1,5 +1,10 @@
 # Project Architecture — `lob-execution-hma`
 
+> **SUPERSEDED (2026-09-04).** This file is now a stale, 2026-08-15 snapshot. For the current,
+> comprehensive architecture and onboarding guide, see
+> [`docs/PROJECT_ARCHITECTURE.md`](docs/PROJECT_ARCHITECTURE.md) instead. Kept here only as a
+> historical record — not maintained, do not use for onboarding.
+
 > **This scan supersedes all prior versions of this document.** Earlier scans in this session
 > were run against `C:\home\ubuntu\test\lob-execution-hma` on the local Windows machine running
 > Claude Code — a stale, disconnected local mirror that has fallen far behind the real project and
